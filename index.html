@@ -132,7 +132,7 @@ const resultadoBadge = (r) => badge(r, { ok: "ok", error: "error", warning: "war
 const spinner = (t = "Cargando...") => `<div class="flex items-center gap-3 text-gray-500 p-8">
   <div class="spin w-5 h-5 border-2 border-violet-700 border-t-transparent rounded-full"></div>${esc(t)}</div>`;
 
-/* ══════════════ Parseo de archivos (SheetJS, en el navegador) ══════════════ */
+/* ══════════════ Parseo de archivos ══════════════ */
 // Replica el manejo de encabezados duplicados de pandas: Ciudad, Ciudad.1, ...
 function dedupHeaders(headers) {
   const seen = {};
@@ -144,28 +144,63 @@ function dedupHeaders(headers) {
   });
 }
 
+// Parser CSV propio (respeta comillas, comas internas y saltos escapados).
+// Los CSV de Frávega tienen columnas repetidas y comas dentro de valores, así
+// que NO usamos SheetJS para CSV (parsea mal ese caso). SheetJS solo para Excel.
+function parseCSVText(text) {
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1); // quitar BOM
+  const rows = [];
+  let row = [], field = "", i = 0, inQ = false;
+  while (i < text.length) {
+    const c = text[i];
+    if (inQ) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i += 2; continue; }
+        inQ = false; i++; continue;
+      }
+      field += c; i++; continue;
+    }
+    if (c === '"') { inQ = true; i++; continue; }
+    if (c === ',') { row.push(field); field = ""; i++; continue; }
+    if (c === '\r') { i++; continue; }
+    if (c === '\n') { row.push(field); rows.push(row); row = []; field = ""; i++; continue; }
+    field += c; i++;
+  }
+  if (field !== "" || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+function rowsToObjects(raw) {
+  if (!raw.length) return [];
+  const headers = dedupHeaders(raw[0]);
+  return raw.slice(1)
+    .filter((r) => r.some((c) => c !== "" && c !== null && c !== undefined))
+    .map((r) => {
+      const o = {};
+      headers.forEach((h, i) => { o[h] = r[i] ?? ""; });
+      return o;
+    });
+}
+
 function parseFile(file) {
+  const esCSV = /\.csv$/i.test(file.name || "");
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error("No se pudo leer el archivo"));
     reader.onload = (e) => {
       try {
-        const wb = XLSX.read(e.target.result, { type: "array" });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        const raw = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: "" });
-        if (!raw.length) return resolve([]);
-        const headers = dedupHeaders(raw[0]);
-        const rows = raw.slice(1)
-          .filter((r) => r.some((c) => c !== "" && c !== null))
-          .map((r) => {
-            const o = {};
-            headers.forEach((h, i) => { o[h] = r[i] ?? ""; });
-            return o;
-          });
-        resolve(rows);
+        if (esCSV) {
+          resolve(rowsToObjects(parseCSVText(e.target.result)));
+        } else {
+          const wb = XLSX.read(e.target.result, { type: "array" });
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          const raw = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: "" });
+          resolve(rowsToObjects(raw));
+        }
       } catch (err) { reject(err); }
     };
-    reader.readAsArrayBuffer(file);
+    if (esCSV) reader.readAsText(file, "utf-8");
+    else reader.readAsArrayBuffer(file);
   });
 }
 
