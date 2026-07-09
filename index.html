@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Plataforma Tango ↔ Frávega</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  body { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  .nav-item.active { background:#4c1d95; color:#fff; }
+  .badge-ok { background:#dcfce7; color:#166534; }
+  .badge-error { background:#fee2e2; color:#991b1b; }
+  .badge-warning { background:#fef9c3; color:#854d0e; }
+  .badge-info { background:#e0e7ff; color:#3730a3; }
+  table.data th { text-align:left; font-size:11px; text-transform:uppercase;
+    letter-spacing:.05em; color:#6b7280; padding:8px 12px;
+    border-bottom:1px solid #e5e7eb; background:#f9fafb; }
+  table.data td { padding:8px 12px; border-bottom:1px solid #f3f4f6; font-size:14px; }
+  table.data tr:hover td { background:#faf5ff; }
+  .spin { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body class="bg-gray-100 text-gray-900">
+
+<div id="login-screen" class="hidden min-h-screen flex items-center justify-center">
+  <div class="bg-white rounded-2xl shadow-xl p-10 w-full max-w-md text-center">
+    <div class="text-4xl mb-2">🔄</div>
+    <h1 class="text-2xl font-bold mb-1">Plataforma Tango ↔ Frávega</h1>
+    <p class="text-gray-500 mb-8">Grupo Bitek — Acceso restringido</p>
+    <div id="google-btn" class="flex justify-center"></div>
+    <p id="login-error" class="text-red-600 text-sm mt-4 hidden"></p>
+  </div>
+</div>
+
+<div id="app-screen" class="hidden min-h-screen flex">
+  <aside class="w-60 bg-violet-950 text-violet-200 flex flex-col shrink-0">
+    <div class="p-4 border-b border-violet-900">
+      <div class="font-bold text-white leading-tight">Tango ↔ Frávega</div>
+      <div class="text-xs opacity-70">Grupo Bitek</div>
+    </div>
+    <nav id="nav" class="flex-1 p-2 space-y-1 text-sm"></nav>
+    <div class="p-3 border-t border-violet-900 text-xs">
+      <div id="user-name" class="text-white truncate"></div>
+      <div id="user-email" class="opacity-70 truncate mb-2"></div>
+      <button onclick="logout()" class="text-violet-300 hover:text-white underline">Cerrar sesión</button>
+    </div>
+  </aside>
+  <main id="main" class="flex-1 p-6 overflow-x-auto"></main>
+</div>
+
+<div id="toasts" class="fixed bottom-4 right-4 space-y-2 z-50"></div>
+
+<div id="modal" class="hidden fixed inset-0 bg-black/40 z-40 flex items-center justify-center p-4">
+  <div class="bg-white rounded-xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+    <div id="modal-content" class="p-6"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/* ══════════════ CONFIGURACIÓN (completar al desplegar) ══════════════ */
+// URL de la App web de Apps Script (Implementar → App web → URL que termina en /exec)
+const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217FMXf2niVvhFI93a9dbT5XZxWBkoigYyz-LiP5nA79Sh3/exec";
+// Client ID de Google (el mismo de GarantApp)
+const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
+
+/* ══════════════ Estado / helpers ══════════════ */
+let TOKEN = localStorage.getItem("tf_token") || "";
+let USER = JSON.parse(localStorage.getItem("tf_user") || "null");
+
+const VIEWS = [
+  { id: "dashboard", label: "📊 Dashboard" },
+  { id: "stock", label: "🔄 Sincronización de Stock" },
+  { id: "ordenes", label: "📦 Ingreso de Órdenes" },
+  { id: "facturas", label: "🧾 Exportación de Facturas" },
+  { id: "skus", label: "🔗 Relación de SKUs" },
+  { id: "pendientes", label: "⚠️ SKU Pendientes" },
+  { id: "logs", label: "📜 Logs" },
+  { id: "config", label: "⚙️ Configuración" },
+];
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function toast(msg, tipo = "ok") {
+  const col = { ok: "bg-green-600", error: "bg-red-600", info: "bg-violet-700", warning: "bg-amber-600" };
+  const el = document.createElement("div");
+  el.className = `${col[tipo] || col.info} text-white px-4 py-3 rounded-lg shadow-lg text-sm max-w-sm`;
+  el.textContent = msg;
+  $("toasts").appendChild(el);
+  setTimeout(() => el.remove(), 5000);
+}
+function showModal(html) { $("modal-content").innerHTML = html; $("modal").classList.remove("hidden"); }
+function closeModal() { $("modal").classList.add("hidden"); }
+$("modal").addEventListener("click", (e) => { if (e.target.id === "modal") closeModal(); });
+
+function confirmar(mensaje, onOk) {
+  showModal(`
+    <h3 class="font-bold text-lg mb-3">Confirmar</h3>
+    <p class="text-sm text-gray-600 mb-6">${esc(mensaje)}</p>
+    <div class="flex gap-3 justify-end">
+      <button onclick="closeModal()" class="px-4 py-2 rounded-lg border">Cancelar</button>
+      <button id="confirm-ok" class="px-4 py-2 rounded-lg bg-violet-700 text-white">Confirmar</button>
+    </div>`);
+  $("confirm-ok").onclick = () => { closeModal(); onOk(); };
+}
+
+/* ══════════════ API (Apps Script) ══════════════ */
+// text/plain evita el preflight CORS (patrón probado con GarantApp)
+async function api(action, payload) {
+  const r = await fetch(API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify({ action, token: TOKEN, payload: payload || {} }),
+  });
+  const data = await r.json();
+  if (data.auth) { logout(); throw new Error(data.error); }
+  if (data.error) throw new Error(data.error);
+  return data.data;
+}
+
+function badge(txt, tipo) {
+  return `<span class="badge-${tipo} px-2 py-0.5 rounded-full text-xs font-medium">${esc(txt)}</span>`;
+}
+const resultadoBadge = (r) => badge(r, { ok: "ok", error: "error", warning: "warning",
+  "con errores": "warning", "falló": "error" }[r] || "info");
+const spinner = (t = "Cargando...") => `<div class="flex items-center gap-3 text-gray-500 p-8">
+  <div class="spin w-5 h-5 border-2 border-violet-700 border-t-transparent rounded-full"></div>${esc(t)}</div>`;
+
+/* ══════════════ Parseo de archivos (SheetJS, en el navegador) ══════════════ */
+// Replica el manejo de encabezados duplicados de pandas: Ciudad, Ciudad.1, ...
+function dedupHeaders(headers) {
+  const seen = {};
+  return headers.map((h) => {
+    h = String(h ?? "").trim();
+    if (!(h in seen)) { seen[h] = 0; return h; }
+    seen[h] += 1;
+    return `${h}.${seen[h]}`;
+  });
+}
+
+function parseFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("No se pudo leer el archivo"));
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(e.target.result, { type: "array" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const raw = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: "" });
+        if (!raw.length) return resolve([]);
+        const headers = dedupHeaders(raw[0]);
+        const rows = raw.slice(1)
+          .filter((r) => r.some((c) => c !== "" && c !== null))
+          .map((r) => {
+            const o = {};
+            headers.forEach((h, i) => { o[h] = r[i] ?? ""; });
+            return o;
+          });
+        resolve(rows);
+      } catch (err) { reject(err); }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+/* ══════════════ Login ══════════════ */
+function initAuth() {
+  if (API_URL.indexOf("PEGAR_ACA") === 0) {
+    document.body.innerHTML = '<div class="p-10 text-center text-red-600 font-bold">' +
+      'Falta configurar API_URL en index.html (la URL /exec del Apps Script).</div>';
+    return;
+  }
+  if (TOKEN && USER) return showApp();
+  showLogin();
+}
+
+function showLogin() {
+  $("app-screen").classList.add("hidden");
+  $("login-screen").classList.remove("hidden");
+  const render = () => {
+    if (!window.google || !google.accounts) return setTimeout(render, 200);
+    google.accounts.id.initialize({ client_id: GOOGLE_CLIENT_ID, callback: onGoogle });
+    google.accounts.id.renderButton($("google-btn"),
+      { theme: "filled_blue", size: "large", text: "signin_with", width: 280 });
+  };
+  render();
+}
+
+async function onGoogle(resp) {
+  try {
+    const r = await fetch(API_URL, {
+      method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ action: "login", credential: resp.credential }),
+    });
+    const data = await r.json();
+    if (data.error) throw new Error(data.error);
+    TOKEN = data.token;
+    USER = { email: data.email, name: data.name };
+    localStorage.setItem("tf_token", TOKEN);
+    localStorage.setItem("tf_user", JSON.stringify(USER));
+    showApp();
+  } catch (e) {
+    $("login-error").textContent = e.message;
+    $("login-error").classList.remove("hidden");
+  }
+}
+
+function logout() {
+  localStorage.removeItem("tf_token"); localStorage.removeItem("tf_user");
+  TOKEN = ""; USER = null; location.hash = ""; location.reload();
+}
+
+/* ══════════════ Shell ══════════════ */
+function showApp() {
+  $("login-screen").classList.add("hidden");
+  $("app-screen").classList.remove("hidden");
+  $("user-name").textContent = USER.name || "";
+  $("user-email").textContent = USER.email || "";
+  $("nav").innerHTML = VIEWS.map((v) =>
+    `<a href="#${v.id}" data-view="${v.id}"
+        class="nav-item block px-3 py-2 rounded-lg hover:bg-violet-900">${v.label}</a>`).join("");
+  window.addEventListener("hashchange", route);
+  route();
+}
+
+function route() {
+  const view = (location.hash || "#dashboard").slice(1).split("?")[0];
+  document.querySelectorAll(".nav-item").forEach((el) =>
+    el.classList.toggle("active", el.dataset.view === view));
+  ({ dashboard: viewDashboard, stock: viewStock, ordenes: viewOrdenes,
+     facturas: viewFacturas, skus: viewSkus, pendientes: viewPendientes,
+     logs: viewLogs, config: viewConfig }[view] || viewDashboard)();
+}
+
+const setMain = (h) => { $("main").innerHTML = h; };
+const H = (t) => `<h2 class="text-xl font-bold mb-4">${t}</h2>`;
+const card = (inner, extra = "") => `<div class="bg-white rounded-xl shadow p-5 ${extra}">${inner}</div>`;
+
+/* ══════════════ DASHBOARD ══════════════ */
+async function viewDashboard() {
+  setMain(H("Dashboard") + spinner("Consultando Tango y Frávega..."));
+  let d;
+  try { d = await api("dashboard"); }
+  catch (e) { return setMain(H("Dashboard") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+
+  const estado = (s) => s.ok
+    ? `<div class="text-green-600 font-bold text-lg">● Conectado</div><div class="text-xs text-gray-500">${esc(s.detalle)}</div>`
+    : `<div class="text-red-600 font-bold text-lg">● Sin conexión</div><div class="text-xs text-gray-500">${esc(s.detalle)}</div>`;
+
+  const u = d.sincronizacion.ultima;
+  const ultimaTxt = u
+    ? `${esc(u.inicio)} — ${resultadoBadge(u.resultado)}<div class="text-xs text-gray-500 mt-1">
+       ok: ${u.ok} · errores: ${u.errores} · no publicados: ${u.no_publicados} · sin relación: ${u.sin_relacion}</div>`
+    : '<span class="text-gray-400">Nunca se ejecutó</span>';
+
+  setMain(H("Dashboard") + `
+    ${d.alertas.length ? `<div class="mb-4 space-y-2">${d.alertas.map((a) =>
+      `<div class="bg-amber-50 border border-amber-300 text-amber-800 px-4 py-2 rounded-lg text-sm">⚠️ ${esc(a)}</div>`).join("")}</div>` : ""}
+    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 mb-4">
+      ${card(`<div class="text-xs text-gray-500 uppercase mb-1">Tango</div>${estado(d.tango)}`)}
+      ${card(`<div class="text-xs text-gray-500 uppercase mb-1">Frávega</div>${estado(d.fravega)}`)}
+      ${card(`<div class="text-xs text-gray-500 uppercase mb-1">Última sincronización</div>${ultimaTxt}`)}
+      ${card(`<div class="text-xs text-gray-500 uppercase mb-1">Próxima sincronización</div>
+        <div class="font-bold text-lg">${d.sincronizacion.proxima ? esc(d.sincronizacion.proxima) : "—"}</div>
+        <div class="text-xs text-gray-500">${d.sincronizacion.habilitada ? "Automática habilitada" : "Automática deshabilitada"}</div>`)}
+    </div>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
+      ${[["Relaciones de SKU", d.contadores.relaciones, "#skus"],
+         ["SKU sin relación", d.contadores.sku_pendientes, "#pendientes"],
+         ["Órdenes importadas", d.contadores.ordenes_importadas, "#ordenes"],
+         ["Errores (24 hs)", d.contadores.errores_24h, "#logs"]].map(([t, n, href]) =>
+        `<a href="${href}" class="bg-white rounded-xl shadow p-5 hover:shadow-md">
+           <div class="text-3xl font-bold">${n}</div>
+           <div class="text-xs text-gray-500 uppercase mt-1">${t}</div></a>`).join("")}
+    </div>
+    <div class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+      ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Última exportación de facturas</div>
+        ${d.ultima_exportacion
+          ? `${esc(d.ultima_exportacion.fecha_hora)} — ${esc(d.ultima_exportacion.archivo)}
+             <div class="text-xs text-gray-500 mt-1">cargadas: ${d.ultima_exportacion.cargadas}
+             · sin factura: ${d.ultima_exportacion.sin_factura}</div>`
+          : '<span class="text-gray-400">Sin exportaciones aún</span>'}`)}
+      ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Errores recientes</div>
+        ${d.errores_recientes.length ? d.errores_recientes.map((l) =>
+          `<div class="text-sm border-b border-gray-100 py-1">
+             <span class="text-gray-400 text-xs">${esc(l.fecha_hora)}</span>
+             [${esc(l.modulo)}] ${esc(l.accion)}: <span class="text-red-600">${esc(String(l.detalle).slice(0, 120))}</span></div>`).join("")
+          : '<span class="text-gray-400">Sin errores 🎉</span>'}`)}
+    </div>`);
+}
+
+/* ══════════════ STOCK ══════════════ */
+async function viewStock() {
+  setMain(H("Sincronización de Stock") + spinner());
+  let st, hist;
+  try { [st, hist] = await Promise.all([api("stock.status"), api("stock.history")]); }
+  catch (e) { return setMain(H("Sincronización de Stock") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+
+  const rows = hist.map((h) => `
+    <tr class="cursor-pointer" onclick='verDetalleSync(${JSON.stringify(String(h.detalle_json || "[]"))})'>
+      <td>${esc(h.inicio)}</td><td>${esc(h.fin || "—")}</td>
+      <td>${esc(h.disparada_por)}</td><td>${resultadoBadge(h.resultado)}</td>
+      <td class="text-center">${h.ok}</td><td class="text-center">${h.errores}</td>
+      <td class="text-center">${h.no_publicados}</td><td class="text-center">${h.sin_relacion}</td>
+    </tr>`).join("");
+
+  setMain(H("Sincronización de Stock") + `
+    <div class="flex flex-wrap items-center gap-4 mb-4">
+      <button onclick="dispararSync()"
+        class="bg-violet-700 hover:bg-violet-800 text-white px-5 py-2.5 rounded-lg font-medium">
+        ▶️ Sincronizar ahora</button>
+      <div class="text-sm text-gray-600">Próxima automática:
+        <b>${st.proxima ? esc(st.proxima) : "deshabilitada"}</b></div>
+      <button onclick="viewStock()" class="text-sm text-violet-700 underline">Actualizar</button>
+    </div>
+    ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Historial (clic en una fila para ver el detalle)</div>
+      <table class="data w-full"><thead><tr>
+        <th>Inicio</th><th>Fin</th><th>Disparada por</th><th>Resultado</th>
+        <th>OK</th><th>Errores</th><th>No public.</th><th>Sin relación</th>
+      </tr></thead><tbody>${rows || '<tr><td colspan="8" class="text-gray-400 p-4">Sin sincronizaciones aún</td></tr>'}</tbody></table>`)}`);
+}
+
+function dispararSync() {
+  confirmar("¿Sincronizar el stock de Tango (depósito configurado) hacia Frávega ahora? Puede tardar hasta un minuto.", async () => {
+    setMain(H("Sincronización de Stock") + spinner("Sincronizando... (leyendo Tango y actualizando Frávega)"));
+    try {
+      const r = await api("stock.sync");
+      if (r.resultado === "omitida") toast(r.mensaje, "warning");
+      else toast(`Sincronización ${r.resultado}: ${r.ok} OK, ${r.errores} errores`, r.errores ? "warning" : "ok");
+    } catch (e) { toast(e.message, "error"); }
+    viewStock();
+  });
+}
+
+function verDetalleSync(jsonStr) {
+  let detalle;
+  try { detalle = JSON.parse(jsonStr); } catch (_) { detalle = []; }
+  if (!detalle.length) return;
+  showModal(`
+    <h3 class="font-bold text-lg mb-3">Detalle de la sincronización</h3>
+    <table class="data w-full"><thead><tr><th>SKU</th><th>refId</th><th>Cantidad</th><th>Estado</th></tr></thead>
+    <tbody>${detalle.map((d) => `<tr><td>${esc(d.sku)}</td><td>${esc(d.refId)}</td>
+      <td>${d.cantidad}</td><td>${resultadoBadge(d.estado === "ok" ? "ok" : d.estado === "error" ? "error" : "warning")}
+      ${d.detalle ? `<div class="text-xs text-gray-500">${esc(d.detalle)}</div>` : ""}</td></tr>`).join("")}</tbody></table>
+    <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 rounded-lg border">Cerrar</button></div>`);
+}
+
+/* ══════════════ ÓRDENES ══════════════ */
+let ORDENES_ROWS = null, ORDENES_ARCHIVO = "", ORDENES_ANALISIS = null;
+
+async function viewOrdenes() {
+  setMain(H("Ingreso de Órdenes") + spinner());
+  let hist;
+  try { hist = await api("orders.history"); }
+  catch (e) { return setMain(H("Ingreso de Órdenes") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+
+  setMain(H("Ingreso de Órdenes") + `
+    ${card(`
+      <div class="text-sm text-gray-600 mb-3">Subí el <b>CSV de órdenes exportado de Frávega</b>.
+        Primero se analiza (vista previa) y recién después confirmás el envío a Tango.</div>
+      <div class="flex items-center gap-3 flex-wrap">
+        <input type="file" id="ordenes-file" accept=".csv"
+          class="text-sm file:mr-3 file:px-4 file:py-2 file:rounded-lg file:border-0 file:bg-violet-100 file:text-violet-800 file:font-medium">
+        <button onclick="analizarOrdenes()" class="bg-violet-700 text-white px-4 py-2 rounded-lg">1️⃣ Analizar</button>
+      </div>
+      <div id="ordenes-resultado" class="mt-4"></div>`, "mb-4")}
+    ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Historial de importaciones</div>
+      <table class="data w-full"><thead><tr>
+        <th>Fecha</th><th>Usuario</th><th>Archivo</th><th>Filas</th><th>Nuevas</th><th>Enviadas</th><th>Rechazadas</th>
+      </tr></thead><tbody>
+      ${hist.map((h) => `<tr><td>${esc(h.fecha_hora)}</td><td>${esc(h.usuario)}</td><td>${esc(h.archivo)}</td>
+        <td class="text-center">${h.total_filas}</td><td class="text-center">${h.nuevas}</td>
+        <td class="text-center font-bold text-green-700">${h.enviadas}</td>
+        <td class="text-center ${Number(h.rechazadas) ? "font-bold text-red-600" : ""}">${h.rechazadas}</td></tr>`).join("")
+        || '<tr><td colspan="7" class="text-gray-400 p-4">Sin importaciones aún</td></tr>'}
+      </tbody></table>`)}`);
+}
+
+async function analizarOrdenes() {
+  const input = $("ordenes-file");
+  if (!input.files.length) return toast("Elegí el archivo CSV primero", "warning");
+  $("ordenes-resultado").innerHTML = spinner("Leyendo y analizando el CSV...");
+  try {
+    ORDENES_ROWS = await parseFile(input.files[0]);
+    ORDENES_ARCHIVO = input.files[0].name;
+    ORDENES_ANALISIS = await api("orders.analyze", { rows: ORDENES_ROWS, archivo: ORDENES_ARCHIVO });
+  } catch (e) {
+    ORDENES_ANALISIS = null;
+    return $("ordenes-resultado").innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`;
+  }
+  const a = ORDENES_ANALISIS;
+  $("ordenes-resultado").innerHTML = `
+    <div class="border rounded-lg p-4 bg-gray-50">
+      <div class="text-sm mb-2"><b>${esc(ORDENES_ARCHIVO)}</b> — ${a.total_filas} filas,
+        ${a.filas_pendientes} pendientes de facturación</div>
+      <div class="flex gap-4 text-sm mb-3 flex-wrap">
+        <span>🆕 Nuevas a enviar: <b>${a.nuevas.length}</b></span>
+        <span>⏩ Ya enviadas: <b>${a.saltadas.length}</b></span>
+        <span class="${a.excluidas.length ? "text-red-600" : ""}">🚫 Excluidas por SKU sin relación: <b>${a.excluidas.length}</b></span>
+      </div>
+      ${a.nuevas.length ? `<table class="data w-full mb-3"><thead><tr>
+        <th>Orden</th><th>Cliente</th><th>Ítems</th><th>Total</th></tr></thead><tbody>
+        ${a.nuevas.map((o) => `<tr><td>${esc(o.orden)}</td><td>${esc(o.cliente)}</td>
+          <td class="text-center">${o.items}</td><td>$ ${Number(o.total).toLocaleString("es-AR")}</td></tr>`).join("")}
+        </tbody></table>` : ""}
+      ${a.excluidas.length ? `<div class="text-sm text-red-700 bg-red-50 border border-red-200 rounded p-3 mb-3">
+        Estas órdenes NO se envían porque tienen SKUs sin relación (ya quedaron en
+        <a href="#pendientes" class="underline font-medium">Pendientes</a>):
+        ${a.excluidas.map((x) => `<div>· ${esc(x.orden)} → SKU ${x.skus_sin_relacion.map(esc).join(", ")}</div>`).join("")}</div>` : ""}
+      ${a.nuevas.length ? `<button onclick="enviarOrdenes()"
+        class="bg-green-700 hover:bg-green-800 text-white px-5 py-2.5 rounded-lg font-medium">
+        2️⃣ Confirmar y enviar ${a.nuevas.length} orden(es) a Tango</button>` :
+        '<div class="text-gray-500 text-sm">No hay órdenes nuevas para enviar.</div>'}
+    </div>`;
+}
+
+function enviarOrdenes() {
+  confirmar(`Se van a crear ${ORDENES_ANALISIS.nuevas.length} pedido(s) en Tango. ¿Continuar?`, async () => {
+    $("ordenes-resultado").innerHTML = spinner("Enviando a Tango...");
+    try {
+      const r = await api("orders.send", { rows: ORDENES_ROWS, archivo: ORDENES_ARCHIVO });
+      $("ordenes-resultado").innerHTML = `
+        <div class="border rounded-lg p-4 ${r.rechazadas.length ? "bg-amber-50" : "bg-green-50"}">
+          <div class="font-bold mb-2">✅ Enviadas y aceptadas por Tango: ${r.enviadas.length}</div>
+          ${r.enviadas.map((id) => `<span class="inline-block bg-white border rounded px-2 py-0.5 text-xs mr-1 mb-1">${esc(id)}</span>`).join("")}
+          ${r.rechazadas.length ? `<div class="font-bold mt-3 mb-1 text-red-700">❌ Rechazadas: ${r.rechazadas.length}</div>
+            ${r.rechazadas.map((f) => `<div class="text-sm text-red-700">· ${esc(f.orden)}: ${esc(f.error)}</div>`).join("")}` : ""}
+        </div>`;
+      toast(`${r.enviadas.length} órdenes enviadas a Tango`, "ok");
+    } catch (e) {
+      $("ordenes-resultado").innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`;
+    }
+  });
+}
+
+/* ══════════════ FACTURAS ══════════════ */
+async function viewFacturas() {
+  setMain(H("Exportación de Facturas") + spinner());
+  let hist;
+  try { hist = await api("invoices.history"); }
+  catch (e) { return setMain(H("Exportación de Facturas") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+
+  setMain(H("Exportación de Facturas") + `
+    ${card(`
+      <div class="text-sm text-gray-600 mb-3">Subí los dos archivos y descargá la
+        <b>Tabla-modelo-facturas COMPLETO.xlsx</b> lista para Frávega.</div>
+      <div class="grid md:grid-cols-2 gap-4 mb-4">
+        <div><label class="text-xs text-gray-500 uppercase">1. CSV de órdenes (Frávega)</label><br>
+          <input type="file" id="fac-ordenes" accept=".csv"
+            class="text-sm file:mr-3 file:px-4 file:py-2 file:rounded-lg file:border-0 file:bg-violet-100 file:text-violet-800"></div>
+        <div><label class="text-xs text-gray-500 uppercase">2. Reporte de facturación (Tango, Libro1.xlsx)</label><br>
+          <input type="file" id="fac-libro" accept=".xlsx,.xls,.csv"
+            class="text-sm file:mr-3 file:px-4 file:py-2 file:rounded-lg file:border-0 file:bg-violet-100 file:text-violet-800"></div>
+      </div>
+      <button onclick="generarFacturas()" class="bg-violet-700 text-white px-5 py-2.5 rounded-lg font-medium">
+        Generar archivo</button>
+      <div id="fac-resultado" class="mt-4"></div>`, "mb-4")}
+    ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Historial de exportaciones</div>
+      <table class="data w-full"><thead><tr>
+        <th>Fecha</th><th>Usuario</th><th>Archivo</th><th>Cargadas</th><th>Sin factura</th><th>Sobrantes</th>
+      </tr></thead><tbody>
+      ${hist.map((h) => `<tr><td>${esc(h.fecha_hora)}</td><td>${esc(h.usuario)}</td>
+        <td class="text-xs">${esc(h.archivo)}</td>
+        <td class="text-center">${h.cargadas}</td><td class="text-center">${h.sin_factura}</td>
+        <td class="text-center">${h.sobrantes}</td></tr>`).join("")
+        || '<tr><td colspan="6" class="text-gray-400 p-4">Sin exportaciones aún</td></tr>'}
+      </tbody></table>
+      <p class="text-xs text-gray-400 mt-2">El archivo se descarga en el momento de generarlo
+      (no queda guardado en el servidor).</p>`)}`);
+}
+
+async function generarFacturas() {
+  const fo = $("fac-ordenes"), fl = $("fac-libro");
+  if (!fo.files.length || !fl.files.length) return toast("Subí los dos archivos", "warning");
+  $("fac-resultado").innerHTML = spinner("Cruzando órdenes con facturas...");
+  try {
+    const [ordenesRows, facturasRows] = await Promise.all(
+      [parseFile(fo.files[0]), parseFile(fl.files[0])]);
+    const r = await api("invoices.generate", { ordenes: ordenesRows, facturas: facturasRows });
+    // Descargar el xlsx desde base64
+    const bytes = Uint8Array.from(atob(r.base64), (c) => c.charCodeAt(0));
+    const blob = new Blob([bytes],
+      { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = r.archivo;
+    a.click();
+    URL.revokeObjectURL(a.href);
+
+    $("fac-resultado").innerHTML = `
+      <div class="border rounded-lg p-4 bg-green-50">
+        <div class="font-bold mb-2">✅ Archivo generado y descargado — ${r.cargadas} orden(es) cargada(s)</div>
+        <div class="text-sm mb-2">${esc(r.archivo)}</div>
+        ${r.sin_factura.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 mb-2">
+          ⚠️ ${r.sin_factura.length} pendiente(s) sin factura:
+          ${r.sin_factura.map((s) => `<div>· ${esc(s.orden)} — ${esc(s.cliente)}</div>`).join("")}</div>` : ""}
+        ${r.sobrantes.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2">
+          ⚠️ ${r.sobrantes.length} factura(s) sin orden pendiente:
+          ${r.sobrantes.map((s) => `<div>· ${esc(s.cliente)} — ${esc(s.factura)}</div>`).join("")}</div>` : ""}
+      </div>`;
+    toast("Archivo de facturas generado", "ok");
+  } catch (e) {
+    $("fac-resultado").innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`;
+  }
+}
+
+/* ══════════════ SKUs ══════════════ */
+async function viewSkus() {
+  setMain(H("Relación de SKUs") + spinner());
+  const q = new URLSearchParams(location.hash.split("?")[1] || "").get("q") || "";
+  let rels;
+  try { rels = await api("skus.list", { q }); }
+  catch (e) { return setMain(H("Relación de SKUs") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+  window._SKUS_CACHE = rels;
+
+  setMain(H("Relación de SKUs") + `
+    <div class="flex flex-wrap items-center gap-3 mb-4">
+      <input id="sku-q" value="${esc(q)}" placeholder="Buscar por SKU Tango, Frávega o descripción..."
+        class="border rounded-lg px-3 py-2 text-sm w-72" onkeydown="if(event.key==='Enter')buscarSkus()">
+      <button onclick="buscarSkus()" class="border px-4 py-2 rounded-lg text-sm">Buscar</button>
+      <button onclick="formSku()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">➕ Nueva relación</button>
+      <label class="border px-4 py-2 rounded-lg text-sm cursor-pointer bg-white">
+        📥 Importar CSV/Excel <input type="file" class="hidden" accept=".csv,.xlsx,.xls"
+        onchange="importarSkus(this)"></label>
+      <button onclick="exportarSkus()" class="border px-4 py-2 rounded-lg text-sm">📤 Exportar CSV</button>
+      <span class="text-sm text-gray-500">${rels.length} relación(es)</span>
+    </div>
+    ${card(`<table class="data w-full"><thead><tr>
+      <th>SKU Tango</th><th>Item ID Frávega</th><th>refId Frávega</th><th>Descripción</th>
+      <th>Modificada</th><th></th></tr></thead><tbody>
+      ${rels.map((r) => `<tr>
+        <td class="font-mono">${esc(r.sku_tango)}</td>
+        <td class="font-mono">${esc(r.fravega_item_id || "—")}</td>
+        <td class="font-mono">${esc(r.fravega_refid)}</td>
+        <td>${esc(r.descripcion || "")}</td>
+        <td class="text-xs text-gray-500">${esc(r.modificada)}</td>
+        <td class="whitespace-nowrap">
+          <button class="text-violet-700 underline text-sm mr-2"
+            onclick='formSku(${JSON.stringify(JSON.stringify(r))})'>Editar</button>
+          <button class="text-red-600 underline text-sm"
+            onclick="borrarSku('${esc(r.sku_tango)}')">Eliminar</button></td>
+      </tr>`).join("") || '<tr><td colspan="6" class="text-gray-400 p-4">Sin resultados</td></tr>'}
+      </tbody></table>`)}
+    <p class="text-xs text-gray-500 mt-3">También podés ver y editar esta tabla directo en la
+      pestaña <b>RelacionesSKU</b> de la Google Sheet. Importación: columnas <b>sku_tango</b>
+      (obligatoria), <b>fravega_item_id</b>, <b>fravega_refid</b> (vacío = igual al SKU Tango)
+      y <b>descripcion</b>.</p>`);
+}
+
+function buscarSkus() { location.hash = `#skus?q=${encodeURIComponent($("sku-q").value)}`; viewSkus(); }
+
+function formSku(jsonStr, presetSku, presetOrigen) {
+  const r = jsonStr ? JSON.parse(jsonStr) : null;
+  const esFravega = presetOrigen === "Fravega";
+  showModal(`
+    <h3 class="font-bold text-lg mb-4">${r ? "Editar" : "Nueva"} relación</h3>
+    <div class="space-y-3 text-sm">
+      <div><label class="text-xs text-gray-500 uppercase">SKU Tango *</label>
+        <input id="f-sku" class="border rounded-lg px-3 py-2 w-full"
+          value="${esc(r ? r.sku_tango : (!esFravega && presetSku) || "")}"></div>
+      <div><label class="text-xs text-gray-500 uppercase">Item ID Frávega (publicación, para órdenes)</label>
+        <input id="f-item" class="border rounded-lg px-3 py-2 w-full"
+          value="${esc(r ? r.fravega_item_id || "" : (esFravega && presetSku) || "")}"></div>
+      <div><label class="text-xs text-gray-500 uppercase">refId Frávega (para stock — vacío = igual al SKU Tango)</label>
+        <input id="f-refid" class="border rounded-lg px-3 py-2 w-full" value="${esc(r ? r.fravega_refid : "")}"></div>
+      <div><label class="text-xs text-gray-500 uppercase">Descripción</label>
+        <input id="f-desc" class="border rounded-lg px-3 py-2 w-full" value="${esc(r ? r.descripcion || "" : "")}"></div>
+    </div>
+    <div class="flex gap-3 justify-end mt-5">
+      <button onclick="closeModal()" class="px-4 py-2 rounded-lg border">Cancelar</button>
+      <button onclick="guardarSku('${r ? esc(r.sku_tango) : ""}', '${esc(presetOrigen || "")}', '${esc(presetSku || "")}')"
+        class="px-4 py-2 rounded-lg bg-violet-700 text-white">Guardar</button></div>`);
+}
+
+async function guardarSku(originalSku, pendOrigen, pendSku) {
+  try {
+    await api("skus.save", {
+      sku_tango: $("f-sku").value.trim(),
+      fravega_item_id: $("f-item").value.trim(),
+      fravega_refid: $("f-refid").value.trim(),
+      descripcion: $("f-desc").value.trim(),
+      original_sku: originalSku,
+    });
+    // Si venía de un pendiente, lo marcamos resuelto automáticamente
+    if (pendOrigen && pendSku) {
+      try { await api("pending.resolve", { sku: pendSku, origen: pendOrigen }); } catch (_) {}
+    }
+    closeModal(); toast("Relación guardada", "ok");
+    (location.hash.startsWith("#pendientes") ? viewPendientes : viewSkus)();
+  } catch (e) { toast(e.message, "error"); }
+}
+
+function borrarSku(sku) {
+  confirmar(`¿Eliminar la relación del SKU ${sku}? Ese artículo dejará de sincronizarse.`, async () => {
+    try { await api("skus.delete", { sku_tango: sku }); toast("Relación eliminada", "ok"); viewSkus(); }
+    catch (e) { toast(e.message, "error"); }
+  });
+}
+
+// Alias de encabezados aceptados al importar
+const SKU_ALIASES = {
+  sku_tango: ["sku_tango", "sku tango", "tango", "skucode", "codigo tango", "código tango"],
+  fravega_item_id: ["fravega_item_id", "item_id", "sku fravega", "sku_fravega", "id publicacion", "productcode"],
+  fravega_refid: ["fravega_refid", "refid", "ref_id", "reference id"],
+  descripcion: ["descripcion", "descripción", "description", "detalle"],
+};
+
+async function importarSkus(input) {
+  if (!input.files.length) return;
+  try {
+    const raw = await parseFile(input.files[0]);
+    const rows = raw.map((r) => {
+      const o = {};
+      Object.keys(r).forEach((k) => {
+        const key = k.trim().toLowerCase();
+        for (const target in SKU_ALIASES) {
+          if (SKU_ALIASES[target].includes(key)) o[target] = r[k];
+        }
+      });
+      return o;
+    });
+    const res = await api("skus.import", { rows });
+    toast(`Importación: ${res.creadas} creadas, ${res.actualizadas} actualizadas` +
+          (res.errores.length ? `, ${res.errores.length} errores` : ""),
+          res.errores.length ? "warning" : "ok");
+    if (res.errores.length) showModal(`<h3 class="font-bold mb-3">Errores de importación</h3>
+      <div class="text-sm space-y-1">${res.errores.map((e) => `<div>· ${esc(e)}</div>`).join("")}</div>
+      <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
+    viewSkus();
+  } catch (e) { toast(e.message, "error"); }
+  input.value = "";
+}
+
+async function exportarSkus() {
+  const rels = window._SKUS_CACHE || await api("skus.list", { q: "" });
+  const lines = ["sku_tango,fravega_item_id,fravega_refid,descripcion"];
+  rels.forEach((r) => {
+    const desc = String(r.descripcion || "").replace(/"/g, "'");
+    lines.push(`${r.sku_tango},${r.fravega_item_id || ""},${r.fravega_refid},"${desc}"`);
+  });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" }));
+  a.download = "relaciones_sku.csv";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* ══════════════ PENDIENTES ══════════════ */
+async function viewPendientes() {
+  setMain(H("SKU Pendientes") + spinner());
+  let pend;
+  try { pend = await api("pending.list"); }
+  catch (e) { return setMain(H("SKU Pendientes") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+
+  setMain(H("SKU Pendientes") + `
+    <p class="text-sm text-gray-600 mb-4">SKUs detectados sin relación durante la sincronización de
+      stock (origen Tango) o el ingreso de órdenes (origen Frávega). Creá la relación (se marca
+      resuelto solo) y la próxima ejecución la usa automáticamente.</p>
+    ${card(`<table class="data w-full"><thead><tr>
+      <th>SKU recibido</th><th>Origen</th><th>Detectado</th><th>Observaciones</th><th></th>
+    </tr></thead><tbody>
+    ${pend.map((p) => `<tr>
+      <td class="font-mono">${esc(p.sku)}</td>
+      <td>${badge(p.origen, p.origen === "Tango" ? "info" : "warning")}</td>
+      <td class="text-xs text-gray-500">${esc(p.detectado_en)}</td>
+      <td class="text-sm">${esc(p.observaciones || "")}</td>
+      <td class="whitespace-nowrap">
+        <button class="text-violet-700 underline text-sm mr-2"
+          onclick="formSku(null, '${esc(p.sku)}', '${esc(p.origen)}')">Crear relación</button>
+        <button class="text-green-700 underline text-sm"
+          onclick="resolverPendiente('${esc(p.sku)}', '${esc(p.origen)}')">Marcar resuelto</button></td>
+    </tr>`).join("") || '<tr><td colspan="5" class="text-gray-400 p-4">No hay pendientes 🎉</td></tr>'}
+    </tbody></table>`)}`);
+}
+
+function resolverPendiente(sku, origen) {
+  confirmar("¿Marcar este SKU como resuelto?", async () => {
+    try { await api("pending.resolve", { sku, origen }); toast("Marcado como resuelto", "ok"); viewPendientes(); }
+    catch (e) { toast(e.message, "error"); }
+  });
+}
+
+/* ══════════════ LOGS ══════════════ */
+async function viewLogs() {
+  setMain(H("Logs") + `
+    <div class="flex flex-wrap gap-2 mb-4 items-end text-sm">
+      <div><label class="text-xs text-gray-500">Desde</label><br>
+        <input type="date" id="l-desde" class="border rounded-lg px-2 py-1.5"></div>
+      <div><label class="text-xs text-gray-500">Hasta</label><br>
+        <input type="date" id="l-hasta" class="border rounded-lg px-2 py-1.5"></div>
+      <div><label class="text-xs text-gray-500">Módulo</label><br>
+        <select id="l-modulo" class="border rounded-lg px-2 py-1.5"><option value="">Todos</option>
+          ${["stock","ordenes","facturas","skus","auth","configuracion","sistema"]
+            .map((m) => `<option>${m}</option>`).join("")}</select></div>
+      <div><label class="text-xs text-gray-500">Tipo</label><br>
+        <select id="l-res" class="border rounded-lg px-2 py-1.5"><option value="">Todos</option>
+          <option>ok</option><option>error</option><option>warning</option><option>info</option></select></div>
+      <div><label class="text-xs text-gray-500">Buscar</label><br>
+        <input id="l-q" class="border rounded-lg px-2 py-1.5 w-48" placeholder="texto..."
+          onkeydown="if(event.key==='Enter')cargarLogs()"></div>
+      <button onclick="cargarLogs()" class="bg-violet-700 text-white px-4 py-2 rounded-lg">Filtrar</button>
+      <button onclick="descargarLogs()" class="border px-4 py-2 rounded-lg">⬇️ Descargar CSV</button>
+    </div>
+    <div id="logs-tabla">${spinner()}</div>`);
+  cargarLogs();
+}
+
+let LOGS_CACHE = [];
+async function cargarLogs() {
+  $("logs-tabla").innerHTML = spinner();
+  try {
+    LOGS_CACHE = await api("logs.list", {
+      desde: $("l-desde").value, hasta: $("l-hasta").value,
+      modulo: $("l-modulo").value, resultado: $("l-res").value, q: $("l-q").value,
+    });
+  } catch (e) { return $("logs-tabla").innerHTML = `<p class="text-red-600">${esc(e.message)}</p>`; }
+  $("logs-tabla").innerHTML = card(`
+    <table class="data w-full"><thead><tr>
+      <th>Fecha/hora</th><th>Usuario</th><th>Módulo</th><th>Acción</th><th>Resultado</th>
+      <th>Detalle</th><th>ms</th></tr></thead><tbody>
+    ${LOGS_CACHE.map((l) => `<tr>
+      <td class="whitespace-nowrap text-xs">${esc(l.fecha_hora)}</td>
+      <td class="text-xs">${esc(l.usuario)}</td><td>${esc(l.modulo)}</td>
+      <td>${esc(l.accion)}</td><td>${resultadoBadge(l.resultado)}</td>
+      <td class="text-xs text-gray-600 max-w-md truncate" title="${esc(l.detalle)}">${esc(l.detalle)}</td>
+      <td class="text-xs text-gray-400">${l.duracion_ms || ""}</td></tr>`).join("")
+      || '<tr><td colspan="7" class="text-gray-400 p-4">Sin registros</td></tr>'}
+    </tbody></table>
+    <div class="text-xs text-gray-400 mt-2">${LOGS_CACHE.length} registro(s) —
+      el historial completo está en la pestaña Logs de la Google Sheet</div>`);
+}
+
+function descargarLogs() {
+  const lines = ["fecha_hora,usuario,modulo,accion,resultado,detalle,duracion_ms"];
+  LOGS_CACHE.forEach((l) => {
+    const det = String(l.detalle || "").replace(/"/g, "'").replace(/\n/g, " ");
+    lines.push(`${l.fecha_hora},${l.usuario},${l.modulo},"${String(l.accion).replace(/"/g, "'")}",${l.resultado},"${det}",${l.duracion_ms || ""}`);
+  });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" }));
+  a.download = "logs.csv"; a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* ══════════════ CONFIGURACIÓN ══════════════ */
+const CONFIG_CAMPOS = [
+  ["Stock", [
+    ["stock_warehouse_code", "Depósito de Tango (stock)", "text"],
+    ["stock_subtract_engaged", "Restar comprometido (EngagedQuantity)", "bool"],
+    ["stock_discount_pending", "Descontar pedidos pendientes (API Tango)", "bool"],
+  ]],
+  ["Automatización", [
+    ["scheduler_enabled", "Sincronización automática habilitada", "bool"],
+    ["scheduler_hours", "Horas del día (0-23, separadas por coma)", "text"],
+  ]],
+  ["Órdenes", [
+    ["orders_counterfoil", "Talonario de pedido", "text"],
+    ["orders_invoice_counterfoil", "Talonario de factura", "text"],
+    ["orders_warehouse_code", "Depósito (pedidos)", "text"],
+    ["orders_seller_code", "Vendedor", "text"],
+    ["orders_payment_method", "Forma de cobro (A01-A10)", "text"],
+    ["orders_batch_size", "Órdenes por lote", "text"],
+    ["orders_estado_objetivo", "Estado de facturación a importar", "text"],
+  ]],
+  ["Facturas", [
+    ["invoices_add_prefix", "Agregar prefijo al Nro de orden", "bool"],
+    ["invoices_prefix", "Prefijo", "text"],
+    ["invoices_estado_objetivo", "Estado de facturación a matchear", "text"],
+  ]],
+];
+
+async function viewConfig() {
+  setMain(H("Configuración") + spinner());
+  let cfg;
+  try { cfg = await api("settings.get"); }
+  catch (e) { return setMain(H("Configuración") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+  const v = cfg.valores;
+
+  const campo = ([key, label, tipo]) => tipo === "bool"
+    ? `<label class="flex items-center gap-2 text-sm py-1">
+         <input type="checkbox" data-key="${key}" ${v[key] === "1" ? "checked" : ""}
+           class="cfg-input w-4 h-4"> ${label}</label>`
+    : `<div class="py-1"><label class="text-xs text-gray-500 uppercase">${label}</label>
+         <input data-key="${key}" value="${esc(v[key] ?? "")}"
+           class="cfg-input border rounded-lg px-3 py-2 w-full text-sm"></div>`;
+
+  const cred = (ok, nombre) => `<div class="flex items-center gap-2 text-sm py-0.5">
+    ${ok ? '<span class="text-green-600">●</span>' : '<span class="text-red-600">●</span>'}
+    ${nombre} ${ok ? "" : '<span class="text-red-600 text-xs">(falta en Script Properties)</span>'}</div>`;
+
+  setMain(H("Configuración") + `
+    <div class="grid xl:grid-cols-2 gap-4">
+      <div class="space-y-4">
+        ${CONFIG_CAMPOS.map(([titulo, campos]) => card(
+          `<div class="text-xs text-gray-500 uppercase font-bold mb-2">${titulo}</div>
+           ${campos.map(campo).join("")}`)).join("")}
+        <button onclick="guardarConfig()"
+          class="bg-violet-700 text-white px-5 py-2.5 rounded-lg font-medium">💾 Guardar cambios</button>
+        <span class="text-sm text-gray-500 ml-3">Próxima sincronización:
+          <b>${cfg.proxima_sincronizacion ? esc(cfg.proxima_sincronizacion) : "—"}</b></span>
+      </div>
+      <div>
+        ${card(`<div class="text-xs text-gray-500 uppercase font-bold mb-2">Credenciales</div>
+          ${cred(cfg.credenciales.tango_token, "Token de Tango")}
+          ${cred(cfg.credenciales.fravega_seller_id, "Frávega seller-id")}
+          ${cred(cfg.credenciales.fravega_api_key, "Frávega x-fvg-api-key")}
+          ${cred(cfg.credenciales.fravega_api_token, "Frávega x-fvg-api-token")}
+          ${cred(cfg.credenciales.google_client_id, "Google Client ID")}
+          <p class="text-xs text-gray-500 mt-3">Por seguridad, las credenciales se administran en el
+          editor de Apps Script: <b>Configuración del proyecto → Script Properties</b>.</p>`)}
+      </div>
+    </div>`);
+}
+
+async function guardarConfig() {
+  const valores = {};
+  document.querySelectorAll(".cfg-input").forEach((el) => {
+    valores[el.dataset.key] = el.type === "checkbox" ? (el.checked ? "1" : "0") : el.value.trim();
+  });
+  try {
+    const r = await api("settings.set", { valores });
+    toast("Configuración guardada", "ok");
+    if (r.proxima_sincronizacion) toast(`Próxima sincronización: ${r.proxima_sincronizacion}`, "info");
+  } catch (e) { toast(e.message, "error"); }
+}
+
+/* ══════════════ Arranque ══════════════ */
+initAuth();
+</script>
+</body>
+</html>
