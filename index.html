@@ -389,12 +389,9 @@ function verDetalleSync(jsonStr) {
 /* ══════════════ ÓRDENES ══════════════ */
 let ORDENES_ROWS = null, ORDENES_ARCHIVO = "", ORDENES_ANALISIS = null;
 
-async function viewOrdenes() {
-  setMain(H("Ingreso de Órdenes") + spinner());
-  let hist;
-  try { hist = await api("orders.history"); }
-  catch (e) { return setMain(H("Ingreso de Órdenes") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
-
+function viewOrdenes() {
+  // Pintamos la sección de carga PRIMERO y sin await, así el input de archivo
+  // nunca se destruye por una llamada async que llega después.
   setMain(H("Ingreso de Órdenes") + `
     ${card(`
       <div class="text-sm text-gray-600 mb-3">Subí el <b>CSV de órdenes exportado de Frávega</b>.
@@ -406,20 +403,33 @@ async function viewOrdenes() {
       </div>
       <div id="ordenes-resultado" class="mt-4"></div>`, "mb-4")}
     ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Historial de importaciones</div>
-      <table class="data w-full"><thead><tr>
-        <th>Fecha</th><th>Usuario</th><th>Archivo</th><th>Filas</th><th>Nuevas</th><th>Enviadas</th><th>Rechazadas</th>
-      </tr></thead><tbody>
-      ${hist.map((h) => `<tr><td>${esc(h.fecha_hora)}</td><td>${esc(h.usuario)}</td><td>${esc(h.archivo)}</td>
-        <td class="text-center">${h.total_filas}</td><td class="text-center">${h.nuevas}</td>
-        <td class="text-center font-bold text-green-700">${h.enviadas}</td>
-        <td class="text-center ${Number(h.rechazadas) ? "font-bold text-red-600" : ""}">${h.rechazadas}</td></tr>`).join("")
-        || '<tr><td colspan="7" class="text-gray-400 p-4">Sin importaciones aún</td></tr>'}
-      </tbody></table>`)}`);
+      <div id="ordenes-hist">${spinner("Cargando historial...")}</div>`)}`);
+  cargarHistorialOrdenes();  // llena SOLO el div del historial, sin tocar la carga
 }
+
+async function cargarHistorialOrdenes() {
+  const cont = $("ordenes-hist");
+  if (!cont) return;
+  let hist;
+  try { hist = await api("orders.history"); }
+  catch (e) { cont.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
+  if (!$("ordenes-hist")) return;  // el usuario ya cambió de pantalla: no tocar nada
+  cont.innerHTML = `
+    <table class="data w-full"><thead><tr>
+      <th>Fecha</th><th>Usuario</th><th>Archivo</th><th>Filas</th><th>Nuevas</th><th>Enviadas</th><th>Rechazadas</th>
+    </tr></thead><tbody>
+    ${hist.map((h) => `<tr><td>${esc(h.fecha_hora)}</td><td>${esc(h.usuario)}</td><td>${esc(h.archivo)}</td>
+      <td class="text-center">${h.total_filas}</td><td class="text-center">${h.nuevas}</td>
+      <td class="text-center font-bold text-green-700">${h.enviadas}</td>
+      <td class="text-center ${Number(h.rechazadas) ? "font-bold text-red-600" : ""}">${h.rechazadas}</td></tr>`).join("")
+      || '<tr><td colspan="7" class="text-gray-400 p-4">Sin importaciones aún</td></tr>'}
+    </tbody></table>`;
+}
+
 
 async function analizarOrdenes() {
   const input = $("ordenes-file");
-  if (!input.files.length) return toast("Elegí el archivo CSV primero", "warning");
+  if (!input || !input.files.length) return toast("Elegí el archivo CSV y después apretá Analizar", "warning");
   $("ordenes-resultado").innerHTML = spinner("Leyendo y analizando el CSV...");
   try {
     ORDENES_ROWS = await parseFile(input.files[0]);
@@ -475,12 +485,7 @@ function enviarOrdenes() {
 }
 
 /* ══════════════ FACTURAS ══════════════ */
-async function viewFacturas() {
-  setMain(H("Exportación de Facturas") + spinner());
-  let hist;
-  try { hist = await api("invoices.history"); }
-  catch (e) { return setMain(H("Exportación de Facturas") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
-
+function viewFacturas() {
   setMain(H("Exportación de Facturas") + `
     ${card(`
       <div class="text-sm text-gray-600 mb-3">Subí los dos archivos y descargá la
@@ -497,17 +502,29 @@ async function viewFacturas() {
         Generar archivo</button>
       <div id="fac-resultado" class="mt-4"></div>`, "mb-4")}
     ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Historial de exportaciones</div>
-      <table class="data w-full"><thead><tr>
-        <th>Fecha</th><th>Usuario</th><th>Archivo</th><th>Cargadas</th><th>Sin factura</th><th>Sobrantes</th>
-      </tr></thead><tbody>
-      ${hist.map((h) => `<tr><td>${esc(h.fecha_hora)}</td><td>${esc(h.usuario)}</td>
-        <td class="text-xs">${esc(h.archivo)}</td>
-        <td class="text-center">${h.cargadas}</td><td class="text-center">${h.sin_factura}</td>
-        <td class="text-center">${h.sobrantes}</td></tr>`).join("")
-        || '<tr><td colspan="6" class="text-gray-400 p-4">Sin exportaciones aún</td></tr>'}
-      </tbody></table>
+      <div id="fac-hist">${spinner("Cargando historial...")}</div>
       <p class="text-xs text-gray-400 mt-2">El archivo se descarga en el momento de generarlo
       (no queda guardado en el servidor).</p>`)}`);
+  cargarHistorialFacturas();
+}
+
+async function cargarHistorialFacturas() {
+  const cont = $("fac-hist");
+  if (!cont) return;
+  let hist;
+  try { hist = await api("invoices.history"); }
+  catch (e) { cont.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
+  if (!$("fac-hist")) return;
+  cont.innerHTML = `
+    <table class="data w-full"><thead><tr>
+      <th>Fecha</th><th>Usuario</th><th>Archivo</th><th>Cargadas</th><th>Sin factura</th><th>Sobrantes</th>
+    </tr></thead><tbody>
+    ${hist.map((h) => `<tr><td>${esc(h.fecha_hora)}</td><td>${esc(h.usuario)}</td>
+      <td class="text-xs">${esc(h.archivo)}</td>
+      <td class="text-center">${h.cargadas}</td><td class="text-center">${h.sin_factura}</td>
+      <td class="text-center">${h.sobrantes}</td></tr>`).join("")
+      || '<tr><td colspan="6" class="text-gray-400 p-4">Sin exportaciones aún</td></tr>'}
+    </tbody></table>`;
 }
 
 async function generarFacturas() {
