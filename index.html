@@ -387,7 +387,7 @@ function verDetalleSync(jsonStr) {
 }
 
 /* ══════════════ ÓRDENES ══════════════ */
-let ORDENES_ROWS = null, ORDENES_ARCHIVO = "", ORDENES_ANALISIS = null;
+let ORDENES_ROWS = null, ORDENES_ARCHIVO = "", ORDENES_ANALISIS = null, ORDENES_COMPLETAS = [];
 
 function viewOrdenes() {
   // Pintamos la sección de carga PRIMERO y sin await, así el input de archivo
@@ -435,6 +435,7 @@ async function analizarOrdenes() {
     ORDENES_ROWS = await parseFile(input.files[0]);
     ORDENES_ARCHIVO = input.files[0].name;
     ORDENES_ANALISIS = await api("orders.analyze", { rows: ORDENES_ROWS, archivo: ORDENES_ARCHIVO });
+    ORDENES_COMPLETAS = ORDENES_ANALISIS.orders || [];
   } catch (e) {
     ORDENES_ANALISIS = null;
     return $("ordenes-resultado").innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`;
@@ -466,21 +467,46 @@ async function analizarOrdenes() {
 }
 
 function enviarOrdenes() {
-  confirmar(`Se van a crear ${ORDENES_ANALISIS.nuevas.length} pedido(s) en Tango. ¿Continuar?`, async () => {
-    $("ordenes-resultado").innerHTML = spinner("Enviando a Tango...");
-    try {
-      const r = await api("orders.send", { rows: ORDENES_ROWS, archivo: ORDENES_ARCHIVO });
-      $("ordenes-resultado").innerHTML = `
-        <div class="border rounded-lg p-4 ${r.rechazadas.length ? "bg-amber-50" : "bg-green-50"}">
-          <div class="font-bold mb-2">✅ Enviadas y aceptadas por Tango: ${r.enviadas.length}</div>
-          ${r.enviadas.map((id) => `<span class="inline-block bg-white border rounded px-2 py-0.5 text-xs mr-1 mb-1">${esc(id)}</span>`).join("")}
-          ${r.rechazadas.length ? `<div class="font-bold mt-3 mb-1 text-red-700">❌ Rechazadas: ${r.rechazadas.length}</div>
-            ${r.rechazadas.map((f) => `<div class="text-sm text-red-700">· ${esc(f.orden)}: ${esc(f.error)}</div>`).join("")}` : ""}
+  const total = ORDENES_COMPLETAS.length;
+  confirmar(`Se van a crear ${total} pedido(s) en Tango, en tandas de 40. ¿Continuar?`, async () => {
+    const TANDA = 40;
+    const enviadas = [], rechazadas = [];
+    const box = $("ordenes-resultado");
+
+    for (let i = 0; i < total; i += TANDA) {
+      const lote = ORDENES_COMPLETAS.slice(i, i + TANDA);
+      const desde = i + 1, hasta = Math.min(i + TANDA, total);
+      box.innerHTML = `
+        <div class="border rounded-lg p-4 bg-violet-50">
+          ${spinner(`Enviando órdenes ${desde}–${hasta} de ${total}...`)}
+          <div class="text-xs text-gray-500 mt-2">Aceptadas hasta ahora: ${enviadas.length}
+            ${rechazadas.length ? `· rechazadas: ${rechazadas.length}` : ""}</div>
+          <div class="w-full bg-violet-200 rounded-full h-2 mt-2">
+            <div class="bg-violet-700 h-2 rounded-full" style="width:${Math.round(hasta / total * 100)}%"></div></div>
         </div>`;
-      toast(`${r.enviadas.length} órdenes enviadas a Tango`, "ok");
-    } catch (e) {
-      $("ordenes-resultado").innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`;
+      try {
+        const r = await api("orders.sendBatch", { orders: lote, archivo: ORDENES_ARCHIVO });
+        enviadas.push(...r.enviadas);
+        rechazadas.push(...r.rechazadas);
+      } catch (e) {
+        // No cortamos todo: registramos el error de esta tanda y seguimos
+        rechazadas.push({ orden: `tanda ${desde}-${hasta}`, error: e.message });
+      }
     }
+
+    box.innerHTML = `
+      <div class="border rounded-lg p-4 ${rechazadas.length ? "bg-amber-50" : "bg-green-50"}">
+        <div class="font-bold mb-2">✅ Enviadas y aceptadas por Tango: ${enviadas.length} de ${total}</div>
+        <div class="max-h-40 overflow-y-auto">
+          ${enviadas.map((id) => `<span class="inline-block bg-white border rounded px-2 py-0.5 text-xs mr-1 mb-1">${esc(id)}</span>`).join("")}
+        </div>
+        ${rechazadas.length ? `<div class="font-bold mt-3 mb-1 text-red-700">❌ Rechazadas / con problema: ${rechazadas.length}</div>
+          <div class="max-h-40 overflow-y-auto">
+          ${rechazadas.map((f) => `<div class="text-sm text-red-700">· ${esc(f.orden)}: ${esc(f.error)}</div>`).join("")}
+          </div>` : ""}
+      </div>`;
+    toast(`${enviadas.length} órdenes enviadas a Tango`, rechazadas.length ? "warning" : "ok");
+    cargarHistorialOrdenes();
   });
 }
 
