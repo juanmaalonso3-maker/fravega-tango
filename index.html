@@ -516,6 +516,21 @@ function enviarOrdenes() {
           </div>` : ""}
       </div>`;
     toast(`${enviadas.length} órdenes enviadas a Tango`, rechazadas.length ? "warning" : "ok");
+    // Registrar UNA fila de resumen en el Historial de importaciones. El envío
+    // por tandas (orders.sendBatch) no lo hacía, por eso no aparecía el import.
+    try {
+      const a = ORDENES_ANALISIS || {};
+      await api("orders.recordImport", {
+        archivo: ORDENES_ARCHIVO,
+        total_filas: a.total_filas,
+        filas_pendientes: a.filas_pendientes,
+        nuevas: total,
+        enviadas: enviadas,
+        rechazadas: rechazadas,
+        excluidas: a.excluidas || [],
+        saltadas: a.saltadas || [],
+      });
+    } catch (e) { /* el historial es secundario: no cortamos el flujo */ }
     cargarHistorialOrdenes();
   });
 }
@@ -872,6 +887,8 @@ async function viewConfig() {
   catch (e) { if (!stillOn("config")) return; return setMain(H("Configuración") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
   if (!stillOn("config")) return;
   const v = cfg.valores;
+  // Depósito de destino de las órdenes en Tango: por defecto "04".
+  if (!v.orders_warehouse_code) v.orders_warehouse_code = "04";
 
   const campo = ([key, label, tipo]) => tipo === "bool"
     ? `<label class="flex items-center gap-2 text-sm py-1">
