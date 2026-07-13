@@ -445,9 +445,7 @@ async function analizarOrdenes() {
     ORDENES_ROWS = await parseFile(input.files[0]);
     ORDENES_ARCHIVO = input.files[0].name;
     ORDENES_ANALISIS = await api("orders.analyze", { rows: ORDENES_ROWS, archivo: ORDENES_ARCHIVO });
-    // El backend devuelve las órdenes a enviar en "nuevas". (Antes se leía
-    // ".orders", que no existe, y por eso el envío decía "0 pedidos".)
-    ORDENES_COMPLETAS = ORDENES_ANALISIS.nuevas || ORDENES_ANALISIS.orders || [];
+    ORDENES_COMPLETAS = ORDENES_ANALISIS.orders || [];
   } catch (e) {
     ORDENES_ANALISIS = null;
     return $("ordenes-resultado").innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`;
@@ -480,8 +478,8 @@ async function analizarOrdenes() {
 
 function enviarOrdenes() {
   const total = ORDENES_COMPLETAS.length;
-  confirmar(`Se van a crear ${total} pedido(s) en Tango, en tandas de 40. ¿Continuar?`, async () => {
-    const TANDA = 40;
+  confirmar(`Se van a crear ${total} pedido(s) en Tango, en tandas de 25. ¿Continuar?`, async () => {
+    const TANDA = 25;  // igual al orders_batch_size del backend (25)
     const enviadas = [], rechazadas = [];
     const box = $("ordenes-resultado");
 
@@ -874,8 +872,6 @@ async function viewConfig() {
   catch (e) { if (!stillOn("config")) return; return setMain(H("Configuración") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
   if (!stillOn("config")) return;
   const v = cfg.valores;
-  // Depósito de destino de las órdenes en Tango: por defecto "04".
-  if (!v.orders_warehouse_code) v.orders_warehouse_code = "04";
 
   const campo = ([key, label, tipo]) => tipo === "bool"
     ? `<label class="flex items-center gap-2 text-sm py-1">
