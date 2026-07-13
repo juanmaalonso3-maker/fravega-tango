@@ -264,8 +264,16 @@ function showApp() {
   route();
 }
 
+function currentView() {
+  return (location.hash || "#dashboard").slice(1).split("?")[0];
+}
+// Devuelve true si el usuario SIGUE en la vista indicada. Las vistas async
+// deben chequear esto después de cada await antes de pintar, así una llamada
+// lenta (p. ej. el dashboard) no sobreescribe la pantalla si ya navegaste.
+function stillOn(view) { return currentView() === view; }
+
 function route() {
-  const view = (location.hash || "#dashboard").slice(1).split("?")[0];
+  const view = currentView();
   document.querySelectorAll(".nav-item").forEach((el) =>
     el.classList.toggle("active", el.dataset.view === view));
   ({ dashboard: viewDashboard, stock: viewStock, ordenes: viewOrdenes,
@@ -282,7 +290,8 @@ async function viewDashboard() {
   setMain(H("Dashboard") + spinner("Consultando Tango y Frávega..."));
   let d;
   try { d = await api("dashboard"); }
-  catch (e) { return setMain(H("Dashboard") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+  catch (e) { if (!stillOn("dashboard")) return; return setMain(H("Dashboard") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+  if (!stillOn("dashboard")) return;  // navegó a otra sección mientras cargaba
 
   const estado = (s) => s.ok
     ? `<div class="text-green-600 font-bold text-lg">● Conectado</div><div class="text-xs text-gray-500">${esc(s.detalle)}</div>`
@@ -335,7 +344,8 @@ async function viewStock() {
   setMain(H("Sincronización de Stock") + spinner());
   let st, hist;
   try { [st, hist] = await Promise.all([api("stock.status"), api("stock.history")]); }
-  catch (e) { return setMain(H("Sincronización de Stock") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+  catch (e) { if (!stillOn("stock")) return; return setMain(H("Sincronización de Stock") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+  if (!stillOn("stock")) return;
 
   const rows = hist.map((h) => `
     <tr class="cursor-pointer" onclick='verDetalleSync(${JSON.stringify(String(h.detalle_json || "[]"))})'>
@@ -435,7 +445,9 @@ async function analizarOrdenes() {
     ORDENES_ROWS = await parseFile(input.files[0]);
     ORDENES_ARCHIVO = input.files[0].name;
     ORDENES_ANALISIS = await api("orders.analyze", { rows: ORDENES_ROWS, archivo: ORDENES_ARCHIVO });
-    ORDENES_COMPLETAS = ORDENES_ANALISIS.orders || [];
+    // El backend devuelve las órdenes a enviar en "nuevas". (Antes se leía
+    // ".orders", que no existe, y por eso el envío decía "0 pedidos".)
+    ORDENES_COMPLETAS = ORDENES_ANALISIS.nuevas || ORDENES_ANALISIS.orders || [];
   } catch (e) {
     ORDENES_ANALISIS = null;
     return $("ordenes-resultado").innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`;
@@ -594,7 +606,8 @@ async function viewSkus() {
   const q = new URLSearchParams(location.hash.split("?")[1] || "").get("q") || "";
   let rels;
   try { rels = await api("skus.list", { q }); }
-  catch (e) { return setMain(H("Relación de SKUs") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+  catch (e) { if (!stillOn("skus")) return; return setMain(H("Relación de SKUs") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+  if (!stillOn("skus")) return;
   window._SKUS_CACHE = rels;
 
   setMain(H("Relación de SKUs") + `
@@ -734,7 +747,8 @@ async function viewPendientes() {
   setMain(H("SKU Pendientes") + spinner());
   let pend;
   try { pend = await api("pending.list"); }
-  catch (e) { return setMain(H("SKU Pendientes") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+  catch (e) { if (!stillOn("pendientes")) return; return setMain(H("SKU Pendientes") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+  if (!stillOn("pendientes")) return;
 
   setMain(H("SKU Pendientes") + `
     <p class="text-sm text-gray-600 mb-4">SKUs detectados sin relación durante la sincronización de
@@ -857,8 +871,11 @@ async function viewConfig() {
   setMain(H("Configuración") + spinner());
   let cfg;
   try { cfg = await api("settings.get"); }
-  catch (e) { return setMain(H("Configuración") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+  catch (e) { if (!stillOn("config")) return; return setMain(H("Configuración") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+  if (!stillOn("config")) return;
   const v = cfg.valores;
+  // Depósito de destino de las órdenes en Tango: por defecto "04".
+  if (!v.orders_warehouse_code) v.orders_warehouse_code = "04";
 
   const campo = ([key, label, tipo]) => tipo === "bool"
     ? `<label class="flex items-center gap-2 text-sm py-1">
