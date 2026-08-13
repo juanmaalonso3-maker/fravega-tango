@@ -1,0 +1,1283 @@
+/**
+ * ═══════════════════════════════════════════════════════════════
+ *  PLATAFORMA TANGO ↔ FRÁVEGA — Backend (Google Apps Script)
+ *  Grupo Bitek
+ *
+ *  Base de datos: la Google Sheet a la que está vinculado este script.
+ *  Frontend: index.html en GitHub Pages (llama a este script vía doPost).
+ *
+ *  PUESTA EN MARCHA (una sola vez):
+ *    1. Completar INITIAL_CREDENTIALS acá abajo.
+ *    2. Ejecutar la función SETUP (botón ▶) y autorizar permisos.
+ *    3. Implementar → Nueva implementación → App web
+ *       (Ejecutar como: YO · Acceso: Cualquier persona) → copiar URL /exec.
+ *    4. Pegar esa URL en el index.html (constante API_URL).
+ *  Ver INSTRUCCIONES.md para el paso a paso completo.
+ * ═══════════════════════════════════════════════════════════════
+ */
+
+// ── Credenciales iniciales (SETUP las guarda en Script Properties y
+//    después podés borrarlas de acá si querés) ─────────────────────
+var INITIAL_CREDENTIALS = {
+  TANGO_ACCESS_TOKEN: 'f156249c-936d-4fa7-b3a7-1b181615677d_16488',
+  FRAVEGA_SELLER_ID: 'fravegasellerprod1380',
+  FRAVEGA_API_KEY: '6a442816637d9cf422c6c608',
+  FRAVEGA_API_TOKEN: 'df500e4446e6e82c0ee94f5ff84ab84dae167085a3c596cffd79892d9507fc71d64f39d4',
+  GOOGLE_CLIENT_ID: '849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com'
+};
+
+var ALLOWED_DOMAINS = ['bitek.com.ar'];
+var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
+var SESSION_HOURS = 12;
+
+// ── Endpoints externos ─────────────────────────────────────────────
+var TANGO_BASE = 'https://tiendas.axoft.com/api/Aperture';
+var FRAVEGA_BASE = 'https://seller-center-api.fravega.com';
+
+// ── Nombres de pestañas de la Sheet ────────────────────────────────
+var SH = {
+  CONFIG: 'Config',
+  SKUS: 'RelacionesSKU',
+  PENDING: 'Pendientes',
+  LOGS: 'Logs',
+  SYNCS: 'HistorialSync',
+  ORDERS: 'HistorialOrdenes',
+  INVOICES: 'HistorialFacturas',
+  SENT: 'OrdenesEnviadas'
+};
+
+var DEFAULT_CONFIG = [
+  ['stock_warehouse_code', '04', 'Depósito de Tango para el stock'],
+  ['stock_subtract_engaged', '1', 'Restar comprometido (EngagedQuantity)'],
+  ['stock_discount_pending', '1', 'Descontar pedidos pendientes (API Tango)'],
+  ['stock_pause_ms', '300', 'Pausa entre llamadas a Frávega (ms)'],
+  ['scheduler_enabled', '1', 'Sincronización automática habilitada'],
+  ['scheduler_hours', '7,19', 'Horas del día para sincronizar (0-23, separadas por coma)'],
+  ['orders_counterfoil', '46', 'Talonario de pedido'],
+  ['orders_invoice_counterfoil', '43', 'Talonario de factura'],
+  ['orders_warehouse_code', '04', 'Depósito (pedidos) — de aquí se descuenta el stock al facturar'],
+  ['orders_seller_code', '01', 'Vendedor'],
+  ['orders_sale_condition', '3', 'Condición de venta (3 = FRÁVEGA MARKETPLACE)'],
+  ['orders_iva_category', 'CF', 'Categoría de IVA'],
+  ['orders_document_type', '96', 'Tipo de documento'],
+  ['orders_payment_method', 'A01', 'Forma de cobro'],
+  ['orders_batch_size', '25', 'Órdenes por lote'],
+  ['orders_estado_objetivo', 'Pendiente', 'Estado de facturación a importar'],
+  ['invoices_add_prefix', '1', 'Agregar prefijo al Nro de orden'],
+  ['invoices_prefix', 'FVG-', 'Prefijo'],
+  ['invoices_estado_objetivo', 'Pendiente', 'Estado a matchear en facturas'],
+  ['invoices_template_id', '', 'ID de la Sheet plantilla de facturas (lo completa SETUP)']
+];
+
+var SEED_RELATIONS = [
+  ['22160', '22712991'], ['18502', '22718907'], ['19501', '22718918'],
+  ['21406', '22712922'], ['19502', '22718915'], ['19504', '22718912'],
+  ['21405', '22712923'], ['18501', '22718908'], ['23106', '22718921'],
+  ['18503', '22718905'], ['30006', '22712989'], ['65002', '22718877'],
+  ['55840', '22718934'], ['72156', '22718958'], ['21605', '22712584'],
+  ['20608', '22712583'], ['10305', '22712955'], ['22506', '22712990'],
+  ['46050', '22716013'], ['47820', '22716014']
+];
+
+/* ═══════════════ SETUP (ejecutar una vez) ═══════════════ */
+
+function SETUP() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  ss.setSpreadsheetTimeZone('America/Argentina/Buenos_Aires');
+
+  // Pestañas + encabezados
+  _ensureSheet(ss, SH.CONFIG, ['clave', 'valor', 'descripcion']);
+  _ensureSheet(ss, SH.SKUS, ['sku_tango', 'fravega_item_id', 'fravega_refid',
+                             'descripcion', 'creada', 'modificada']);
+  _ensureSheet(ss, SH.PENDING, ['sku', 'origen', 'estado', 'observaciones',
+                                'detectado_en', 'resuelto_en']);
+  _ensureSheet(ss, SH.LOGS, ['fecha_hora', 'usuario', 'modulo', 'accion',
+                             'resultado', 'detalle', 'duracion_ms']);
+  _ensureSheet(ss, SH.SYNCS, ['inicio', 'fin', 'disparada_por', 'resultado',
+                              'ok', 'errores', 'no_publicados', 'sin_relacion', 'detalle_json']);
+  _ensureSheet(ss, SH.ORDERS, ['fecha_hora', 'usuario', 'archivo', 'total_filas',
+                               'pendientes', 'nuevas', 'enviadas', 'rechazadas', 'detalle_json']);
+  _ensureSheet(ss, SH.INVOICES, ['fecha_hora', 'usuario', 'archivo', 'cargadas',
+                                 'sin_factura', 'sobrantes', 'detalle_json']);
+  _ensureSheet(ss, SH.SENT, ['order_id', 'fecha_hora']);
+
+  // Config por defecto (solo claves faltantes)
+  var cfgSheet = ss.getSheetByName(SH.CONFIG);
+  var existing = _colValues(cfgSheet, 1);
+  DEFAULT_CONFIG.forEach(function (row) {
+    if (existing.indexOf(row[0]) === -1) cfgSheet.appendRow(row);
+  });
+
+  // Seed de relaciones si está vacía
+  var skuSheet = ss.getSheetByName(SH.SKUS);
+  if (skuSheet.getLastRow() < 2) {
+    var ts = _now();
+    SEED_RELATIONS.forEach(function (r) {
+      skuSheet.appendRow([r[0], r[1], r[0], '', ts, ts]); // refId = SKU Tango
+    });
+  }
+
+  // (El .xlsx de facturas se genera 100% por código con su estructura completa;
+  //  ya no hace falta una plantilla en Drive.)
+
+  // Credenciales → Script Properties
+  var props = PropertiesService.getScriptProperties();
+  Object.keys(INITIAL_CREDENTIALS).forEach(function (k) {
+    if (INITIAL_CREDENTIALS[k]) props.setProperty(k, INITIAL_CREDENTIALS[k]);
+  });
+  if (!props.getProperty('SECRET_KEY')) {
+    props.setProperty('SECRET_KEY', Utilities.getUuid() + Utilities.getUuid());
+  }
+
+  configurarTriggers();
+  log_('sistema', 'sistema', 'SETUP ejecutado', 'ok', '');
+  return 'SETUP completo. Ahora: Implementar → Nueva implementación → App web.';
+}
+
+/** Crea/actualiza los triggers según scheduler_hours. Ejecutar tras cambiar horarios. */
+function configurarTriggers() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'syncProgramada') ScriptApp.deleteTrigger(t);
+  });
+  var horas = String(getConfig('scheduler_hours') || '7,19').split(',');
+  horas.forEach(function (h) {
+    h = parseInt(h.trim(), 10);
+    if (!isNaN(h) && h >= 0 && h <= 23) {
+      ScriptApp.newTrigger('syncProgramada').timeBased().everyDays(1).atHour(h).create();
+    }
+  });
+}
+
+function syncProgramada() {
+  if (getConfig('scheduler_enabled') !== '1') return;
+  runStockSync('scheduler');
+}
+
+/**
+ * EJECUTAR UNA VEZ desde el editor (botón ▶) después de pegar esta versión.
+ *
+ * Fuerza en la hoja Config los dos valores pedidos, aunque las claves ya
+ * existan con otro valor:
+ *   - Condición de venta = 3  (FRÁVEGA MARKETPLACE)
+ *   - Depósito de pedidos = 04 (de este depósito se descuenta el stock al facturar)
+ *
+ * Por qué hace falta: la app lee lo que hay en la hoja Config, NO lo que dice
+ * DEFAULT_CONFIG del código. Cambiar el código solo afecta a una instalación
+ * nueva; para una que ya está andando hay que escribir el valor en la hoja,
+ * que es justo lo que hace esta función. No requiere re-implementar la App web.
+ */
+function ACTUALIZAR_CONDICION_Y_DEPOSITO() {
+  setConfig('orders_sale_condition', '3');
+  setConfig('orders_warehouse_code', '04');
+  log_('sistema', 'configuracion',
+       'Aplicado: condición de venta=3 (FRÁVEGA MARKETPLACE), depósito pedidos=04',
+       'ok', '');
+  return 'Listo: condición de venta = 3 (FRÁVEGA MARKETPLACE), depósito pedidos = 04.';
+}
+
+/* ═══════════════ API HTTP (doPost) ═══════════════ */
+
+function doGet() {
+  return _json({ ok: true, servicio: 'Plataforma Tango-Fravega', hora: _now() });
+}
+
+function doPost(e) {
+  var req;
+  try { req = JSON.parse(e.postData.contents); }
+  catch (err) { return _json({ error: 'JSON inválido' }); }
+
+  var action = req.action || '';
+  try {
+    // Login: única acción sin token de sesión
+    if (action === 'login') return _json(login(req.credential));
+
+    var user = _checkSession(req.token); // lanza si es inválido
+    var p = req.payload || {};
+    var out;
+    switch (action) {
+      case 'dashboard':          out = apiDashboard(); break;
+      case 'stock.sync':         out = apiStockSync(user); break;
+      case 'stock.status':       out = apiStockStatus(); break;
+      case 'stock.history':      out = _readRows(SH.SYNCS, 50).reverse(); break;
+      case 'orders.analyze':     out = apiOrdersAnalyze(user, p.rows, p.archivo); break;
+      case 'orders.send':        out = apiOrdersSend(user, p.rows, p.archivo); break;
+      case 'orders.sendBatch':   out = apiOrdersSendBatch(user, p.orders, p.archivo); break;
+      case 'orders.recordImport':out = apiOrdersRecordImport(user, p); break;
+      case 'orders.history':     out = _readRows(SH.ORDERS, 50).reverse(); break;
+      case 'invoices.generate':  out = apiInvoicesGenerate(user, p.ordenes, p.facturas); break;
+      case 'invoices.history':   out = _readRows(SH.INVOICES, 50).reverse(); break;
+      case 'skus.list':          out = apiSkusList(p.q || ''); break;
+      case 'skus.save':          out = apiSkusSave(user, p); break;
+      case 'skus.delete':        out = apiSkusDelete(user, p.sku_tango); break;
+      case 'skus.import':        out = apiSkusImport(user, p.rows); break;
+      case 'pending.list':       out = _pendingList(); break;
+      case 'pending.resolve':    out = apiPendingResolve(user, p.sku, p.origen); break;
+      case 'logs.list':          out = apiLogsList(p); break;
+      case 'settings.get':       out = apiSettingsGet(); break;
+      case 'settings.set':       out = apiSettingsSet(user, p.valores); break;
+      default: throw new Error('Acción desconocida: ' + action);
+    }
+    return _json({ ok: true, data: out });
+  } catch (err) {
+    var msg = String(err && err.message ? err.message : err);
+    if (msg.indexOf('AUTH:') === 0) return _json({ error: msg.slice(5), auth: true });
+    log_('sistema', 'sistema', 'Error en acción ' + action, 'error', msg);
+    return _json({ error: msg });
+  }
+}
+
+/* ═══════════════ AUTH ═══════════════ */
+
+function login(credential) {
+  if (!credential) throw new Error('Falta el credential de Google');
+  var r = UrlFetchApp.fetch(
+    'https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(credential),
+    { muteHttpExceptions: true });
+  if (r.getResponseCode() !== 200) throw new Error('Token de Google inválido');
+  var info = JSON.parse(r.getContentText());
+  var clientId = _prop('GOOGLE_CLIENT_ID');
+  if (clientId && info.aud !== clientId) throw new Error('El token no corresponde a esta aplicación');
+  if (String(info.email_verified) !== 'true') throw new Error('Email no verificado');
+  var email = String(info.email || '').toLowerCase();
+  if (!_emailAllowed(email)) {
+    log_(email, 'auth', 'Login rechazado', 'warning', '');
+    throw new Error('Acceso denegado para ' + email);
+  }
+  log_(email, 'auth', 'Login', 'ok', '');
+  return { token: _makeSession(email, info.name || email),
+           email: email, name: info.name || email, picture: info.picture || '' };
+}
+
+function _emailAllowed(email) {
+  if (ALLOWED_EMAILS.indexOf(email) !== -1) return true;
+  var dom = email.split('@')[1] || '';
+  return ALLOWED_DOMAINS.indexOf(dom) !== -1;
+}
+
+function _makeSession(email, name) {
+  var payload = Utilities.base64EncodeWebSafe(JSON.stringify(
+    { email: email, name: name, exp: Date.now() + SESSION_HOURS * 3600 * 1000 }));
+  return payload + '.' + _hmac(payload);
+}
+
+function _checkSession(token) {
+  if (!token || token.indexOf('.') === -1) throw new Error('AUTH:Falta la sesión');
+  var parts = token.split('.');
+  if (_hmac(parts[0]) !== parts[1]) throw new Error('AUTH:Sesión inválida');
+  var payload = JSON.parse(Utilities.newBlob(
+    Utilities.base64DecodeWebSafe(parts[0])).getDataAsString());
+  if (payload.exp < Date.now()) throw new Error('AUTH:Sesión expirada');
+  if (!_emailAllowed(payload.email)) throw new Error('AUTH:Acceso revocado');
+  return payload;
+}
+
+function _hmac(text) {
+  var sig = Utilities.computeHmacSha256Signature(text, _prop('SECRET_KEY'));
+  return sig.map(function (b) { return ('0' + (b & 255).toString(16)).slice(-2); }).join('');
+}
+
+/* ═══════════════ CLIENTES TANGO / FRÁVEGA ═══════════════ */
+
+function _tangoHeaders() {
+  return { accesstoken: _prop('TANGO_ACCESS_TOKEN'), 'Content-Type': 'application/json' };
+}
+
+function tangoVerify() {
+  try {
+    var r = UrlFetchApp.fetch(TANGO_BASE + '/dummy',
+      { method: 'post', headers: _tangoHeaders(), muteHttpExceptions: true });
+    var data = JSON.parse(r.getContentText());
+    return data.isOk ? [true, 'Token válido'] : [false, String(data.Message || 'Token inválido')];
+  } catch (e) { return [false, 'Sin conexión con Tango: ' + e.message]; }
+}
+
+function tangoFetchStock(warehouse, discountPending) {
+  var all = [], page = 1;
+  while (true) {
+    var url = TANGO_BASE + '/Stock?pageSize=500&pageNumber=' + page +
+      (warehouse ? '&WarehouseCode=' + encodeURIComponent(warehouse) : '') +
+      (discountPending ? '&discountPendingOrders=true' : '');
+    var r = UrlFetchApp.fetch(url, { headers: _tangoHeaders(), muteHttpExceptions: true });
+    if (r.getResponseCode() !== 200) {
+      throw new Error('Tango /Stock HTTP ' + r.getResponseCode() + ': ' +
+                      r.getContentText().slice(0, 200));
+    }
+    var body = JSON.parse(r.getContentText());
+    all = all.concat(body.Data || []);
+    if (!body.Paging || !body.Paging.MoreData) break;
+    page++;
+  }
+  return all;
+}
+
+function tangoSendBatch(orders) {
+  var r = UrlFetchApp.fetch(TANGO_BASE + '/order/batch', {
+    method: 'post', headers: _tangoHeaders(), contentType: 'application/json',
+    payload: JSON.stringify({ OrderBatch: orders }), muteHttpExceptions: true
+  });
+  var raw = r.getContentText();
+  if (r.getResponseCode() !== 200) {
+    throw new Error('Tango /order/batch HTTP ' + r.getResponseCode() + ': ' + raw.slice(0, 300));
+  }
+  var parsed;
+  try { parsed = JSON.parse(raw); }
+  catch (e) {
+    throw new Error('Tango /order/batch devolvió una respuesta no-JSON: ' + raw.slice(0, 300));
+  }
+  // Si Tango marca un error a nivel de la respuesta completa, lo exponemos.
+  if (parsed && parsed.isOk === false && !_respData(parsed).length) {
+    throw new Error('Tango /order/batch rechazó el lote: ' +
+                    String(parsed.Message || raw).slice(0, 300));
+  }
+  parsed.__raw = raw;               // crudo para diagnóstico
+  return parsed;
+}
+
+function _fravegaHeaders() {
+  return {
+    'seller-id': _prop('FRAVEGA_SELLER_ID'),
+    'x-fvg-api-key': _prop('FRAVEGA_API_KEY'),
+    'x-fvg-api-token': _prop('FRAVEGA_API_TOKEN')
+  };
+}
+
+function fravegaUpdateStock(refid, quantity) {
+  var url = FRAVEGA_BASE + '/api/v1/item/stock?refId=' + encodeURIComponent(refid);
+  for (var intento = 0; intento <= 2; intento++) {
+    try {
+      var r = UrlFetchApp.fetch(url, {
+        method: 'put', headers: _fravegaHeaders(), contentType: 'application/json',
+        payload: JSON.stringify({ quantity: Math.round(quantity) }),
+        muteHttpExceptions: true
+      });
+      var code = r.getResponseCode();
+      if (code === 200) return [true, '200'];
+      if ([429, 500, 502, 503, 504].indexOf(code) !== -1 && intento < 2) {
+        Utilities.sleep(2000 * (intento + 1)); continue;
+      }
+      return [false, 'HTTP ' + code + ': ' + r.getContentText().slice(0, 200)];
+    } catch (e) {
+      if (intento < 2) { Utilities.sleep(2000 * (intento + 1)); continue; }
+      return [false, 'excepción: ' + e.message];
+    }
+  }
+  return [false, 'agotados los reintentos'];
+}
+
+function fravegaPing() {
+  try {
+    var r = UrlFetchApp.fetch(FRAVEGA_BASE + '/api/v1/item/stock?refId=__ping__', {
+      method: 'put', headers: _fravegaHeaders(), contentType: 'application/json',
+      payload: '{"quantity":0}', muteHttpExceptions: true
+    });
+    var code = r.getResponseCode();
+    if (code === 404) return [true, 'Conexión y credenciales OK'];
+    if (code === 401 || code === 403) return [false, 'Credenciales rechazadas (HTTP ' + code + ')'];
+    if (code === 200) return [true, 'Conexión OK'];
+    return [false, 'HTTP ' + code];
+  } catch (e) { return [false, 'Sin conexión con Frávega: ' + e.message]; }
+}
+
+/* ═══════════════ MÓDULO STOCK ═══════════════ */
+
+function runStockSync(disparadaPor) {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return { resultado: 'omitida', mensaje: 'Ya hay una sincronización en curso' };
+  var t0 = Date.now();
+  var inicio = _now();
+  var detalle = [], ok = 0, errores = 0, noPublicados = 0, sinRelacion = 0;
+  try {
+    log_(disparadaPor, 'stock', 'Inicio de sincronización', 'info', '');
+    var vt = tangoVerify();
+    if (!vt[0]) throw new Error('Token de Tango inválido: ' + vt[1]);
+
+    var warehouse = getConfig('stock_warehouse_code');
+    var records = tangoFetchStock(warehouse, getConfig('stock_discount_pending') === '1');
+
+    // Disponible = Quantity - Engaged (si aplica), nunca negativo
+    var restar = getConfig('stock_subtract_engaged') === '1';
+    var stock = {};
+    records.forEach(function (it) {
+      var sku = String(it.SKUCode || '').trim();
+      if (!sku) return;
+      var q = Number(it.Quantity) || 0;
+      if (restar) q -= Number(it.EngagedQuantity) || 0;
+      stock[sku] = (stock[sku] || 0) + q;
+    });
+    Object.keys(stock).forEach(function (s) { if (stock[s] < 0) stock[s] = 0; });
+    log_(disparadaPor, 'stock', 'Stock leído de Tango (depósito ' + warehouse + ')',
+         'info', Object.keys(stock).length + ' artículos con saldo');
+
+    var rels = _skuRelations();          // { sku_tango: {item_id, refid} }
+    var pauseMs = parseInt(getConfig('stock_pause_ms') || '300', 10);
+
+    // SKUs de Tango sin relación → pendientes
+    Object.keys(stock).forEach(function (sku) {
+      if (!rels[sku]) {
+        sinRelacion++;
+        _pendingAdd(sku, 'Tango', 'Detectado en sincronización de stock sin relación');
+      }
+    });
+
+    // Envío (todos los SKUs con relación; sin registro en depósito = 0)
+    Object.keys(rels).forEach(function (sku) {
+      var qty = Math.round(stock[sku] || 0);
+      var refid = rels[sku].refid || sku;
+      var res = fravegaUpdateStock(refid, qty);
+      if (res[0]) { ok++; detalle.push({ sku: sku, refId: refid, cantidad: qty, estado: 'ok' }); }
+      else if (res[1].indexOf('ref_id_not_found') !== -1) {
+        noPublicados++;
+        detalle.push({ sku: sku, refId: refid, cantidad: qty, estado: 'no publicado' });
+      } else {
+        errores++;
+        detalle.push({ sku: sku, refId: refid, cantidad: qty, estado: 'error', detalle: res[1] });
+        log_(disparadaPor, 'stock', 'Error al actualizar ' + sku, 'error', res[1]);
+      }
+      Utilities.sleep(pauseMs);
+    });
+
+    var resultado = errores === 0 ? 'ok' : 'con errores';
+    _appendRow(SH.SYNCS, [inicio, _now(), disparadaPor, resultado, ok, errores,
+                          noPublicados, sinRelacion, JSON.stringify(detalle)]);
+    log_(disparadaPor, 'stock', 'Sincronización finalizada',
+         errores === 0 ? 'ok' : 'warning',
+         'ok=' + ok + ' errores=' + errores + ' no_publicados=' + noPublicados +
+         ' sin_relacion=' + sinRelacion, Date.now() - t0);
+    return { resultado: resultado, ok: ok, errores: errores,
+             no_publicados: noPublicados, sin_relacion: sinRelacion, detalle: detalle };
+  } catch (e) {
+    _appendRow(SH.SYNCS, [inicio, _now(), disparadaPor, 'falló', ok, errores,
+                          noPublicados, sinRelacion, JSON.stringify(detalle)]);
+    log_(disparadaPor, 'stock', 'Sincronización abortada', 'error', e.message, Date.now() - t0);
+    return { resultado: 'falló', error: e.message };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function apiStockSync(user) { return runStockSync(user.email); }
+
+function apiStockStatus() {
+  var hist = _readRows(SH.SYNCS, 1);
+  return {
+    ultima: hist.length ? hist[hist.length - 1] : null,
+    proxima: _proximaSync(),
+    habilitada: getConfig('scheduler_enabled') === '1'
+  };
+}
+
+function _proximaSync() {
+  if (getConfig('scheduler_enabled') !== '1') return null;
+  var horas = String(getConfig('scheduler_hours') || '7,19').split(',')
+    .map(function (h) { return parseInt(h.trim(), 10); })
+    .filter(function (h) { return !isNaN(h) && h >= 0 && h <= 23; })
+    .sort(function (a, b) { return a - b; });
+  if (!horas.length) return null;
+  var tz = 'America/Argentina/Buenos_Aires';
+  var ahora = new Date();
+  var horaActual = parseInt(Utilities.formatDate(ahora, tz, 'H'), 10);
+  for (var i = 0; i < horas.length; i++) {
+    if (horas[i] > horaActual) {
+      return Utilities.formatDate(ahora, tz, 'yyyy-MM-dd') + ' ' +
+             ('0' + horas[i]).slice(-2) + ':00 (aprox.)';
+    }
+  }
+  var maniana = new Date(ahora.getTime() + 24 * 3600 * 1000);
+  return Utilities.formatDate(maniana, tz, 'yyyy-MM-dd') + ' ' +
+         ('0' + horas[0]).slice(-2) + ':00 (aprox.)';
+}
+
+/* ═══════════════ MÓDULO ÓRDENES ═══════════════ */
+
+var PROVINCE_MAP = {
+  'CIUDAD AUTONOMA DE BUENOS AIRES': '0', 'CAPITAL FEDERAL': '0', 'CABA': '0',
+  'BUENOS AIRES': '1', 'CATAMARCA': '2', 'CORDOBA': '3', 'CORRIENTES': '4',
+  'ENTRE RIOS': '5', 'JUJUY': '6', 'MENDOZA': '7', 'LA RIOJA': '8',
+  'SALTA': '9', 'SAN JUAN': '10', 'SAN LUIS': '11', 'SANTA FE': '12',
+  'SANTIAGO DEL ESTERO': '13', 'TUCUMAN': '14', 'CHACO': '16', 'CHUBUT': '17',
+  'FORMOSA': '18', 'MISIONES': '19', 'NEUQUEN': '20', 'LA PAMPA': '21',
+  'RIO NEGRO': '22', 'SANTA CRUZ': '23', 'TIERRA DEL FUEGO': '24'
+};
+
+function _normalize(t) {
+  return String(t || '').toUpperCase()
+    .replace(/Á/g, 'A').replace(/É/g, 'E').replace(/Í/g, 'I')
+    .replace(/Ó/g, 'O').replace(/Ú/g, 'U').replace(/Ñ/g, 'N').trim();
+}
+
+function _provinceCode(name) {
+  var n = _normalize(name);
+  if (PROVINCE_MAP[n]) return PROVINCE_MAP[n];
+  for (var k in PROVINCE_MAP) if (n.indexOf(k) !== -1) return PROVINCE_MAP[k];
+  return '1';
+}
+
+function _cleanName(full) {
+  var raw = String(full || '').trim(), email = '';
+  var m = raw.match(/\S+@\S+\.\S+/);
+  if (m) { email = m[0]; raw = raw.replace(email, '').trim(); }
+  raw = raw.replace(/\s+/g, ' ').trim();
+  var i = raw.indexOf(' ');
+  return i === -1 ? [raw, '', email] : [raw.slice(0, i), raw.slice(i + 1), email];
+}
+
+function _parseAddress(addr) {
+  addr = String(addr || '').trim();
+  var m = addr.match(/^(.+?)\s+(\d+\s*[A-Za-z]?)$/);
+  if (m) return [m[1].trim().slice(0, 30), m[2].trim()];
+  return [addr.slice(0, 30), ''];
+}
+
+function _s(v, def) {
+  if (v === null || v === undefined) return def || '';
+  var s = String(v).trim();
+  return (s === '' || s.toLowerCase() === 'nan') ? (def || '') : s;
+}
+
+function _dni(v) {
+  var s = _s(v);
+  return s.indexOf('.') !== -1 ? s.split('.')[0] : s;
+}
+
+function _buildOrder(orderId, rows, rels, cfg) {
+  var first = rows[0], items = [], unmapped = [];
+  rows.forEach(function (row) {
+    var skuF = String(parseInt(row['SKU'], 10));
+    var found = null;
+    for (var st in rels) if (rels[st].item_id === skuF) { found = st; break; }
+    if (!found) { unmapped.push(skuF); return; }
+    items.push({
+      ProductCode: skuF, SKUCode: found,
+      Description: _s(row['Descripción SKU']).slice(0, 400),
+      Quantity: Number(row['Cantidad de SKU']) || 1,
+      UnitPrice: Number(row['Valor del SKU']) || 0,
+      DiscountPercentage: 0.0
+    });
+  });
+  if (unmapped.length) return [null, unmapped];
+
+  var total = 0;
+  rows.forEach(function (r) {
+    total += (Number(r['Valor del SKU']) || 0) * (Number(r['Cantidad de SKU']) || 1);
+  });
+  total = Math.round(total * 100) / 100;
+
+  var nombre = _cleanName(_s(first['Cliente']));
+  var dni = _dni(first['DNI']);
+  var billAddr = _parseAddress(_s(first['Domicilio de Facturación']));
+  var billCity = _s(first['Ciudad']).slice(0, 20);
+  var billProv = _provinceCode(_s(first['Provincia']));
+  var billPostal = _s(first['Código Postal']);
+  var delAddrRaw = _s(first['Domicilio de entrega']);
+  var delAddr = delAddrRaw ? _parseAddress(delAddrRaw) : billAddr;
+  var delCity = _s(first['Ciudad.1']).slice(0, 20) || billCity;
+  var delProvRaw = _s(first['Provincia.1']);
+  var digits = String(orderId).replace(/\D/g, '');
+
+  return [{
+    OrderID: orderId, OrderNumber: orderId,
+    OrderCounterfoil: parseInt(cfg.orders_counterfoil, 10),
+    InvoiceCounterfoil: parseInt(cfg.orders_invoice_counterfoil, 10),
+    Date: _s(first['Fecha de Compra']).replace(/\//g, '-') + 'T00:00:00',
+    Total: total, PaidTotal: total, FinancialSurcharge: 0.0,
+    WarehouseCode: cfg.orders_warehouse_code, SellerCode: cfg.orders_seller_code,
+    SaleConditionCode: cfg.orders_sale_condition,
+    ValidateTotalWithPaidTotal: false, ValidateTotalWithItems: false,
+    Customer: {
+      CustomerID: /^\d+$/.test(dni) ? parseInt(dni, 10) : 1,
+      Code: '000000', DocumentType: cfg.orders_document_type, DocumentNumber: dni,
+      IVACategoryCode: cfg.orders_iva_category, User: orderId,
+      Email: nombre[2] || (orderId + '@fravega.com'),
+      FirstName: nombre[0], LastName: nombre[1], BusinessName: '',
+      Street: billAddr[0], HouseNumber: billAddr[1], Floor: '', Apartment: '',
+      City: billCity, ProvinceCode: billProv, PostalCode: billPostal,
+      PhoneNumber1: '', PhoneNumber2: ''
+    },
+    Shipping: {
+      ShippingID: 1, Street: delAddr[0], HouseNumber: delAddr[1],
+      Floor: '', Apartment: '', City: delCity,
+      ProvinceCode: delProvRaw ? _provinceCode(delProvRaw) : billProv,
+      PostalCode: _s(first['Código Postal.1'], billPostal),
+      PhoneNumber1: '', PhoneNumber2: ''
+    },
+    OrderItems: items, Payments: [],
+    CashPayments: [{ PaymentID: digits ? parseInt(digits, 10) : 1,
+                     PaymentMethod: cfg.orders_payment_method, PaymentTotal: total }]
+  }, []];
+}
+
+function _analyzeOrders(rows) {
+  var cfg = _configMap();
+  var estado = cfg.orders_estado_objetivo || 'Pendiente';
+  var pend = rows.filter(function (r) {
+    return _s(r['Estado de Facturación']) === estado;
+  });
+  var rels = _skuRelations();
+  var sent = _sentIds();
+
+  // Agrupar por Nro de Orden preservando el orden
+  var groups = {}, orderIds = [];
+  pend.forEach(function (r) {
+    var oid = _s(r['Nro de Orden']);
+    if (!groups[oid]) { groups[oid] = []; orderIds.push(oid); }
+    groups[oid].push(r);
+  });
+
+  var orders = [], skipped = [], excluded = [];
+  orderIds.forEach(function (oid) {
+    if (sent[oid]) { skipped.push(oid); return; }
+    var res = _buildOrder(oid, groups[oid], rels, cfg);
+    if (res[1].length) {
+      res[1].forEach(function (sku) {
+        _pendingAdd(sku, 'Fravega', 'Detectado en orden ' + oid + ' sin relación');
+      });
+      excluded.push({ orden: oid, skus_sin_relacion: res[1] });
+    } else {
+      orders.push(res[0]);
+    }
+  });
+  return { total_filas: rows.length, filas_pendientes: pend.length,
+           orders: orders, saltadas: skipped, excluidas: excluded };
+}
+
+function apiOrdersAnalyze(user, rows, archivo) {
+  if (!rows || !rows.length) throw new Error('El CSV llegó vacío');
+  var a = _analyzeOrders(rows);
+  log_(user.email, 'ordenes', 'CSV analizado', 'info',
+       'archivo=' + archivo + ' nuevas=' + a.orders.length +
+       ' saltadas=' + a.saltadas.length + ' excluidas=' + a.excluidas.length);
+  return {
+    total_filas: a.total_filas, filas_pendientes: a.filas_pendientes,
+    nuevas: a.orders.map(function (o) {
+      return { orden: o.OrderID,
+               cliente: (o.Customer.FirstName + ' ' + o.Customer.LastName).trim(),
+               items: o.OrderItems.length, total: o.Total };
+    }),
+    orders: a.orders,   // órdenes completas (payload de Tango) para envío por tandas
+    saltadas: a.saltadas, excluidas: a.excluidas
+  };
+}
+
+function apiOrdersSend(user, rows, archivo) {
+  var vt = tangoVerify();
+  if (!vt[0]) throw new Error('Token de Tango inválido: ' + vt[1]);
+  var a = _analyzeOrders(rows);   // re-análisis sobre los mismos datos
+  if (!a.orders.length) throw new Error('No hay órdenes nuevas para enviar');
+  return _sendOrders(a.orders, user, archivo,
+                     { total_filas: a.total_filas, filas_pendientes: a.filas_pendientes,
+                       excluidas: a.excluidas, saltadas: a.saltadas });
+}
+
+/**
+ * Envío por TANDAS: el frontend arma las órdenes una vez y las manda de a
+ * grupos chicos, para no pasar el límite de 6 min de Apps Script.
+ * Recibe órdenes YA construidas (payload de Tango). Saltea las que ya están
+ * en OrdenesEnviadas. Devuelve {enviadas, rechazadas}.
+ * OJO: acá NO se escribe HistorialOrdenes (meta = null). La fila de resumen
+ * del import la escribe apiOrdersRecordImport, que el frontend llama UNA vez
+ * al terminar todas las tandas.
+ */
+function apiOrdersSendBatch(user, orders, archivo) {
+  if (!orders || !orders.length) return { enviadas: [], rechazadas: [] };
+  var vt = tangoVerify();
+  if (!vt[0]) throw new Error('Token de Tango inválido: ' + vt[1]);
+  // Filtrar las que ya se enviaron (idempotencia entre tandas / reintentos)
+  var sent = _sentIds();
+  var pendientes = orders.filter(function (o) { return !sent[o.OrderID]; });
+  if (!pendientes.length) {
+    // No las tragamos en silencio: avisamos que ya estaban registradas como enviadas.
+    return { enviadas: [], rechazadas: orders.map(function (o) {
+      return { orden: o.OrderID, error: 'Ya figuraba en OrdenesEnviadas; no se reenvió' };
+    }) };
+  }
+  return _sendOrders(pendientes, user, archivo, null);
+}
+
+/**
+ * Registra UNA fila de resumen del import en HistorialOrdenes.
+ * Lo llama el frontend al terminar todas las tandas del envío por lotes,
+ * porque apiOrdersSendBatch (con meta=null) no escribe el historial.
+ */
+function apiOrdersRecordImport(user, p) {
+  p = p || {};
+  var enviadas = p.enviadas || [];
+  var rechazadas = p.rechazadas || [];
+  var nuevas = (p.nuevas !== undefined && p.nuevas !== null && p.nuevas !== '')
+    ? p.nuevas : (enviadas.length + rechazadas.length);
+  _appendRow(SH.ORDERS, [_now(), user.email, p.archivo || 'Ordenes.csv',
+                         (p.total_filas != null ? p.total_filas : ''),
+                         (p.filas_pendientes != null ? p.filas_pendientes : ''),
+                         nuevas, enviadas.length, rechazadas.length,
+                         JSON.stringify({ enviadas: enviadas, rechazadas: rechazadas,
+                                          excluidas: p.excluidas || [], saltadas: p.saltadas || [] })]);
+  log_(user.email, 'ordenes', 'Importación registrada', 'ok',
+       'archivo=' + (p.archivo || '') + ' enviadas=' + enviadas.length +
+       ' rechazadas=' + rechazadas.length);
+  return { ok: true };
+}
+
+/* ── Lectura tolerante de la respuesta de Tango ──────────────────────
+ * Tango puede devolver las claves con distinto casing/nombre según endpoint
+ * o versión. Estos helpers evitan que una diferencia de nombre haga que el
+ * envío cuente "0 aceptadas / 0 rechazadas" en silencio. */
+function _pick(obj, keys) {
+  if (!obj) return undefined;
+  for (var i = 0; i < keys.length; i++) {
+    if (obj[keys[i]] !== undefined && obj[keys[i]] !== null) return obj[keys[i]];
+  }
+  return undefined;
+}
+function _respData(resp) {
+  var d = _pick(resp, ['Data', 'data', 'Result', 'Results', 'results', 'Orders', 'orders', 'OrderBatch']);
+  if (d === undefined || d === null) return [];
+  return Array.isArray(d) ? d : [d];
+}
+function _itIds(it) {
+  var v = _pick(it, ['OrderID', 'OrderId', 'orderId', 'orderID', 'OrderNumber', 'OrderNo',
+                     'orderNumber', 'Id', 'ID', 'id']);
+  return String(v === undefined ? '' : v).split(',')
+    .map(function (x) { return x.trim(); }).filter(String);
+}
+function _itInprocess(it) {
+  var v = _pick(it, ['Inprocess', 'InProcess', 'inProcess', 'inprocess',
+                     'IsOk', 'isOk', 'Success', 'success', 'Ok', 'ok']);
+  return v === true || String(v).toLowerCase() === 'true';
+}
+function _itError(it) {
+  return _pick(it, ['ValidationException', 'validationException',
+                    'Message', 'message', 'Error', 'error']);
+}
+
+/** Núcleo de envío a Tango, con reintento -Rn y registro. */
+function _sendOrders(orders, user, archivo, meta) {
+  var t0 = Date.now();
+  var batchSize = parseInt(getConfig('orders_batch_size') || '25', 10);
+  var cfgPago = getConfig('orders_payment_method') || 'A01';
+  var results = [];
+
+  function sendBatches(list) {
+    for (var i = 0; i < list.length; i += batchSize) {
+      var batch = list.slice(i, i + batchSize);
+      var loteNro = (i / batchSize) + 1;
+      try {
+        var resp = tangoSendBatch(batch);
+        // Guardamos la respuesta cruda en los logs para poder diagnosticar.
+        log_(user.email, 'ordenes', 'Respuesta Tango /order/batch', 'info',
+             'lote=' + loteNro + ' n=' + batch.length + ' resp=' +
+             String(resp.__raw || '').slice(0, 1500));
+        results.push({ status: 'ok', response: resp, lote: loteNro });
+      } catch (e) {
+        results.push({ status: 'error', error: e.message, lote: loteNro });
+      }
+    }
+  }
+  sendBatches(orders);
+
+  // Reintento -Rn de rechazadas por estado ANULADA/CERRADA
+  var accepted = _sentIds();
+  results.forEach(function (r) {
+    if (r.status !== 'ok') return;
+    _respData(r.response).forEach(function (it) {
+      if (_itInprocess(it)) _itIds(it).forEach(function (x) { accepted[x] = true; });
+    });
+  });
+  var byId = {};
+  orders.forEach(function (o) { byId[o.OrderID] = o; });
+  var retries = [];
+  results.slice().forEach(function (r) {
+    if (r.status !== 'ok') return;
+    _respData(r.response).forEach(function (it) {
+      if (_itInprocess(it)) return;
+      var err = String(_itError(it) || '');
+      if (err.indexOf('Order state must be') === -1) return;
+      var oid = _itIds(it)[0];
+      var orig = oid ? byId[oid] : null;
+      if (!orig) return;
+      var n = 1;
+      while (accepted[oid + '-R' + n]) n++;
+      var nid = oid + '-R' + n;
+      accepted[nid] = true;
+      var copy = JSON.parse(JSON.stringify(orig));
+      copy.OrderID = nid; copy.OrderNumber = nid;
+      var dg = nid.replace(/\D/g, '');
+      copy.CashPayments = [{ PaymentID: dg ? parseInt(dg, 10) : 1,
+                             PaymentMethod: cfgPago, PaymentTotal: orig.Total }];
+      retries.push(copy);
+    });
+  });
+  if (retries.length) {
+    log_(user.email, 'ordenes', 'Reintentando ' + retries.length + ' orden(es) con sufijo -Rn', 'warning', '');
+    sendBatches(retries);
+  }
+
+  // Consolidar aceptadas / rechazadas
+  var sentIds = [], failed = [];
+  results.forEach(function (r) {
+    if (r.status !== 'ok') {
+      failed.push({ orden: 'lote ' + (r.lote || '?'), error: r.error }); return;
+    }
+    _respData(r.response).forEach(function (it) {
+      var ids = _itIds(it);
+      if (!ids.length) return;
+      if (_itInprocess(it)) sentIds = sentIds.concat(ids);
+      else ids.forEach(function (id) {
+        failed.push({ orden: id, error: String(_itError(it) || 'rechazada') });
+      });
+    });
+  });
+
+  // Red de seguridad: si Tango respondió 200 pero no reconocimos NI aceptadas
+  // NI rechazadas, NO lo ocultamos: exponemos la respuesta cruda para diagnóstico.
+  if (!sentIds.length && !failed.length && orders.length) {
+    results.forEach(function (r) {
+      if (r.status !== 'ok') { failed.push({ orden: 'lote ' + (r.lote || '?'), error: r.error }); return; }
+      failed.push({ orden: 'lote ' + (r.lote || '?') + ' (respuesta no reconocida)',
+                    error: 'Tango respondió 200 sin órdenes identificables. Crudo: ' +
+                           String(r.response.__raw || '').slice(0, 400) });
+    });
+    log_(user.email, 'ordenes', 'Envío sin resultados reconocibles', 'warning',
+         'orders=' + orders.length + ' — revisar el crudo de la respuesta de Tango en los logs');
+  }
+
+  var ts = _now();
+  sentIds.forEach(function (id) { _appendRow(SH.SENT, [id, ts]); });
+  if (meta) {
+    _appendRow(SH.ORDERS, [ts, user.email, archivo || 'Ordenes.csv', meta.total_filas,
+                           meta.filas_pendientes, orders.length, sentIds.length, failed.length,
+                           JSON.stringify({ enviadas: sentIds, rechazadas: failed,
+                                            excluidas: meta.excluidas, saltadas: meta.saltadas })]);
+  }
+  log_(user.email, 'ordenes', 'Envío de órdenes (tanda)',
+       failed.length ? 'warning' : 'ok',
+       'enviadas=' + sentIds.length + ' rechazadas=' + failed.length, Date.now() - t0);
+  return { enviadas: sentIds, rechazadas: failed };
+}
+
+/* ═══════════════ MÓDULO FACTURAS ═══════════════ */
+
+function _normKey(s) {
+  s = String(s || '').toUpperCase();
+  s = s.replace(/[ÁÀÂÄ]/g, 'A').replace(/[ÉÈÊË]/g, 'E').replace(/[ÍÌÎÏ]/g, 'I')
+       .replace(/[ÓÒÔÖ]/g, 'O').replace(/[ÚÙÛÜ]/g, 'U').replace(/Ñ/g, 'N');
+  s = s.replace(/[^A-Z0-9 ]/g, ' ');
+  return s.split(/\s+/).filter(String).sort().join(' ');
+}
+
+function _fechaFmt(v) {
+  if (v === null || v === undefined || v === '') return '';
+  if (typeof v === 'number') {  // serial de Excel
+    var d = new Date(Date.UTC(1899, 11, 30) + v * 86400000);
+    return ('0' + d.getUTCDate()).slice(-2) + '/' + ('0' + (d.getUTCMonth() + 1)).slice(-2) +
+           '/' + d.getUTCFullYear();
+  }
+  var s = String(v).trim();
+  var m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);          // yyyy-mm-dd
+  if (m) return m[3] + '/' + m[2] + '/' + m[1];
+  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/); // dd/mm/yyyy
+  if (m) return ('0' + m[1]).slice(-2) + '/' + ('0' + m[2]).slice(-2) + '/' + m[3];
+  return s;
+}
+
+function apiInvoicesGenerate(user, ordenesRows, facturasRows) {
+  if (!ordenesRows || !ordenesRows.length) throw new Error('El CSV de órdenes llegó vacío');
+  if (!facturasRows || !facturasRows.length) throw new Error('El reporte de facturación llegó vacío');
+  ['RAZON_SOCI', 'N_COMP', 'FECHA_EMI'].forEach(function (c) {
+    if (!(c in facturasRows[0])) throw new Error("El reporte no tiene la columna '" + c + "'");
+  });
+
+  var estado = (getConfig('invoices_estado_objetivo') || 'Pendiente').toLowerCase();
+  var addPrefix = getConfig('invoices_add_prefix') === '1';
+  var prefijo = getConfig('invoices_prefix') || 'FVG-';
+
+  var pend = ordenesRows.filter(function (r) {
+    return _s(r['Estado de Facturación']).toLowerCase() === estado;
+  });
+
+  // Pool de facturas por cliente normalizado (ordenadas por N_COMP)
+  var pool = {};
+  facturasRows.slice().sort(function (a, b) {
+    return String(a['N_COMP']).localeCompare(String(b['N_COMP']));
+  }).forEach(function (f) {
+    var k = _normKey(f['RAZON_SOCI']);
+    (pool[k] = pool[k] || []).push(f);
+  });
+
+  var filas = [], sinFactura = [];
+  pend.forEach(function (r) {
+    var k = _normKey(r['Cliente']);
+    if (pool[k] && pool[k].length) {
+      var f = pool[k].shift();
+      var orden = _s(r['Nro de Orden']);
+      if (addPrefix && orden.toUpperCase().indexOf(prefijo.toUpperCase()) !== 0) {
+        orden = prefijo + orden;
+      }
+      // Nro de factura sin guiones ni espacios (formato B0000700001993)
+      var nroFactura = String(f['N_COMP']).replace(/[\s\-]/g, '');
+      filas.push([orden, nroFactura, _fechaFmt(f['FECHA_EMI'])]);
+    } else {
+      sinFactura.push({ orden: _s(r['Nro de Orden']), cliente: _s(r['Cliente']) });
+    }
+  });
+  var sobrantes = [];
+  Object.keys(pool).forEach(function (k) {
+    pool[k].forEach(function (f) {
+      sobrantes.push({ cliente: String(f['RAZON_SOCI']), factura: String(f['N_COMP']) });
+    });
+  });
+
+  // Generar el .xlsx con la ESTRUCTURA COMPLETA que pide Frávega:
+  //   Hoja "Ordenes": 7 columnas (las 4 extra van vacías, se completan luego)
+  //   Hoja "Transportadoras": 50 opciones (para el dropdown)
+  //   Hoja "config": version / operation
+  var nombre = 'Tabla-modelo-facturas COMPLETO ' +
+    Utilities.formatDate(new Date(), 'America/Argentina/Buenos_Aires', 'yyyyMMdd_HHmmss');
+  var ss = SpreadsheetApp.create(nombre);
+
+  // Hoja Ordenes
+  var hoja = ss.getSheets()[0];
+  hoja.setName('Ordenes');
+  hoja.getRange(1, 1, 1, 7).setValues([[
+    'Orden*', 'Nro Factura*', 'Fecha*', 'Url factura',
+    'Nro Seguimiento', 'Url seguimiento', 'Transportadora']]);
+  if (filas.length) {
+    // filas ya trae [orden, nroFactura, fecha]; completamos las 4 columnas vacías
+    var full = filas.map(function (f) { return [f[0], f[1], f[2], '', '', '', '']; });
+    hoja.getRange(2, 1, full.length, 7).setValues(full);
+  }
+
+  // Hoja Transportadoras (opciones válidas del dropdown, 50 filas)
+  var transp = ss.insertSheet('Transportadoras');
+  var opciones = [];
+  opciones.push(['FravegaEnvios - Envio a domicilio']);
+  for (var t = 0; t < 49; t++) opciones.push(['Retiro en Sucursal']);
+  transp.getRange(1, 1, 50, 1).setValues(opciones);
+
+  // Validación de datos en la columna Transportadora (G2:G9999)
+  var rule = SpreadsheetApp.newDataValidation()
+    .requireValueInRange(transp.getRange('A1:A50'), true)
+    .setAllowInvalid(true).build();
+  hoja.getRange('G2:G9999').setDataValidation(rule);
+
+  // Hoja config
+  var cfgSheet = ss.insertSheet('config');
+  cfgSheet.getRange(1, 1, 2, 2).setValues([['version', '1'], ['operation', 'invoice']]);
+
+  SpreadsheetApp.flush();
+
+  var xlsx = UrlFetchApp.fetch(
+    'https://docs.google.com/spreadsheets/d/' + ss.getId() + '/export?format=xlsx',
+    { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() } }).getBlob();
+  DriveApp.getFileById(ss.getId()).setTrashed(true);  // no acumular copias en Drive
+
+  _appendRow(SH.INVOICES, [_now(), user.email, nombre + '.xlsx', filas.length,
+                           sinFactura.length, sobrantes.length,
+                           JSON.stringify({ sin_factura: sinFactura, sobrantes: sobrantes })]);
+  log_(user.email, 'facturas', 'Exportación generada', 'ok',
+       'cargadas=' + filas.length + ' sin_factura=' + sinFactura.length +
+       ' sobrantes=' + sobrantes.length);
+
+  return { archivo: nombre + '.xlsx', cargadas: filas.length,
+           sin_factura: sinFactura, sobrantes: sobrantes,
+           base64: Utilities.base64Encode(xlsx.getBytes()) };
+}
+
+/* ═══════════════ MÓDULO SKUs / PENDIENTES ═══════════════ */
+
+function _skuRelations() {
+  var rows = _readRows(SH.SKUS);
+  var out = {};
+  rows.forEach(function (r) {
+    var sku = String(r.sku_tango || '').trim();
+    if (!sku) return;
+    out[sku] = { item_id: String(r.fravega_item_id || '').trim(),
+                 refid: String(r.fravega_refid || '').trim() || sku,
+                 descripcion: String(r.descripcion || '') };
+  });
+  return out;
+}
+
+function apiSkusList(q) {
+  var rows = _readRows(SH.SKUS);
+  q = String(q || '').toLowerCase();
+  if (q) {
+    rows = rows.filter(function (r) {
+      return ['sku_tango', 'fravega_item_id', 'fravega_refid', 'descripcion']
+        .some(function (c) { return String(r[c] || '').toLowerCase().indexOf(q) !== -1; });
+    });
+  }
+  return rows;
+}
+
+function apiSkusSave(user, p) {
+  var sku = String(p.sku_tango || '').trim();
+  if (!sku) throw new Error('sku_tango es obligatorio');
+  var refid = String(p.fravega_refid || '').trim() || sku;
+  var item = String(p.fravega_item_id || '').trim();
+  var desc = String(p.descripcion || '').trim();
+  var sheet = _sheet(SH.SKUS);
+  var col = _colValues(sheet, 1);
+  var ts = _now();
+  var idx = col.indexOf(sku);
+  var original = String(p.original_sku || '').trim();
+
+  if (original && original !== sku) {           // renombrar SKU
+    var idxOrig = col.indexOf(original);
+    if (idxOrig === -1) throw new Error('Relación no encontrada: ' + original);
+    if (idx !== -1) throw new Error('Ya existe una relación para ' + sku);
+    sheet.getRange(idxOrig + 2, 1, 1, 6)
+         .setValues([[sku, item, refid, desc, sheet.getRange(idxOrig + 2, 5).getValue(), ts]]);
+  } else if (idx !== -1) {                      // actualizar
+    sheet.getRange(idx + 2, 2, 1, 5)
+         .setValues([[item, refid, desc, sheet.getRange(idx + 2, 5).getValue() || ts, ts]]);
+  } else {                                      // crear
+    sheet.appendRow([sku, item, refid, desc, ts, ts]);
+  }
+  log_(user.email, 'skus', 'Relación guardada: ' + sku, 'ok', '');
+  return { ok: true };
+}
+
+function apiSkusDelete(user, skuTango) {
+  var sheet = _sheet(SH.SKUS);
+  var idx = _colValues(sheet, 1).indexOf(String(skuTango).trim());
+  if (idx === -1) throw new Error('Relación no encontrada');
+  sheet.deleteRow(idx + 2);
+  log_(user.email, 'skus', 'Relación eliminada: ' + skuTango, 'warning', '');
+  return { ok: true };
+}
+
+function apiSkusImport(user, rows) {
+  if (!rows || !rows.length) throw new Error('El archivo llegó vacío');
+  var creadas = 0, actualizadas = 0, errores = [];
+  var sheet = _sheet(SH.SKUS);
+  var col = _colValues(sheet, 1);
+  var ts = _now();
+  rows.forEach(function (r, i) {
+    var sku = String(r.sku_tango || '').trim();
+    if (!sku) { errores.push('Fila ' + (i + 2) + ': falta sku_tango'); return; }
+    var item = String(r.fravega_item_id || '').trim();
+    var refid = String(r.fravega_refid || '').trim() || sku;
+    var desc = String(r.descripcion || '').trim();
+    var idx = col.indexOf(sku);
+    if (idx !== -1) {
+      sheet.getRange(idx + 2, 2, 1, 5)
+           .setValues([[item, refid, desc, sheet.getRange(idx + 2, 5).getValue() || ts, ts]]);
+      actualizadas++;
+    } else {
+      sheet.appendRow([sku, item, refid, desc, ts, ts]);
+      col.push(sku);
+      creadas++;
+    }
+  });
+  log_(user.email, 'skus', 'Importación de relaciones',
+       errores.length ? 'warning' : 'ok',
+       'creadas=' + creadas + ' actualizadas=' + actualizadas + ' errores=' + errores.length);
+  return { creadas: creadas, actualizadas: actualizadas, errores: errores };
+}
+
+function _pendingList() {
+  return _readRows(SH.PENDING).filter(function (r) { return r.estado === 'pendiente'; })
+    .reverse();
+}
+
+function _pendingAdd(sku, origen, obs) {
+  var sheet = _sheet(SH.PENDING);
+  var data = sheet.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][0]) === String(sku) && data[i][1] === origen) {
+      sheet.getRange(i + 1, 3, 1, 2).setValues([['pendiente', obs]]);
+      sheet.getRange(i + 1, 6).setValue('');
+      return;
+    }
+  }
+  sheet.appendRow([String(sku), origen, 'pendiente', obs, _now(), '']);
+}
+
+function apiPendingResolve(user, sku, origen) {
+  var sheet = _sheet(SH.PENDING);
+  var data = sheet.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][0]) === String(sku) && data[i][1] === origen) {
+      sheet.getRange(i + 1, 3).setValue('resuelto');
+      sheet.getRange(i + 1, 6).setValue(_now());
+      log_(user.email, 'skus', 'Pendiente resuelto: ' + sku, 'ok', '');
+      return { ok: true };
+    }
+  }
+  throw new Error('Pendiente no encontrado');
+}
+
+/* ═══════════════ LOGS / CONFIG / DASHBOARD ═══════════════ */
+
+function log_(usuario, modulo, accion, resultado, detalle, duracionMs) {
+  try {
+    _appendRow(SH.LOGS, [_now(), usuario, modulo, accion, resultado,
+                         String(detalle || '').slice(0, 2000), duracionMs || '']);
+  } catch (e) { /* nunca romper por un log */ }
+}
+
+function apiLogsList(p) {
+  var rows = _readRows(SH.LOGS, 2000).reverse();
+  return rows.filter(function (r) {
+    if (p.modulo && r.modulo !== p.modulo) return false;
+    if (p.resultado && r.resultado !== p.resultado) return false;
+    if (p.desde && String(r.fecha_hora) < p.desde) return false;
+    if (p.hasta && String(r.fecha_hora) > p.hasta + ' 23:59:59') return false;
+    if (p.q) {
+      var q = p.q.toLowerCase();
+      if ((String(r.accion) + String(r.detalle) + String(r.usuario))
+          .toLowerCase().indexOf(q) === -1) return false;
+    }
+    return true;
+  }).slice(0, 500);
+}
+
+function _configMap() {
+  var out = {};
+  _sheet(SH.CONFIG).getDataRange().getValues().slice(1).forEach(function (r) {
+    out[String(r[0])] = String(r[1]);
+  });
+  return out;
+}
+
+function getConfig(key) { return _configMap()[key] || ''; }
+
+function setConfig(key, value) {
+  var sheet = _sheet(SH.CONFIG);
+  var idx = _colValues(sheet, 1).indexOf(key);
+  if (idx === -1) sheet.appendRow([key, String(value), '']);
+  else sheet.getRange(idx + 2, 2).setValue(String(value));
+}
+
+function apiSettingsGet() {
+  var props = PropertiesService.getScriptProperties();
+  return {
+    valores: _configMap(),
+    credenciales: {
+      tango_token: !!props.getProperty('TANGO_ACCESS_TOKEN'),
+      fravega_seller_id: !!props.getProperty('FRAVEGA_SELLER_ID'),
+      fravega_api_key: !!props.getProperty('FRAVEGA_API_KEY'),
+      fravega_api_token: !!props.getProperty('FRAVEGA_API_TOKEN'),
+      google_client_id: !!props.getProperty('GOOGLE_CLIENT_ID')
+    },
+    proxima_sincronizacion: _proximaSync()
+  };
+}
+
+function apiSettingsSet(user, valores) {
+  var editables = {};
+  DEFAULT_CONFIG.forEach(function (r) { editables[r[0]] = true; });
+  var cambios = [];
+  Object.keys(valores || {}).forEach(function (k) {
+    if (!editables[k]) throw new Error('Clave no editable: ' + k);
+    setConfig(k, valores[k]);
+    cambios.push(k + '=' + valores[k]);
+  });
+  if ('scheduler_hours' in (valores || {}) || 'scheduler_enabled' in (valores || {})) {
+    configurarTriggers();
+  }
+  log_(user.email, 'configuracion', 'Configuración actualizada', 'ok', cambios.join(', '));
+  return { ok: true, proxima_sincronizacion: _proximaSync() };
+}
+
+function apiDashboard() {
+  var vt = tangoVerify();
+  var vf = fravegaPing();
+  var syncs = _readRows(SH.SYNCS, 1);
+  var ultima = syncs.length ? syncs[syncs.length - 1] : null;
+  var pendientes = _pendingList().length;
+  var skus = _sheet(SH.SKUS).getLastRow() - 1;
+  var invoices = _readRows(SH.INVOICES, 1);
+  var ordersRows = _readRows(SH.ORDERS, 200);
+  var totalEnviadas = 0;
+  ordersRows.forEach(function (r) { totalEnviadas += Number(r.enviadas) || 0; });
+  var errores24 = _readRows(SH.LOGS, 500).filter(function (r) {
+    return r.resultado === 'error' &&
+      (new Date().getTime() - new Date(String(r.fecha_hora)).getTime()) < 86400000;
+  });
+
+  var alertas = [];
+  if (!vt[0]) alertas.push('Tango: ' + vt[1]);
+  if (!vf[0]) alertas.push('Frávega: ' + vf[1]);
+  if (pendientes) alertas.push('Hay ' + pendientes + ' SKU sin relación');
+  if (ultima && ultima.resultado !== 'ok') {
+    alertas.push('La última sincronización terminó: ' + ultima.resultado);
+  }
+
+  return {
+    tango: { ok: vt[0], detalle: vt[1] },
+    fravega: { ok: vf[0], detalle: vf[1] },
+    sincronizacion: { ultima: ultima, proxima: _proximaSync(),
+                      habilitada: getConfig('scheduler_enabled') === '1' },
+    contadores: { relaciones: Math.max(skus, 0), sku_pendientes: pendientes,
+                  ordenes_importadas: totalEnviadas, errores_24h: errores24.length },
+    ultima_exportacion: invoices.length ? invoices[invoices.length - 1] : null,
+    errores_recientes: errores24.slice(-5).reverse(),
+    alertas: alertas
+  };
+}
+
+/* ═══════════════ HELPERS DE SHEETS ═══════════════ */
+
+function _sheet(name) {
+  var s = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+  if (!s) throw new Error('Falta la pestaña "' + name + '": ejecutá SETUP');
+  return s;
+}
+
+function _ensureSheet(ss, name, headers) {
+  var s = ss.getSheetByName(name) || ss.insertSheet(name);
+  if (s.getLastRow() === 0) {
+    s.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+    s.setFrozenRows(1);
+  }
+  return s;
+}
+
+function _appendRow(name, row) { _sheet(name).appendRow(row); }
+
+function _colValues(sheet, col) {
+  var last = sheet.getLastRow();
+  if (last < 2) return [];
+  return sheet.getRange(2, col, last - 1, 1).getValues()
+    .map(function (r) { return String(r[0]); });
+}
+
+/** Lee las últimas `limit` filas como objetos {encabezado: valor}. */
+function _readRows(name, limit) {
+  var sheet = _sheet(name);
+  var last = sheet.getLastRow();
+  if (last < 2) return [];
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  var start = limit ? Math.max(2, last - limit + 1) : 2;
+  var data = sheet.getRange(start, 1, last - start + 1, headers.length).getValues();
+  return data.map(function (row) {
+    var o = {};
+    headers.forEach(function (h, i) {
+      var v = row[i];
+      o[String(h)] = (v instanceof Date)
+        ? Utilities.formatDate(v, 'America/Argentina/Buenos_Aires', 'yyyy-MM-dd HH:mm:ss')
+        : v;
+    });
+    return o;
+  });
+}
+
+function _sentIds() {
+  var out = {};
+  _colValues(_sheet(SH.SENT), 1).forEach(function (id) { out[id] = true; });
+  return out;
+}
+
+function _prop(key) {
+  return PropertiesService.getScriptProperties().getProperty(key) || '';
+}
+
+function _now() {
+  return Utilities.formatDate(new Date(), 'America/Argentina/Buenos_Aires',
+                              'yyyy-MM-dd HH:mm:ss');
+}
+
+function _json(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
