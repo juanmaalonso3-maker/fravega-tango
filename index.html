@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Plataforma Tango ↔ Frávega</title>
+<title>Plataforma Tango ↔ Frávega / OnCity</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
@@ -28,7 +28,7 @@
 <div id="login-screen" class="hidden min-h-screen flex items-center justify-center">
   <div class="bg-white rounded-2xl shadow-xl p-10 w-full max-w-md text-center">
     <div class="text-4xl mb-2">🔄</div>
-    <h1 class="text-2xl font-bold mb-1">Plataforma Tango ↔ Frávega</h1>
+    <h1 class="text-2xl font-bold mb-1">Plataforma Tango ↔ Frávega / OnCity</h1>
     <p class="text-gray-500 mb-8">Grupo Bitek — Acceso restringido</p>
     <div id="google-btn" class="flex justify-center"></div>
     <p id="login-error" class="text-red-600 text-sm mt-4 hidden"></p>
@@ -38,7 +38,7 @@
 <div id="app-screen" class="hidden min-h-screen flex">
   <aside class="w-60 bg-violet-950 text-violet-200 flex flex-col shrink-0">
     <div class="p-4 border-b border-violet-900">
-      <div class="font-bold text-white leading-tight">Tango ↔ Frávega</div>
+      <div class="font-bold text-white leading-tight">Tango ↔ Frávega / OnCity</div>
       <div class="text-xs opacity-70">Grupo Bitek</div>
     </div>
     <nav id="nav" class="flex-1 p-2 space-y-1 text-sm"></nav>
@@ -306,9 +306,13 @@ async function viewDashboard() {
   setMain(H("Dashboard") + `
     ${d.alertas.length ? `<div class="mb-4 space-y-2">${d.alertas.map((a) =>
       `<div class="bg-amber-50 border border-amber-300 text-amber-800 px-4 py-2 rounded-lg text-sm">⚠️ ${esc(a)}</div>`).join("")}</div>` : ""}
-    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 mb-4">
+    <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4 mb-4">
       ${card(`<div class="text-xs text-gray-500 uppercase mb-1">Tango</div>${estado(d.tango)}`)}
       ${card(`<div class="text-xs text-gray-500 uppercase mb-1">Frávega</div>${estado(d.fravega)}`)}
+      ${card(`<div class="text-xs text-gray-500 uppercase mb-1">OnCity (VTEX)</div>
+        ${d.oncity ? (d.oncity.habilitado ? estado(d.oncity) +
+            (d.oncity.simulacion ? '<div class="text-xs text-amber-700 mt-1">modo simulación</div>' : '')
+          : '<div class="text-gray-400 font-bold text-lg">● Deshabilitado</div>') : ''}`)}
       ${card(`<div class="text-xs text-gray-500 uppercase mb-1">Última sincronización</div>${ultimaTxt}`)}
       ${card(`<div class="text-xs text-gray-500 uppercase mb-1">Próxima sincronización</div>
         <div class="font-bold text-lg">${d.sincronizacion.proxima ? esc(d.sincronizacion.proxima) : "—"}</div>
@@ -350,13 +354,18 @@ async function viewStock() {
   const rows = hist.map((h) => `
     <tr class="cursor-pointer" onclick='verDetalleSync(${JSON.stringify(String(h.detalle_json || "[]"))})'>
       <td>${esc(h.inicio)}</td><td>${esc(h.fin || "—")}</td>
-      <td>${esc(h.disparada_por)}</td><td>${resultadoBadge(h.resultado)}</td>
+      <td>${esc(h.disparada_por)}</td><td>${esc(h.destino || "—")}</td><td>${resultadoBadge(h.resultado)}</td>
       <td class="text-center">${h.ok}</td><td class="text-center">${h.errores}</td>
       <td class="text-center">${h.no_publicados}</td><td class="text-center">${h.sin_relacion}</td>
     </tr>`).join("");
 
   setMain(H("Sincronización de Stock") + `
     <div class="flex flex-wrap items-center gap-4 mb-4">
+      <select id="sync-destino" class="border rounded-lg px-3 py-2.5 text-sm bg-white">
+        <option value="">Todos los destinos habilitados</option>
+        <option value="fravega">Solo Frávega</option>
+        <option value="oncity">Solo OnCity (VTEX)</option>
+      </select>
       <button onclick="dispararSync()"
         class="bg-violet-700 hover:bg-violet-800 text-white px-5 py-2.5 rounded-lg font-medium">
         ▶️ Sincronizar ahora</button>
@@ -366,18 +375,31 @@ async function viewStock() {
     </div>
     ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Historial (clic en una fila para ver el detalle)</div>
       <table class="data w-full"><thead><tr>
-        <th>Inicio</th><th>Fin</th><th>Disparada por</th><th>Resultado</th>
+        <th>Inicio</th><th>Fin</th><th>Disparada por</th><th>Destino</th><th>Resultado</th>
         <th>OK</th><th>Errores</th><th>No public.</th><th>Sin relación</th>
-      </tr></thead><tbody>${rows || '<tr><td colspan="8" class="text-gray-400 p-4">Sin sincronizaciones aún</td></tr>'}</tbody></table>`)}`);
+      </tr></thead><tbody>${rows || '<tr><td colspan="9" class="text-gray-400 p-4">Sin sincronizaciones aún</td></tr>'}</tbody></table>`)}`);
 }
 
 function dispararSync() {
-  confirmar("¿Sincronizar el stock de Tango (depósito configurado) hacia Frávega ahora? Puede tardar hasta un minuto.", async () => {
-    setMain(H("Sincronización de Stock") + spinner("Sincronizando... (leyendo Tango y actualizando Frávega)"));
+  const destino = ($("sync-destino") || {}).value || "";
+  const comoTexto = destino === "fravega" ? "Frávega"
+                  : destino === "oncity" ? "OnCity (VTEX)"
+                  : "todos los destinos habilitados";
+  confirmar(`¿Sincronizar el stock de Tango (depósito configurado) hacia ${comoTexto} ahora? Puede tardar hasta un minuto.`, async () => {
+    setMain(H("Sincronización de Stock") + spinner(`Sincronizando ${comoTexto}... (leyendo Tango y actualizando la tienda)`));
     try {
-      const r = await api("stock.sync");
+      const r = await api("stock.sync", { destino });
       if (r.resultado === "omitida") toast(r.mensaje, "warning");
-      else toast(`Sincronización ${r.resultado}: ${r.ok} OK, ${r.errores} errores`, r.errores ? "warning" : "ok");
+      else {
+        toast(`Sincronización ${r.resultado}: ${r.ok} OK, ${r.errores} errores`, r.errores ? "warning" : "ok");
+        // Desglose por destino, que es lo que interesa cuando se sincronizan los dos
+        const pd = r.por_destino || {};
+        Object.keys(pd).forEach((d) => {
+          const x = pd[d];
+          toast(`${d === "oncity" ? "OnCity" : "Frávega"}: ${x.ok} OK · ${x.errores} errores · ${x.no_publicados} no publicados` +
+                (x.simulacion ? " (simulación)" : ""), x.errores ? "warning" : "info");
+        });
+      }
     } catch (e) { toast(e.message, "error"); }
     viewStock();
   });
@@ -389,8 +411,9 @@ function verDetalleSync(jsonStr) {
   if (!detalle.length) return;
   showModal(`
     <h3 class="font-bold text-lg mb-3">Detalle de la sincronización</h3>
-    <table class="data w-full"><thead><tr><th>SKU</th><th>refId</th><th>Cantidad</th><th>Estado</th></tr></thead>
-    <tbody>${detalle.map((d) => `<tr><td>${esc(d.sku)}</td><td>${esc(d.refId)}</td>
+    <table class="data w-full"><thead><tr><th>Destino</th><th>SKU</th><th>refId</th><th>Cantidad</th><th>Estado</th></tr></thead>
+    <tbody>${detalle.map((d) => `<tr><td>${badge(d.destino === "oncity" ? "OnCity" : d.destino === "fravega" ? "Frávega" : (d.destino || "—"), d.destino === "oncity" ? "warning" : "info")}</td>
+      <td>${esc(d.sku)}</td><td>${esc(d.refId)}</td>
       <td>${d.cantidad}</td><td>${resultadoBadge(d.estado === "ok" ? "ok" : d.estado === "error" ? "error" : "warning")}
       ${d.detalle ? `<div class="text-xs text-gray-500">${esc(d.detalle)}</div>` : ""}</td></tr>`).join("")}</tbody></table>
     <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 rounded-lg border">Cerrar</button></div>`);
@@ -636,12 +659,15 @@ async function viewSkus() {
       <span class="text-sm text-gray-500">${rels.length} relación(es)</span>
     </div>
     ${card(`<table class="data w-full"><thead><tr>
-      <th>SKU Tango</th><th>Item ID Frávega</th><th>refId Frávega</th><th>Descripción</th>
+      <th>SKU Tango</th><th>Item ID Frávega</th><th>refId Frávega</th>
+      <th>refId OnCity</th><th>SKU id VTEX</th><th>Descripción</th>
       <th>Modificada</th><th></th></tr></thead><tbody>
       ${rels.map((r) => `<tr>
         <td class="font-mono">${esc(r.sku_tango)}</td>
         <td class="font-mono">${esc(r.fravega_item_id || "—")}</td>
         <td class="font-mono">${esc(r.fravega_refid)}</td>
+        <td class="font-mono">${esc(r.oncity_refid || r.sku_tango)}</td>
+        <td class="font-mono text-xs text-gray-500">${esc(r.oncity_sku_id || "—")}</td>
         <td>${esc(r.descripcion || "")}</td>
         <td class="text-xs text-gray-500">${esc(r.modificada)}</td>
         <td class="whitespace-nowrap">
@@ -649,12 +675,12 @@ async function viewSkus() {
             onclick='formSku(${JSON.stringify(JSON.stringify(r))})'>Editar</button>
           <button class="text-red-600 underline text-sm"
             onclick="borrarSku('${esc(r.sku_tango)}')">Eliminar</button></td>
-      </tr>`).join("") || '<tr><td colspan="6" class="text-gray-400 p-4">Sin resultados</td></tr>'}
+      </tr>`).join("") || '<tr><td colspan="8" class="text-gray-400 p-4">Sin resultados</td></tr>'}
       </tbody></table>`)}
     <p class="text-xs text-gray-500 mt-3">También podés ver y editar esta tabla directo en la
       pestaña <b>RelacionesSKU</b> de la Google Sheet. Importación: columnas <b>sku_tango</b>
-      (obligatoria), <b>fravega_item_id</b>, <b>fravega_refid</b> (vacío = igual al SKU Tango)
-      y <b>descripcion</b>.</p>`);
+      (obligatoria), <b>fravega_item_id</b>, <b>fravega_refid</b> y <b>oncity_refid</b>
+      (vacíos = igual al SKU Tango) y <b>descripcion</b>.</p>`);
 }
 
 function buscarSkus() { location.hash = `#skus?q=${encodeURIComponent($("sku-q").value)}`; viewSkus(); }
@@ -673,6 +699,11 @@ function formSku(jsonStr, presetSku, presetOrigen) {
           value="${esc(r ? r.fravega_item_id || "" : (esFravega && presetSku) || "")}"></div>
       <div><label class="text-xs text-gray-500 uppercase">refId Frávega (para stock — vacío = igual al SKU Tango)</label>
         <input id="f-refid" class="border rounded-lg px-3 py-2 w-full" value="${esc(r ? r.fravega_refid : "")}"></div>
+      <div><label class="text-xs text-gray-500 uppercase">refId OnCity / VTEX (vacío = igual al SKU Tango)</label>
+        <input id="f-onref" class="border rounded-lg px-3 py-2 w-full" value="${esc(r ? r.oncity_refid || "" : "")}"></div>
+      <div><label class="text-xs text-gray-500 uppercase">SKU id interno de VTEX</label>
+        <input id="f-onid" class="border rounded-lg px-3 py-2 w-full" value="${esc(r ? r.oncity_sku_id || "" : "")}">
+        <div class="text-xs text-gray-400 mt-1">Se completa solo con los pedidos ya vendidos. Si el artículo nunca se vendió en OnCity, cargalo a mano (está en la URL del producto en el admin de VTEX).</div></div>
       <div><label class="text-xs text-gray-500 uppercase">Descripción</label>
         <input id="f-desc" class="border rounded-lg px-3 py-2 w-full" value="${esc(r ? r.descripcion || "" : "")}"></div>
     </div>
@@ -688,6 +719,8 @@ async function guardarSku(originalSku, pendOrigen, pendSku) {
       sku_tango: $("f-sku").value.trim(),
       fravega_item_id: $("f-item").value.trim(),
       fravega_refid: $("f-refid").value.trim(),
+      oncity_refid: $("f-onref").value.trim(),
+      oncity_sku_id: $("f-onid").value.trim(),
       descripcion: $("f-desc").value.trim(),
       original_sku: originalSku,
     });
@@ -712,6 +745,8 @@ const SKU_ALIASES = {
   sku_tango: ["sku_tango", "sku tango", "tango", "skucode", "codigo tango", "código tango"],
   fravega_item_id: ["fravega_item_id", "item_id", "sku fravega", "sku_fravega", "id publicacion", "productcode"],
   fravega_refid: ["fravega_refid", "refid", "ref_id", "reference id"],
+  oncity_refid: ["oncity_refid", "refid oncity", "sku oncity", "sku_oncity", "vtex_refid", "refid vtex"],
+  oncity_sku_id: ["oncity_sku_id", "sku id vtex", "skuid", "sku_id", "id vtex", "vtex_sku_id", "id sku vtex"],
   descripcion: ["descripcion", "descripción", "description", "detalle"],
 };
 
@@ -743,10 +778,11 @@ async function importarSkus(input) {
 
 async function exportarSkus() {
   const rels = window._SKUS_CACHE || await api("skus.list", { q: "" });
-  const lines = ["sku_tango,fravega_item_id,fravega_refid,descripcion"];
+  const lines = ["sku_tango,fravega_item_id,fravega_refid,oncity_refid,oncity_sku_id,descripcion"];
   rels.forEach((r) => {
     const desc = String(r.descripcion || "").replace(/"/g, "'");
-    lines.push(`${r.sku_tango},${r.fravega_item_id || ""},${r.fravega_refid},"${desc}"`);
+    lines.push(`${r.sku_tango},${r.fravega_item_id || ""},${r.fravega_refid},` +
+               `${r.oncity_refid || r.sku_tango},${r.oncity_sku_id || ""},"${desc}"`);
   });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" }));
@@ -855,10 +891,20 @@ function descargarLogs() {
 
 /* ══════════════ CONFIGURACIÓN ══════════════ */
 const CONFIG_CAMPOS = [
-  ["Stock", [
+  ["Stock (origen: Tango)", [
     ["stock_warehouse_code", "Depósito de Tango (stock)", "text"],
     ["stock_subtract_engaged", "Restar comprometido (EngagedQuantity)", "bool"],
     ["stock_discount_pending", "Descontar pedidos pendientes (API Tango)", "bool"],
+  ]],
+  ["Destinos del stock", [
+    ["stock_destino_fravega", "Actualizar Frávega", "bool"],
+    ["stock_destino_oncity", "Actualizar OnCity (VTEX)", "bool"],
+    ["stock_pause_ms", "Pausa entre llamadas a Frávega (ms)", "text"],
+  ]],
+  ["OnCity (VTEX)", [
+    ["oncity_warehouse_id", "Depósito de VTEX que recibe el stock", "warehouse"],
+    ["oncity_dry_run", "Modo simulación (calcula pero NO escribe en VTEX)", "bool"],
+    ["oncity_pause_ms", "Pausa entre llamadas a VTEX (ms)", "text"],
   ]],
   ["Automatización", [
     ["scheduler_enabled", "Sincronización automática habilitada", "bool"],
@@ -895,6 +941,16 @@ async function viewConfig() {
     ? `<label class="flex items-center gap-2 text-sm py-1">
          <input type="checkbox" data-key="${key}" ${v[key] === "1" ? "checked" : ""}
            class="cfg-input w-4 h-4"> ${label}</label>`
+    : tipo === "warehouse"
+    ? `<div class="py-1"><label class="text-xs text-gray-500 uppercase">${label}</label>
+         <div class="flex gap-2">
+           <select data-key="${key}" id="cfg-wh" class="cfg-input border rounded-lg px-3 py-2 w-full text-sm">
+             <option value="${esc(v[key] ?? "")}">${v[key] ? esc(v[key]) : "— sin elegir —"}</option>
+           </select>
+           <button type="button" onclick="cargarDepositosVtex()"
+             class="border rounded-lg px-3 text-sm whitespace-nowrap">Buscar</button>
+         </div>
+         <div id="cfg-wh-msg" class="text-xs text-gray-400 mt-1">Tocá "Buscar" para traer los depósitos de VTEX.</div></div>`
     : `<div class="py-1"><label class="text-xs text-gray-500 uppercase">${label}</label>
          <input data-key="${key}" value="${esc(v[key] ?? "")}"
            class="cfg-input border rounded-lg px-3 py-2 w-full text-sm"></div>`;
@@ -911,6 +967,7 @@ async function viewConfig() {
            ${campos.map(campo).join("")}`)).join("")}
         <button onclick="guardarConfig()"
           class="bg-violet-700 text-white px-5 py-2.5 rounded-lg font-medium">💾 Guardar cambios</button>
+        <button onclick="probarOncity()" class="border px-4 py-2.5 rounded-lg font-medium ml-2">🔌 Probar OnCity</button>
         <span class="text-sm text-gray-500 ml-3">Próxima sincronización:
           <b>${cfg.proxima_sincronizacion ? esc(cfg.proxima_sincronizacion) : "—"}</b></span>
       </div>
@@ -921,10 +978,53 @@ async function viewConfig() {
           ${cred(cfg.credenciales.fravega_api_key, "Frávega x-fvg-api-key")}
           ${cred(cfg.credenciales.fravega_api_token, "Frávega x-fvg-api-token")}
           ${cred(cfg.credenciales.google_client_id, "Google Client ID")}
+          ${cred(cfg.credenciales.vtex_app_key, "OnCity · VTEX AppKey")}
+          ${cred(cfg.credenciales.vtex_app_token, "OnCity · VTEX AppToken")}
           <p class="text-xs text-gray-500 mt-3">Por seguridad, las credenciales se administran en el
           editor de Apps Script: <b>Configuración del proyecto → Script Properties</b>.</p>`)}
       </div>
     </div>`);
+}
+
+// Trae los depósitos de VTEX y los carga en el selector de Configuración.
+async function cargarDepositosVtex() {
+  const sel = $("cfg-wh"), msg = $("cfg-wh-msg");
+  if (!sel) return;
+  msg.textContent = "Consultando VTEX...";
+  try {
+    const ws = await api("oncity.warehouses");
+    const actual = sel.value;
+    sel.innerHTML = '<option value="">— sin elegir —</option>' +
+      ws.map((w) => `<option value="${esc(w.id)}" ${w.id === actual ? "selected" : ""}>${esc(w.name)} (${esc(w.id)})</option>`).join("");
+    msg.textContent = `${ws.length} depósito(s) encontrados. Elegí el que recibe el stock y guardá.`;
+  } catch (e) {
+    msg.textContent = "No se pudieron traer los depósitos: " + e.message;
+  }
+}
+
+// Diagnóstico de OnCity: conexión, depósitos y traducción de los primeros refId.
+async function probarOncity() {
+  showModal(`<h3 class="font-bold text-lg mb-3">Probando OnCity…</h3>${spinner("Consultando VTEX...")}`);
+  let r;
+  try { r = await api("oncity.test"); }
+  catch (e) { return showModal(`<h3 class="font-bold text-lg mb-3">Probar OnCity</h3>
+    <p class="text-red-600 text-sm">${esc(e.message)}</p>
+    <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`); }
+  showModal(`
+    <h3 class="font-bold text-lg mb-3">Probar OnCity (VTEX)</h3>
+    <div class="mb-3 text-sm">${r.conexion.ok
+      ? '<span class="text-green-700 font-bold">● Conectado</span>'
+      : '<span class="text-red-600 font-bold">● Sin conexión</span>'} — ${esc(r.conexion.detalle)}</div>
+    ${r.depositos && r.depositos.length ? `<div class="text-xs text-gray-500 uppercase mb-1">Depósitos de VTEX</div>
+      <table class="data w-full mb-4"><tbody>${r.depositos.map((w) =>
+        `<tr><td class="font-mono">${esc(w.id)}</td><td>${esc(w.name)}</td></tr>`).join("")}</tbody></table>` : ""}
+    ${r.muestra && r.muestra.length ? `<div class="text-xs text-gray-500 uppercase mb-1">Traducción de SKU (muestra)</div>
+      <table class="data w-full"><thead><tr><th>SKU Tango</th><th>refId</th><th>SKU id en VTEX</th></tr></thead>
+      <tbody>${r.muestra.map((m) => `<tr><td class="font-mono">${esc(m.sku_tango)}</td>
+        <td class="font-mono">${esc(m.refid)}</td>
+        <td class="font-mono ${String(m.sku_id).indexOf("no encontrado") !== -1 ? "text-red-600" : "text-green-700"}">${esc(m.sku_id)}</td></tr>`).join("")}
+      </tbody></table>` : ""}
+    <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
 }
 
 async function guardarConfig() {
