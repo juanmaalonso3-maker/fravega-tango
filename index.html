@@ -421,23 +421,281 @@ function verDetalleSync(jsonStr) {
 
 /* ══════════════ ÓRDENES ══════════════ */
 let ORDENES_ROWS = null, ORDENES_ARCHIVO = "", ORDENES_ANALISIS = null, ORDENES_COMPLETAS = [];
+// Resultado acumulado de la búsqueda por API (todas las páginas juntas)
+let API_ORDENES = null;
+let ORDENES_MODO = localStorage.getItem("tf_ordenes_modo") || "api";
 
 function viewOrdenes() {
-  // Pintamos la sección de carga PRIMERO y sin await, así el input de archivo
-  // nunca se destruye por una llamada async que llega después.
+  // Pintamos la sección PRIMERO y sin await, así el input de archivo nunca se
+  // destruye por una llamada async que llega después.
+  const tab = (id, txt) => `<button onclick="cambiarModoOrdenes('${id}')"
+    class="px-4 py-2 text-sm rounded-lg ${ORDENES_MODO === id
+      ? "bg-violet-700 text-white font-medium" : "border bg-white text-gray-600"}">${txt}</button>`;
+
   setMain(H("Ingreso de Órdenes") + `
-    ${card(`
-      <div class="text-sm text-gray-600 mb-3">Subí el <b>CSV de órdenes exportado de Frávega</b>.
-        Primero se analiza (vista previa) y recién después confirmás el envío a Tango.</div>
-      <div class="flex items-center gap-3 flex-wrap">
-        <input type="file" id="ordenes-file" accept=".csv"
-          class="text-sm file:mr-3 file:px-4 file:py-2 file:rounded-lg file:border-0 file:bg-violet-100 file:text-violet-800 file:font-medium">
-        <button onclick="analizarOrdenes()" class="bg-violet-700 text-white px-4 py-2 rounded-lg">1️⃣ Analizar</button>
-      </div>
-      <div id="ordenes-resultado" class="mt-4"></div>`, "mb-4")}
+    <div class="flex gap-2 mb-4">
+      ${tab("api", "🔌 Directo desde Frávega (API)")}
+      ${tab("csv", "📄 Subiendo el CSV")}
+    </div>
+    ${ORDENES_MODO === "api" ? bloqueOrdenesApi() : bloqueOrdenesCsv()}
     ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Historial de importaciones</div>
       <div id="ordenes-hist">${spinner("Cargando historial...")}</div>`)}`);
   cargarHistorialOrdenes();  // llena SOLO el div del historial, sin tocar la carga
+}
+
+function cambiarModoOrdenes(modo) {
+  ORDENES_MODO = modo;
+  localStorage.setItem("tf_ordenes_modo", modo);
+  API_ORDENES = null;
+  viewOrdenes();
+}
+
+function bloqueOrdenesApi() {
+  return card(`
+    <div class="text-sm text-gray-600 mb-3">
+      Trae las órdenes <b>cobradas y pendientes de facturación</b> directamente de la API de
+      Frávega. No hace falta descargar ni subir nada.
+      <div class="mt-2 text-xs bg-amber-50 border border-amber-200 text-amber-900 rounded-lg px-3 py-2">
+        ⏱️ <b>Espera de Envío Pack:</b> solo se traen órdenes que ya cumplieron el tiempo mínimo
+        configurado (90 minutos por defecto), que es lo que necesita Envío Pack para generar el
+        envío. Las más nuevas no se pierden: aparecen listadas como "esperando" y entran solas
+        en la próxima búsqueda.
+      </div>
+    </div>
+    <div class="flex items-center gap-3 flex-wrap">
+      <button onclick="buscarOrdenesApi()" class="bg-violet-700 hover:bg-violet-800 text-white px-5 py-2.5 rounded-lg font-medium">
+        1️⃣ Buscar órdenes en Frávega</button>
+      <button onclick="probarApiOrdenes()" class="border px-4 py-2.5 rounded-lg text-sm">🔌 Probar conexión</button>
+    </div>
+    <div id="ordenes-resultado" class="mt-4"></div>`, "mb-4");
+}
+
+function bloqueOrdenesCsv() {
+  return card(`
+    <div class="text-sm text-gray-600 mb-3">Subí el <b>CSV de órdenes exportado de Frávega</b>.
+      Primero se analiza (vista previa) y recién después confirmás el envío a Tango.</div>
+    <div class="flex items-center gap-3 flex-wrap">
+      <input type="file" id="ordenes-file" accept=".csv"
+        class="text-sm file:mr-3 file:px-4 file:py-2 file:rounded-lg file:border-0 file:bg-violet-100 file:text-violet-800 file:font-medium">
+      <button onclick="analizarOrdenes()" class="bg-violet-700 text-white px-4 py-2 rounded-lg">1️⃣ Analizar</button>
+    </div>
+    <div id="ordenes-resultado" class="mt-4"></div>`, "mb-4");
+}
+
+/* ── Búsqueda por API, página por página ────────────────────────────────
+ * Cada página es una llamada a Apps Script, así ninguna pasa los 6 minutos
+ * de límite. El backend hace una llamada de detalle por orden nueva (con su
+ * pausa configurable) porque el listado no trae los domicilios. */
+async function buscarOrdenesApi() {
+  const box = $("ordenes-resultado");
+  box.innerHTML = spinner("Consultando la API de Frávega...");
+
+  const acc = { orders: [], registros: {}, nuevas: [], saltadas: [], excluidas: [],
+                esperando: [], fallidas: [], total: 0, paginas: 1, truncada: false,
+                campo_id: "", espera_min: 90 };
+  let pagina = 1;
+
+  try {
+    while (true) {
+      box.innerHTML = `<div class="border rounded-lg p-4 bg-violet-50">
+        ${spinner(`Leyendo página ${pagina}${acc.paginas > 1 ? " de " + acc.paginas : ""} de Frávega...`)}
+        <div class="text-xs text-gray-600 mt-2">Órdenes nuevas encontradas: ${acc.nuevas.length}
+          ${acc.esperando.length ? ` · esperando el tiempo de envío: ${acc.esperando.length}` : ""}</div>
+        <div class="text-xs text-gray-400 mt-1">Cada orden nueva requiere una consulta de detalle
+          (es la que trae los domicilios), por eso puede tardar.</div>
+      </div>`;
+
+      const r = await api("orders.apiPreview", { pagina });
+      acc.total = r.total; acc.paginas = r.paginas;
+      acc.campo_id = r.campo_id; acc.espera_min = r.espera_min;
+      acc.orders.push(...r.orders);
+      Object.assign(acc.registros, r.registros || {});
+      acc.nuevas.push(...r.nuevas);
+      acc.saltadas.push(...r.saltadas);
+      acc.excluidas.push(...r.excluidas);
+      acc.esperando.push(...r.esperando);
+      acc.fallidas.push(...r.fallidas);
+      if (r.truncada) acc.truncada = true;
+
+      if (r.truncada || pagina >= r.paginas || !r.en_pagina) break;
+      pagina++;
+    }
+  } catch (e) {
+    box.innerHTML = `<div class="border border-red-200 bg-red-50 rounded-lg p-4">
+      <div class="font-bold text-red-700 mb-1">No se pudieron traer las órdenes</div>
+      <div class="text-sm text-red-700">${esc(e.message)}</div></div>`;
+    return;
+  }
+
+  API_ORDENES = acc;
+  pintarOrdenesApi();
+}
+
+function pintarOrdenesApi() {
+  const a = API_ORDENES;
+  if (!a) return;
+  const box = $("ordenes-resultado");
+  const money = (n) => "$ " + Number(n).toLocaleString("es-AR");
+
+  box.innerHTML = `
+    <div class="border rounded-lg p-4 bg-gray-50">
+      <div class="text-sm mb-2">
+        <b>${a.total}</b> orden(es) pendientes de facturación en Frávega
+        <span class="text-gray-400">· Nro de Orden tomado de <code>${esc(a.campo_id)}</code></span>
+      </div>
+      <div class="flex gap-4 text-sm mb-3 flex-wrap">
+        <span>🆕 Nuevas a enviar: <b>${a.nuevas.length}</b></span>
+        <span>⏩ Ya enviadas: <b>${a.saltadas.length}</b></span>
+        <span class="${a.esperando.length ? "text-amber-700" : ""}">⏱️ Esperando el tiempo de envío: <b>${a.esperando.length}</b></span>
+        <span class="${a.excluidas.length ? "text-red-600" : ""}">🚫 Sin relación de SKU: <b>${a.excluidas.length}</b></span>
+        ${a.fallidas.length ? `<span class="text-red-600">⚠️ Con error: <b>${a.fallidas.length}</b></span>` : ""}
+      </div>
+
+      ${a.truncada ? `<div class="text-sm bg-amber-50 border border-amber-200 text-amber-900 rounded p-3 mb-3">
+        Se cortó la lectura para no pasar el límite de tiempo de Google. Enviá estas órdenes y
+        volvé a apretar "Buscar" para traer el resto.</div>` : ""}
+
+      ${a.nuevas.length ? `<div class="max-h-96 overflow-y-auto mb-3">
+        <table class="data w-full"><thead><tr>
+          <th>Orden</th><th>Cliente</th><th>Documento</th><th>Fecha de compra</th>
+          <th>Entrega</th><th>Ítems</th><th>Total</th></tr></thead><tbody>
+        ${a.nuevas.map((o) => `<tr>
+          <td class="font-mono">${esc(o.orden)}</td>
+          <td>${esc(o.cliente)}</td>
+          <td class="font-mono text-xs">${esc(o.documento)}</td>
+          <td class="text-xs">${esc(o.fecha)}</td>
+          <td class="text-xs">${o.entrega === "SP" ? "Sucursal" : o.entrega === "HD" ? "Domicilio" : esc(o.entrega || "—")}</td>
+          <td class="text-center">${o.items}</td>
+          <td>${money(o.total)}${o.aviso ? `<div class="text-xs text-amber-700" title="${esc(o.aviso)}">⚠ revisar total</div>` : ""}</td>
+        </tr>`).join("")}</tbody></table></div>` : ""}
+
+      ${a.esperando.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-3 mb-3">
+        ⏱️ Estas órdenes todavía no cumplieron los ${a.espera_min} minutos que necesita Envío Pack.
+        No hay que hacer nada: entran solas en la próxima búsqueda.
+        ${a.esperando.slice(0, 20).map((x) => `<div>· ${esc(x.orden)} — comprada ${esc(x.compra)}, faltan ${x.faltan_min} min</div>`).join("")}
+        ${a.esperando.length > 20 ? `<div class="text-xs mt-1">…y ${a.esperando.length - 20} más</div>` : ""}</div>` : ""}
+
+      ${a.excluidas.length ? `<div class="text-sm text-red-700 bg-red-50 border border-red-200 rounded p-3 mb-3">
+        Estas órdenes NO se envían porque tienen SKUs sin relación (ya quedaron en
+        <a href="#pendientes" class="underline font-medium">Pendientes</a>):
+        ${a.excluidas.map((x) => `<div>· ${esc(x.orden)} → SKU ${x.skus_sin_relacion.map(esc).join(", ")}</div>`).join("")}</div>` : ""}
+
+      ${a.fallidas.length ? `<div class="text-sm text-red-700 bg-red-50 border border-red-200 rounded p-3 mb-3">
+        No se pudo leer el detalle de estas órdenes:
+        ${a.fallidas.map((x) => `<div>· ${esc(x.orden)}: ${esc(x.error)}</div>`).join("")}</div>` : ""}
+
+      ${a.nuevas.length ? `<button onclick="enviarOrdenesApi()"
+        class="bg-green-700 hover:bg-green-800 text-white px-5 py-2.5 rounded-lg font-medium">
+        2️⃣ Confirmar y enviar ${a.nuevas.length} orden(es) a Tango</button>` :
+        '<div class="text-gray-500 text-sm">No hay órdenes nuevas para enviar.</div>'}
+    </div>`;
+}
+
+function enviarOrdenesApi() {
+  const a = API_ORDENES;
+  if (!a || !a.orders.length) return;
+  const total = a.orders.length;
+
+  confirmar(`Se van a crear ${total} pedido(s) en Tango, en tandas de 25. ¿Continuar?`, async () => {
+    const TANDA = 25;
+    const enviadas = [], rechazadas = [];
+    const box = $("ordenes-resultado");
+
+    for (let i = 0; i < total; i += TANDA) {
+      const lote = a.orders.slice(i, i + TANDA);
+      // Mandamos solo los registros de este lote, para no inflar el payload
+      const regs = {};
+      lote.forEach((o) => { if (a.registros[o.OrderID]) regs[o.OrderID] = a.registros[o.OrderID]; });
+      const desde = i + 1, hasta = Math.min(i + TANDA, total);
+
+      box.innerHTML = `
+        <div class="border rounded-lg p-4 bg-violet-50">
+          ${spinner(`Enviando órdenes ${desde}–${hasta} de ${total} a Tango...`)}
+          <div class="text-xs text-gray-500 mt-2">Aceptadas hasta ahora: ${enviadas.length}
+            ${rechazadas.length ? `· rechazadas: ${rechazadas.length}` : ""}</div>
+          <div class="w-full bg-violet-200 rounded-full h-2 mt-2">
+            <div class="bg-violet-700 h-2 rounded-full" style="width:${Math.round(hasta / total * 100)}%"></div></div>
+        </div>`;
+      try {
+        const r = await api("orders.apiSend", { orders: lote, registros: regs, archivo: "API Frávega" });
+        enviadas.push(...r.enviadas);
+        rechazadas.push(...r.rechazadas);
+      } catch (e) {
+        rechazadas.push({ orden: `tanda ${desde}-${hasta}`, error: e.message });
+      }
+    }
+
+    box.innerHTML = `
+      <div class="border rounded-lg p-4 ${rechazadas.length ? "bg-amber-50" : "bg-green-50"}">
+        <div class="font-bold mb-2">✅ Enviadas y aceptadas por Tango: ${enviadas.length} de ${total}</div>
+        <div class="text-sm text-gray-600 mb-2">Quedaron guardadas con cliente, documento y total en
+          <b>OrdenesEnviadas</b>. Para facturar ya no hace falta volver a subir el CSV de Frávega:
+          andá a <a href="#facturas" class="underline text-violet-700">Exportación de Facturas</a> y
+          subí solo el reporte de Tango.</div>
+        <div class="max-h-40 overflow-y-auto">
+          ${enviadas.map((id) => `<span class="inline-block bg-white border rounded px-2 py-0.5 text-xs mr-1 mb-1">${esc(id)}</span>`).join("")}
+        </div>
+        ${rechazadas.length ? `<div class="font-bold mt-3 mb-1 text-red-700">❌ Rechazadas / con problema: ${rechazadas.length}</div>
+          <div class="max-h-40 overflow-y-auto">
+          ${rechazadas.map((f) => `<div class="text-sm text-red-700">· ${esc(f.orden)}: ${esc(f.error)}</div>`).join("")}
+          </div>` : ""}
+      </div>`;
+    toast(`${enviadas.length} órdenes enviadas a Tango`, rechazadas.length ? "warning" : "ok");
+
+    try {
+      await api("orders.recordImport", {
+        archivo: "API Frávega",
+        total_filas: a.total,
+        filas_pendientes: a.nuevas.length + a.saltadas.length,
+        nuevas: total,
+        enviadas: enviadas,
+        rechazadas: rechazadas,
+        excluidas: a.excluidas || [],
+        saltadas: a.saltadas || [],
+      });
+    } catch (e) { /* el historial es secundario: no cortamos el flujo */ }
+    API_ORDENES = null;
+    cargarHistorialOrdenes();
+  });
+}
+
+/* Diagnóstico de la API de órdenes, sin enviar nada a Tango. */
+async function probarApiOrdenes() {
+  showModal(`<h3 class="font-bold text-lg mb-3">Probando la API de órdenes…</h3>${spinner("Consultando Frávega...")}`);
+  let r;
+  try { r = await api("orders.apiTest"); }
+  catch (e) { return showModal(`<h3 class="font-bold text-lg mb-3">Probar API de órdenes</h3>
+    <p class="text-red-600 text-sm">${esc(e.message)}</p>
+    <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`); }
+
+  showModal(`
+    <h3 class="font-bold text-lg mb-3">Probar API de órdenes de Frávega</h3>
+    <div class="mb-3 text-sm">${r.ok
+      ? '<span class="text-green-700 font-bold">● Conectado</span>'
+      : '<span class="text-red-600 font-bold">● Sin acceso</span>'} — ${esc(r.mensaje)}</div>
+    ${r.ok ? `
+      <div class="text-sm space-y-1 mb-4">
+        <div>Órdenes pendientes: <b>${r.total}</b> en ${r.paginas} página(s)</div>
+        <div>Nro de Orden tomado de: <code>${esc(r.campo_id)}</code></div>
+        <div>Espera de Envío Pack: <b>${r.espera_min} min</b></div>
+        <div>Consulta de detalle: ${r.detalle_ok
+          ? `<span class="text-green-700">funciona</span> (formato <code>${esc(r.modo_detalle)}</code>)`
+          : `<span class="text-red-600">falla</span> — ${esc(r.detalle_error || "")}`}</div>
+        ${r.comprador ? `<div>Comprador de muestra: ${esc(r.comprador)}</div>` : ""}
+        ${r.domicilio_facturacion ? `<div>Domicilio de facturación: ${esc(r.domicilio_facturacion)}</div>` : ""}
+        ${r.domicilio_entrega ? `<div>Domicilio de entrega: ${esc(r.domicilio_entrega)}</div>` : ""}
+        ${r.operador_logistico ? `<div>Operador logístico: <b>${esc(r.operador_logistico)}</b></div>` : ""}
+      </div>
+      ${r.muestra && r.muestra.length ? `<div class="text-xs text-gray-500 uppercase mb-1">Muestra de órdenes</div>
+        <table class="data w-full"><thead><tr><th>orderId</th><th>suborderId</th><th>Cliente</th><th>SKUs</th></tr></thead>
+        <tbody>${r.muestra.map((m) => `<tr>
+          <td class="font-mono text-xs">${esc(m.orderId)}</td>
+          <td class="font-mono text-xs">${esc(m.suborderId)}</td>
+          <td class="text-xs">${esc(m.cliente)}</td>
+          <td class="text-xs ${String(m.skus).indexOf("sin relación") !== -1 ? "text-red-600" : ""}">${esc(m.skus)}</td>
+        </tr>`).join("")}</tbody></table>` : ""}
+    ` : ""}
+    <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
 }
 
 async function cargarHistorialOrdenes() {
@@ -559,27 +817,146 @@ function enviarOrdenes() {
 }
 
 /* ══════════════ FACTURAS ══════════════ */
+let FACTURAS_MODO = localStorage.getItem("tf_facturas_modo") || "historial";
+
 function viewFacturas() {
+  const tab = (id, txt) => `<button onclick="cambiarModoFacturas('${id}')"
+    class="px-4 py-2 text-sm rounded-lg ${FACTURAS_MODO === id
+      ? "bg-violet-700 text-white font-medium" : "border bg-white text-gray-600"}">${txt}</button>`;
+
   setMain(H("Exportación de Facturas") + `
-    ${card(`
-      <div class="text-sm text-gray-600 mb-3">Subí los dos archivos y descargá la
-        <b>Tabla-modelo-facturas COMPLETO.xlsx</b> lista para Frávega.</div>
-      <div class="grid md:grid-cols-2 gap-4 mb-4">
-        <div><label class="text-xs text-gray-500 uppercase">1. CSV de órdenes (Frávega)</label><br>
-          <input type="file" id="fac-ordenes" accept=".csv"
-            class="text-sm file:mr-3 file:px-4 file:py-2 file:rounded-lg file:border-0 file:bg-violet-100 file:text-violet-800"></div>
-        <div><label class="text-xs text-gray-500 uppercase">2. Reporte de facturación (Tango, Libro1.xlsx)</label><br>
-          <input type="file" id="fac-libro" accept=".xlsx,.xls,.csv"
-            class="text-sm file:mr-3 file:px-4 file:py-2 file:rounded-lg file:border-0 file:bg-violet-100 file:text-violet-800"></div>
-      </div>
-      <button onclick="generarFacturas()" class="bg-violet-700 text-white px-5 py-2.5 rounded-lg font-medium">
-        Generar archivo</button>
-      <div id="fac-resultado" class="mt-4"></div>`, "mb-4")}
+    <div class="flex gap-2 mb-4">
+      ${tab("historial", "🗂️ Contra el historial (solo el reporte de Tango)")}
+      ${tab("csv", "📄 Subiendo los dos archivos")}
+    </div>
+    ${FACTURAS_MODO === "historial" ? bloqueFacturasHistorial() : bloqueFacturasCsv()}
     ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Historial de exportaciones</div>
       <div id="fac-hist">${spinner("Cargando historial...")}</div>
       <p class="text-xs text-gray-400 mt-2">El archivo se descarga en el momento de generarlo
       (no queda guardado en el servidor).</p>`)}`);
   cargarHistorialFacturas();
+  if (FACTURAS_MODO === "historial") cargarPendientesFacturar();
+}
+
+function cambiarModoFacturas(modo) {
+  FACTURAS_MODO = modo;
+  localStorage.setItem("tf_facturas_modo", modo);
+  viewFacturas();
+}
+
+function bloqueFacturasHistorial() {
+  return card(`
+    <div class="text-sm text-gray-600 mb-3">
+      Subí <b>solo el reporte de facturación de Tango</b>. La app lo cruza contra las órdenes
+      que ella misma le mandó a Tango, así que no hace falta volver a bajar el CSV de Frávega.
+      <div class="mt-2 text-xs bg-violet-50 border border-violet-200 text-violet-900 rounded-lg px-3 py-2">
+        El match se hace primero por <b>número de documento</b> (que es unívoco) y solo si eso
+        falla se cae al nombre del cliente. Cada orden matcheada queda marcada como facturada
+        para que no se vuelva a usar en la próxima exportación.
+      </div>
+    </div>
+    <div id="fac-pendientes" class="mb-4">${spinner("Contando órdenes pendientes de facturar...")}</div>
+    <div class="mb-4">
+      <label class="text-xs text-gray-500 uppercase">Reporte de facturación (Tango, Libro1.xlsx)</label><br>
+      <input type="file" id="fac-libro-h" accept=".xlsx,.xls,.csv"
+        class="text-sm file:mr-3 file:px-4 file:py-2 file:rounded-lg file:border-0 file:bg-violet-100 file:text-violet-800">
+    </div>
+    <button onclick="generarFacturasHistorial()" class="bg-violet-700 text-white px-5 py-2.5 rounded-lg font-medium">
+      Generar archivo</button>
+    <div id="fac-resultado" class="mt-4"></div>`, "mb-4");
+}
+
+function bloqueFacturasCsv() {
+  return card(`
+    <div class="text-sm text-gray-600 mb-3">Subí los dos archivos y descargá la
+      <b>Tabla-modelo-facturas COMPLETO.xlsx</b> lista para Frávega.</div>
+    <div class="grid md:grid-cols-2 gap-4 mb-4">
+      <div><label class="text-xs text-gray-500 uppercase">1. CSV de órdenes (Frávega)</label><br>
+        <input type="file" id="fac-ordenes" accept=".csv"
+          class="text-sm file:mr-3 file:px-4 file:py-2 file:rounded-lg file:border-0 file:bg-violet-100 file:text-violet-800"></div>
+      <div><label class="text-xs text-gray-500 uppercase">2. Reporte de facturación (Tango, Libro1.xlsx)</label><br>
+        <input type="file" id="fac-libro" accept=".xlsx,.xls,.csv"
+          class="text-sm file:mr-3 file:px-4 file:py-2 file:rounded-lg file:border-0 file:bg-violet-100 file:text-violet-800"></div>
+    </div>
+    <button onclick="generarFacturas()" class="bg-violet-700 text-white px-5 py-2.5 rounded-lg font-medium">
+      Generar archivo</button>
+    <div id="fac-resultado" class="mt-4"></div>`, "mb-4");
+}
+
+async function cargarPendientesFacturar() {
+  const cont = $("fac-pendientes");
+  if (!cont) return;
+  let r;
+  try { r = await api("invoices.pendientes"); }
+  catch (e) { cont.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
+  if (!$("fac-pendientes")) return;
+  const p = r.pendientes || [];
+  cont.innerHTML = `
+    <div class="border rounded-lg p-3 bg-gray-50">
+      <div class="text-sm mb-2"><b>${p.length}</b> orden(es) enviadas a Tango y todavía sin factura cargada
+        ${r.sin_datos ? `<span class="text-xs text-gray-500">· ${r.sin_datos} fila(s) viejas sin datos de cliente (no se pueden matchear)</span>` : ""}</div>
+      ${p.length ? `<div class="max-h-56 overflow-y-auto">
+        <table class="data w-full"><thead><tr>
+          <th>Orden</th><th>Cliente</th><th>Documento</th><th>Fecha</th><th>Total</th><th>Origen</th>
+        </tr></thead><tbody>
+        ${p.slice(0, 200).map((o) => `<tr>
+          <td class="font-mono text-xs">${esc(o.orden)}</td><td>${esc(o.cliente)}</td>
+          <td class="font-mono text-xs">${esc(o.documento)}</td>
+          <td class="text-xs">${esc(o.fecha_compra)}</td>
+          <td>${o.total !== "" && o.total !== null ? "$ " + Number(o.total).toLocaleString("es-AR") : "—"}</td>
+          <td class="text-xs">${badge(o.origen || "csv", o.origen === "api" ? "info" : "warning")}</td>
+        </tr>`).join("")}</tbody></table>
+        ${p.length > 200 ? `<div class="text-xs text-gray-400 mt-1">…y ${p.length - 200} más</div>` : ""}
+      </div>` : '<div class="text-sm text-gray-400">No hay órdenes pendientes de facturar.</div>'}
+    </div>`;
+}
+
+/** Descarga el .xlsx que devuelve el backend en base64. */
+function descargarXlsx(base64, nombre) {
+  const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+  const blob = new Blob([bytes],
+    { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = nombre;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+async function generarFacturasHistorial() {
+  const fl = $("fac-libro-h");
+  if (!fl || !fl.files.length) return toast("Subí el reporte de facturación de Tango", "warning");
+  $("fac-resultado").innerHTML = spinner("Cruzando el reporte contra las órdenes enviadas...");
+  try {
+    const facturasRows = await parseFile(fl.files[0]);
+    const r = await api("invoices.fromHistory", { facturas: facturasRows });
+    descargarXlsx(r.base64, r.archivo);
+
+    $("fac-resultado").innerHTML = `
+      <div class="border rounded-lg p-4 bg-green-50">
+        <div class="font-bold mb-2">✅ Archivo generado y descargado — ${r.cargadas} orden(es) cargada(s)</div>
+        <div class="text-sm mb-2">${esc(r.archivo)}</div>
+        <div class="text-sm text-gray-600 mb-2">
+          Matcheadas por documento: <b>${r.por_documento}</b> · por nombre: <b>${r.por_nombre}</b>
+          <div class="text-xs text-gray-500">Columna de documento usada del reporte de Tango:
+            ${esc(r.columna_documento)}</div>
+        </div>
+        ${r.sin_factura.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 mb-2">
+          ⚠️ ${r.sin_factura.length} orden(es) enviadas a Tango sin factura en el reporte:
+          ${r.sin_factura.slice(0, 30).map((s) => `<div>· ${esc(s.orden)} — ${esc(s.cliente)}${s.documento ? " (doc " + esc(s.documento) + ")" : ""}</div>`).join("")}
+          ${r.sin_factura.length > 30 ? `<div class="text-xs mt-1">…y ${r.sin_factura.length - 30} más</div>` : ""}
+          <div class="text-xs mt-1">Quedan pendientes: entran solas en la próxima exportación.</div></div>` : ""}
+        ${r.sobrantes.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2">
+          ⚠️ ${r.sobrantes.length} factura(s) del reporte sin orden pendiente que las reclame:
+          ${r.sobrantes.slice(0, 30).map((s) => `<div>· ${esc(s.cliente)} — ${esc(s.factura)}</div>`).join("")}
+          ${r.sobrantes.length > 30 ? `<div class="text-xs mt-1">…y ${r.sobrantes.length - 30} más</div>` : ""}</div>` : ""}
+      </div>`;
+    toast("Archivo de facturas generado", "ok");
+    cargarHistorialFacturas();
+    cargarPendientesFacturar();
+  } catch (e) {
+    $("fac-resultado").innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`;
+  }
 }
 
 async function cargarHistorialFacturas() {
@@ -918,12 +1295,22 @@ const CONFIG_CAMPOS = [
     ["orders_seller_code", "Vendedor", "text"],
     ["orders_payment_method", "Forma de cobro (A01-A10)", "text"],
     ["orders_batch_size", "Órdenes por lote", "text"],
-    ["orders_estado_objetivo", "Estado de facturación a importar", "text"],
+    ["orders_estado_objetivo", "Estado de facturación a importar (solo modo CSV)", "text"],
+  ]],
+  ["Órdenes por API de Frávega", [
+    ["orders_api_espera_min", "Espera antes de enviar cada orden, en minutos (Envío Pack necesita 90)", "text"],
+    ["orders_api_dias_atras", "Ventana de búsqueda hacia atrás (días)", "text"],
+    ["orders_api_pause_ms", "Pausa entre consultas de detalle a Frávega (ms)", "text"],
+    ["orders_api_page_size", "Órdenes por página (máx. 100)", "text"],
+    ["orders_api_max_detalle", "Máximo de detalles por ejecución", "text"],
+    ["orders_api_id_field", "Nro de Orden: auto · suborderId · orderId", "text"],
+    ["orders_api_tipo_entrega", "Filtrar tipo de entrega: vacío = todos · SP · HD", "text"],
+    ["orders_api_facturar_envio", "Sumar el costo de envío al total (dejar apagado con Frávega Envíos)", "bool"],
   ]],
   ["Facturas", [
     ["invoices_add_prefix", "Agregar prefijo al Nro de orden", "bool"],
     ["invoices_prefix", "Prefijo", "text"],
-    ["invoices_estado_objetivo", "Estado de facturación a matchear", "text"],
+    ["invoices_estado_objetivo", "Estado de facturación a matchear (solo modo CSV)", "text"],
   ]],
 ];
 

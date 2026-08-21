@@ -52,6 +52,18 @@ var SH = {
   SENT: 'OrdenesEnviadas'
 };
 
+/**
+ * Columnas de OrdenesEnviadas. Antes eran solo [order_id, fecha_hora]; ahora
+ * guarda TODO lo que se le mandó a Tango, así la exportación de facturas ya no
+ * necesita que vuelvas a subir el CSV de órdenes: cruza el reporte de Tango
+ * contra este historial. La columna 1 sigue siendo order_id, que es lo que lee
+ * _sentIds() para no reenviar un pedido dos veces.
+ */
+var COLS_SENT = ['order_id', 'suborder_id', 'fecha_hora', 'fecha_compra',
+                 'cliente', 'documento', 'cuil', 'email', 'total', 'items',
+                 'origen', 'estado_facturacion', 'nro_factura', 'fecha_factura',
+                 'facturada_en'];
+
 var DEFAULT_CONFIG = [
   ['stock_warehouse_code', '04', 'Depósito de Tango para el stock'],
   ['stock_subtract_engaged', '1', 'Restar comprometido (EngagedQuantity)'],
@@ -74,6 +86,17 @@ var DEFAULT_CONFIG = [
   ['orders_payment_method', 'A01', 'Forma de cobro'],
   ['orders_batch_size', '25', 'Órdenes por lote'],
   ['orders_estado_objetivo', 'Pendiente', 'Estado de facturación a importar'],
+  // ── Ingreso de órdenes por API de Frávega ───────────────────────────────
+  ['orders_api_espera_min', '90', 'Minutos que tiene que tener la orden antes de enviarla (Envío Pack necesita 90)'],
+  ['orders_api_dias_atras', '30', 'Ventana de búsqueda hacia atrás (días)'],
+  ['orders_api_page_size', '100', 'Órdenes por página de la API (máx. 100)'],
+  ['orders_api_pause_ms', '400', 'Pausa entre llamadas de detalle a Frávega (ms)'],
+  ['orders_api_max_detalle', '120', 'Máximo de detalles por ejecución (límite de 6 min de Apps Script)'],
+  ['orders_api_id_field', 'auto', 'Qué ID usar como Nro de Orden: auto | suborderId | orderId'],
+  ['orders_api_detalle_modo', '', 'Forma del endpoint de detalle que funcionó (se detecta solo)'],
+  ['orders_api_facturar_envio', '0', 'Sumar el costo de envío al total (0 si usás Frávega Envíos)'],
+  ['orders_api_tipo_entrega', '', 'Filtrar por tipo de entrega: vacío = todos · SP = sucursal · HD = domicilio'],
+  ['invoices_origen', 'historial', 'De dónde salen las órdenes a facturar: historial | csv'],
   ['invoices_add_prefix', '1', 'Agregar prefijo al Nro de orden'],
   ['invoices_prefix', 'FVG-', 'Prefijo'],
   ['invoices_estado_objetivo', 'Pendiente', 'Estado a matchear en facturas'],
@@ -112,7 +135,7 @@ function SETUP() {
                                'pendientes', 'nuevas', 'enviadas', 'rechazadas', 'detalle_json']);
   _ensureSheet(ss, SH.INVOICES, ['fecha_hora', 'usuario', 'archivo', 'cargadas',
                                  'sin_factura', 'sobrantes', 'detalle_json']);
-  _ensureSheet(ss, SH.SENT, ['order_id', 'fecha_hora']);
+  _ensureSheet(ss, SH.SENT, COLS_SENT);
 
   // Config por defecto (solo claves faltantes)
   var cfgSheet = ss.getSheetByName(SH.CONFIG);
@@ -144,6 +167,7 @@ function SETUP() {
   }
 
   MIGRAR_ONCITY();
+  MIGRAR_ORDENES_API();
   configurarTriggers();
   log_('sistema', 'sistema', 'SETUP ejecutado', 'ok', '');
   return 'SETUP completo. Ahora: Implementar → Nueva implementación → App web.';
@@ -219,7 +243,13 @@ function doPost(e) {
       case 'orders.sendBatch':   out = apiOrdersSendBatch(user, p.orders, p.archivo); break;
       case 'orders.recordImport':out = apiOrdersRecordImport(user, p); break;
       case 'orders.history':     out = _readRows(SH.ORDERS, 50).reverse(); break;
+      // ── Ingreso de órdenes por API de Frávega ──
+      case 'orders.apiPreview':  out = apiOrdersApiPreview(user, p); break;
+      case 'orders.apiSend':     out = apiOrdersApiSend(user, p); break;
+      case 'orders.apiTest':     out = apiOrdersApiTest(); break;
       case 'invoices.generate':  out = apiInvoicesGenerate(user, p.ordenes, p.facturas); break;
+      case 'invoices.pendientes':out = apiInvoicesPendientes(); break;
+      case 'invoices.fromHistory': out = apiInvoicesFromHistory(user, p.facturas); break;
       case 'invoices.history':   out = _readRows(SH.INVOICES, 50).reverse(); break;
       case 'skus.list':          out = apiSkusList(p.q || ''); break;
       case 'skus.save':          out = apiSkusSave(user, p); break;
@@ -830,9 +860,15 @@ function _itError(it) {
                     'Message', 'message', 'Error', 'error']);
 }
 
-/** Núcleo de envío a Tango, con reintento -Rn y registro. */
-function _sendOrders(orders, user, archivo, meta) {
+/**
+ * Núcleo de envío a Tango, con reintento -Rn y registro.
+ * `registros` (opcional) es { OrderID: {cliente, documento, total, …} } y es lo
+ * que hace que OrdenesEnviadas guarde todo lo que se mandó, para que después la
+ * exportación de facturas cruce contra ese historial y no contra un CSV.
+ */
+function _sendOrders(orders, user, archivo, meta, registros) {
   var t0 = Date.now();
+  registros = registros || {};
   var batchSize = parseInt(getConfig('orders_batch_size') || '25', 10);
   var cfgPago = getConfig('orders_payment_method') || 'A01';
   var results = [];
@@ -884,6 +920,12 @@ function _sendOrders(orders, user, archivo, meta) {
       var dg = nid.replace(/\D/g, '');
       copy.CashPayments = [{ PaymentID: dg ? parseInt(dg, 10) : 1,
                              PaymentMethod: cfgPago, PaymentTotal: orig.Total }];
+      // El reintento hereda los datos del pedido original, así la fila que
+      // queda en OrdenesEnviadas sirve igual para matchear la factura.
+      if (registros[oid]) {
+        registros[nid] = JSON.parse(JSON.stringify(registros[oid]));
+        registros[nid].order_id = nid;
+      }
       retries.push(copy);
     });
   });
@@ -922,7 +964,7 @@ function _sendOrders(orders, user, archivo, meta) {
   }
 
   var ts = _now();
-  sentIds.forEach(function (id) { _appendRow(SH.SENT, [id, ts]); });
+  sentIds.forEach(function (id) { _appendRow(SH.SENT, _filaSent(id, registros[id], ts)); });
   if (meta) {
     _appendRow(SH.ORDERS, [ts, user.email, archivo || 'Ordenes.csv', meta.total_filas,
                            meta.filas_pendientes, orders.length, sentIds.length, failed.length,
@@ -933,6 +975,573 @@ function _sendOrders(orders, user, archivo, meta) {
        failed.length ? 'warning' : 'ok',
        'enviadas=' + sentIds.length + ' rechazadas=' + failed.length, Date.now() - t0);
   return { enviadas: sentIds, rechazadas: failed };
+}
+
+/* ═══════════════ MÓDULO ÓRDENES POR API DE FRÁVEGA ═══════════════
+ * Reemplaza el paso manual de bajar el CSV del seller center y subirlo.
+ *
+ * Cómo funciona:
+ *   1. GET /api/v1/orders?status=pending  → listado paginado de las órdenes
+ *      cobradas y todavía sin facturar (equivale al "Estado de Facturación =
+ *      Pendiente" del CSV).
+ *   2. Para cada orden nueva, GET /api/v1/orders/{id} → el detalle, que es lo
+ *      único que trae los domicilios de facturación y de entrega.
+ *   3. Se arma el mismo payload de Tango que armaba _buildOrder desde el CSV
+ *      y se manda por el /order/batch de siempre.
+ *
+ * LA ESPERA DE ENVÍO PACK: el manual de Frávega pide que las órdenes tengan al
+ * menos 90 minutos antes de tocarlas, porque Envío Pack necesita ese tiempo
+ * para generar el envío en su plataforma. Se respeta de dos formas: se pide a
+ * la API con purchasedateto = ahora − espera, y además se vuelve a verificar
+ * orden por orden acá abajo. Una orden que todavía no cumplió el tiempo no se
+ * saltea ni se pierde: queda listada como "esperando" y entra sola en la
+ * próxima corrida. El tiempo se configura en orders_api_espera_min.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+var TZ_AR = 'America/Argentina/Buenos_Aires';
+
+/** Fecha → string ISO 8601 en UTC, que es el formato que pide la API. */
+function _isoUtc(d) {
+  return Utilities.formatDate(d, 'UTC', "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'");
+}
+
+/** Parsea una fecha de la API a milisegundos. Devuelve 0 si no se entiende. */
+function _fechaMs(v) {
+  if (!v) return 0;
+  if (v instanceof Date) return v.getTime();
+  var s = String(v).trim();
+  var d = new Date(s);
+  if (!isNaN(d.getTime())) return d.getTime();
+  var m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);   // dd/mm/yyyy
+  if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1])).getTime();
+  return 0;
+}
+
+/** Fecha de la API → el formato que espera Tango (yyyy-MM-ddTHH:mm:ss). */
+function _fechaTango(v) {
+  var s = String(v || '').trim();
+  var m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return m[1] + '-' + m[2] + '-' + m[3] + 'T00:00:00';
+  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+  if (m) return m[3] + '-' + ('0' + m[2]).slice(-2) + '-' + ('0' + m[1]).slice(-2) + 'T00:00:00';
+  var ms = _fechaMs(s);
+  if (ms) return Utilities.formatDate(new Date(ms), TZ_AR, "yyyy-MM-dd'T'00:00:00");
+  return Utilities.formatDate(new Date(), TZ_AR, "yyyy-MM-dd'T'00:00:00");
+}
+
+/** GET con reintentos contra la API de Frávega. Devuelve {ok, code, data|error}. */
+function _fravegaGetJson(path) {
+  var headers = _fravegaHeaders();
+  headers['accept'] = 'application/json';
+  for (var intento = 0; intento <= 2; intento++) {
+    try {
+      var r = UrlFetchApp.fetch(FRAVEGA_BASE + path,
+        { method: 'get', headers: headers, muteHttpExceptions: true });
+      var code = r.getResponseCode();
+      var body = r.getContentText();
+      if (code === 200) {
+        try { return { ok: true, code: code, data: JSON.parse(body) }; }
+        catch (e) { return { ok: false, code: code, error: 'respuesta no-JSON: ' + body.slice(0, 200) }; }
+      }
+      if ([429, 500, 502, 503, 504].indexOf(code) !== -1 && intento < 2) {
+        Utilities.sleep(1500 * (intento + 1)); continue;
+      }
+      return { ok: false, code: code, error: 'HTTP ' + code + ': ' + body.slice(0, 250) };
+    } catch (e) {
+      if (intento < 2) { Utilities.sleep(1500 * (intento + 1)); continue; }
+      return { ok: false, code: 'excepción', error: e.message };
+    }
+  }
+  return { ok: false, code: 0, error: 'agotados los reintentos' };
+}
+
+/** El array de órdenes puede venir como Items, items, data… lo buscamos. */
+function _apiItems(obj) {
+  if (!obj) return [];
+  var claves = ['Items', 'items', 'Data', 'data', 'Result', 'results', 'orders', 'Orders'];
+  for (var i = 0; i < claves.length; i++) {
+    if (Array.isArray(obj[claves[i]])) return obj[claves[i]];
+  }
+  return Array.isArray(obj) ? obj : [];
+}
+
+/** Los productos también cambian de nombre según el endpoint. */
+function _apiProductos(detalle, item) {
+  var fuentes = [detalle, item];
+  var claves = ['products', 'Products', 'producto', 'Producto', 'items', 'Items'];
+  for (var f = 0; f < fuentes.length; f++) {
+    if (!fuentes[f]) continue;
+    for (var i = 0; i < claves.length; i++) {
+      var v = fuentes[f][claves[i]];
+      if (Array.isArray(v) && v.length) return v;
+      if (v && typeof v === 'object' && v.sellerSku !== undefined) return [v];
+    }
+  }
+  return [];
+}
+
+/** Una página del listado de órdenes pendientes de facturación. */
+function fravegaFetchOrdersPage(pagina, cfg) {
+  var pageSize = parseInt(cfg.orders_api_page_size || '100', 10) || 100;
+  if (pageSize > 100) pageSize = 100;
+  if (pageSize < 1) pageSize = 100;
+
+  var esperaMin = parseInt(cfg.orders_api_espera_min || '90', 10);
+  if (isNaN(esperaMin) || esperaMin < 0) esperaMin = 0;
+  var diasAtras = parseInt(cfg.orders_api_dias_atras || '30', 10) || 30;
+
+  var hasta = new Date(Date.now() - esperaMin * 60 * 1000);
+  var desde = new Date(hasta.getTime() - diasAtras * 86400000);
+
+  var qs = '?page=' + pagina + '&page-size=' + pageSize + '&status=pending' +
+           '&purchasedatefrom=' + encodeURIComponent(_isoUtc(desde)) +
+           '&purchasedateto=' + encodeURIComponent(_isoUtc(hasta));
+  if (cfg.orders_api_tipo_entrega) {
+    qs += '&deliverytype=' + encodeURIComponent(cfg.orders_api_tipo_entrega);
+  }
+
+  var res = _fravegaGetJson('/api/v1/orders' + qs);
+  if (!res.ok) {
+    if (String(res.code) === '401' || String(res.code) === '403') {
+      throw new Error('Frávega rechazó las credenciales para órdenes (HTTP ' + res.code +
+        '). El token de Seller Center necesita permiso de "operador OMS y Operador ' +
+        'Facturante": hay que pedírselo a seller support. El mismo token sigue ' +
+        'funcionando para stock, así que no es un problema de configuración.');
+    }
+    throw new Error('Frávega /orders: ' + res.error);
+  }
+  return res.data || {};
+}
+
+/* El manual es ambiguo sobre el detalle: el path dice {id} = orden y el query
+ * dice orderid = suborden. Probamos las combinaciones hasta que una responda y
+ * guardamos cuál fue, para no reintentar en cada llamada. */
+var DETALLE_MODOS = [
+  { id: 'a', arma: function (o, s) { return '/api/v1/orders/' + encodeURIComponent(o) + '?orderid=' + encodeURIComponent(s); } },
+  { id: 'b', arma: function (o, s) { return '/api/v1/orders/' + encodeURIComponent(s) + '?orderid=' + encodeURIComponent(o); } },
+  { id: 'c', arma: function (o, s) { return '/api/v1/orders/' + encodeURIComponent(s); } },
+  { id: 'd', arma: function (o, s) { return '/api/v1/orders/' + encodeURIComponent(o); } }
+];
+
+function fravegaOrderDetail(orderId, suborderId, cfg) {
+  var guardado = String(cfg.orders_api_detalle_modo || '').trim();
+  var orden = [];
+  DETALLE_MODOS.forEach(function (m) { if (m.id === guardado) orden.push(m); });
+  DETALLE_MODOS.forEach(function (m) { if (m.id !== guardado) orden.push(m); });
+
+  var ultimo = '';
+  for (var i = 0; i < orden.length; i++) {
+    var res = _fravegaGetJson(orden[i].arma(orderId, suborderId));
+    if (res.ok && res.data) {
+      if (orden[i].id !== guardado) {
+        setConfig('orders_api_detalle_modo', orden[i].id);
+        cfg.orders_api_detalle_modo = orden[i].id;
+      }
+      return res.data;
+    }
+    ultimo = res.error;
+    // Sin permisos no tiene sentido seguir probando formas de la URL.
+    if (String(res.code) === '401' || String(res.code) === '403') break;
+  }
+  throw new Error('No se pudo leer el detalle (orden ' + orderId + ' / suborden ' +
+                  suborderId + '): ' + ultimo);
+}
+
+/**
+ * Decide cuál de los dos IDs es el "Nro de Orden" con el que ya venís
+ * trabajando. Es lo que evita que al prender la API se re-envíen a Tango
+ * pedidos que ya cargaste por CSV: se fija cuál de los dos aparece en
+ * OrdenesEnviadas y usa ese.
+ */
+function _elegirCampoId(items, cfg) {
+  var pref = String(cfg.orders_api_id_field || 'auto').trim();
+  if (pref === 'orderId' || pref === 'suborderId') return pref;
+
+  var sent = _sentIds();
+  var hitsOrder = 0, hitsSub = 0;
+  items.forEach(function (it) {
+    if (it.orderId !== undefined && sent[String(it.orderId)]) hitsOrder++;
+    if (it.suborderId !== undefined && sent[String(it.suborderId)]) hitsSub++;
+  });
+  if (hitsSub > hitsOrder) return 'suborderId';
+  if (hitsOrder > hitsSub) return 'orderId';
+  // Empate (típico: ninguna de estas órdenes se envió todavía). El manual dice
+  // que la suborden es "el id trazable para la orden del seller", que es el que
+  // ves en el seller center y en el CSV.
+  return 'suborderId';
+}
+
+/**
+ * sellerSku → código de Tango. El manual se contradice sobre qué es sellerSku
+ * (nuestro código o el id de publicación de Frávega), así que probamos las dos
+ * lecturas y funciona en cualquiera de los dos casos.
+ */
+function _resolverSkuApi(sellerSku, rels, indiceItem) {
+  var s = String(sellerSku === null || sellerSku === undefined ? '' : sellerSku).trim();
+  if (!s) return '';
+  if (rels[s]) return s;                      // sellerSku = código de Tango
+  if (indiceItem[s]) return indiceItem[s];    // sellerSku = item id de Frávega
+  var n = parseInt(s, 10);                    // por si viene con ceros a la izquierda
+  if (!isNaN(n)) {
+    var sn = String(n);
+    if (rels[sn]) return sn;
+    if (indiceItem[sn]) return indiceItem[sn];
+  }
+  return '';
+}
+
+/** Primer valor no vacío de la lista. */
+function _primero() {
+  for (var i = 0; i < arguments.length; i++) {
+    var v = arguments[i];
+    if (v !== null && v !== undefined && String(v).trim() !== '' &&
+        String(v).toLowerCase() !== 'null') return String(v).trim();
+  }
+  return '';
+}
+
+/** Arma el domicilio de Tango a partir del objeto de dirección de Frávega. */
+function _domicilioApi(dir) {
+  dir = dir || {};
+  return {
+    street: _primero(dir.street, dir.Street).slice(0, 30),
+    number: _primero(dir.number, dir.Number),
+    floor: _primero(dir.floor, dir.Floor),
+    apartment: _primero(dir.apartment, dir.Apartment, dir.department),
+    city: _primero(dir.city, dir.City).slice(0, 20),
+    state: _primero(dir.state, dir.State, dir.province),
+    zip: _primero(dir.zipCode, dir.ZipCode, dir.postalCode)
+  };
+}
+
+/**
+ * Construye el payload de Tango desde la API.
+ * Devuelve [orden, skusSinRelacion, registro] — registro es lo que se guarda
+ * en OrdenesEnviadas para después cruzar contra el reporte de facturación.
+ */
+function _buildOrderFromApi(idOrden, item, detalle, rels, indiceItem, cfg) {
+  var prods = _apiProductos(detalle, item);
+  if (!prods.length) return [null, ['(la orden no trae productos)'], null];
+
+  var items = [], unmapped = [], totalItems = 0, resumen = [];
+  prods.forEach(function (p) {
+    var sellerSku = _primero(p.sellerSku, p.SellerSku, p.sku, p.Sku);
+    var tangoSku = _resolverSkuApi(sellerSku, rels, indiceItem);
+    if (!tangoSku) { unmapped.push(String(sellerSku)); return; }
+
+    var cant = Number(p.quantity) || 1;
+    var sub = Number(p.subtotal);
+    if (!isFinite(sub) || sub <= 0) {
+      sub = (Number(p.basePrice) || 0) * cant - (Number(p.discounts) || 0);
+    }
+    var unit = cant ? Math.round((sub / cant) * 100) / 100 : sub;
+    totalItems += sub;
+    resumen.push(tangoSku + ' x' + cant);
+
+    items.push({
+      ProductCode: String(sellerSku),
+      SKUCode: tangoSku,
+      Description: String(_primero(p.name, p.Name, rels[tangoSku].descripcion)).slice(0, 400),
+      Quantity: cant,
+      UnitPrice: unit,
+      DiscountPercentage: 0.0
+    });
+  });
+  if (unmapped.length) return [null, unmapped, null];
+
+  detalle = detalle || {};
+  var buyer = detalle.buyer || {};
+  var bi = detalle.billingInfo || {};
+  var bp = bi.billingPerson || {};
+  var sd = detalle.shippingData || {};
+
+  var fact = _domicilioApi(bi.billingAddress || sd.shippingAddress);
+  var entrega = _domicilioApi(sd.shippingAddress || bi.billingAddress);
+
+  // Nombre: la API ya lo trae partido, que es mejor que adivinarlo del CSV.
+  var nombre = _primero(buyer.firstName, buyer.FirstName);
+  var apellido = _primero(buyer.lastName, buyer.LastName);
+  if (!nombre && !apellido) {
+    var completo = _cleanName(_primero(bp.name, item && item.clientName, detalle.clientName));
+    nombre = completo[0]; apellido = completo[1];
+  }
+  var nombreCompleto = (nombre + ' ' + apellido).trim();
+
+  var doc = _dni(_primero(bp.document, buyer.documentNumber, item && item.documentNumber));
+  var cuil = _primero(buyer.cuil, buyer.Cuil);
+  var email = _primero(bp.email, buyer.email);
+
+  // Total a facturar. Con Frávega Envíos se factura solo la mercadería: el
+  // manual dice que "subtotal" es el valor que tiene que usar el seller.
+  var total = Math.round(totalItems * 100) / 100;
+  if (cfg.orders_api_facturar_envio === '1') {
+    total += Number(detalle.deliveriesTotal) || 0;
+    total = Math.round(total * 100) / 100;
+  }
+
+  // Si Frávega dice otro total de productos, lo avisamos en la vista previa en
+  // vez de mandarlo distinto en silencio.
+  var totalFravega = Number(detalle.productsTotal);
+  var aviso = '';
+  if (isFinite(totalFravega) && totalFravega > 0 &&
+      Math.abs(totalFravega - Math.round(totalItems * 100) / 100) > 1) {
+    aviso = 'Frávega informa productsTotal=' + totalFravega +
+            ' y la suma de los ítems da ' + (Math.round(totalItems * 100) / 100);
+  }
+
+  var digits = String(idOrden).replace(/\D/g, '');
+  var fechaCompra = _primero(detalle.purchaseDate, item && item.purchaseDate, item && item.createdOn);
+
+  var orden = {
+    OrderID: idOrden, OrderNumber: idOrden,
+    OrderCounterfoil: parseInt(cfg.orders_counterfoil, 10),
+    InvoiceCounterfoil: parseInt(cfg.orders_invoice_counterfoil, 10),
+    Date: _fechaTango(fechaCompra),
+    Total: total, PaidTotal: total, FinancialSurcharge: 0.0,
+    WarehouseCode: cfg.orders_warehouse_code, SellerCode: cfg.orders_seller_code,
+    SaleConditionCode: cfg.orders_sale_condition,
+    ValidateTotalWithPaidTotal: false, ValidateTotalWithItems: false,
+    Customer: {
+      CustomerID: /^\d+$/.test(doc) ? parseInt(doc, 10) : 1,
+      Code: '000000',
+      DocumentType: cfg.orders_document_type,
+      DocumentNumber: doc,
+      IVACategoryCode: cfg.orders_iva_category,
+      User: idOrden,
+      Email: email || (idOrden + '@fravega.com'),
+      FirstName: nombre, LastName: apellido, BusinessName: '',
+      Street: fact.street, HouseNumber: fact.number,
+      Floor: fact.floor, Apartment: fact.apartment,
+      City: fact.city, ProvinceCode: _provinceCode(fact.state), PostalCode: fact.zip,
+      PhoneNumber1: '', PhoneNumber2: ''
+    },
+    Shipping: {
+      ShippingID: 1,
+      Street: entrega.street, HouseNumber: entrega.number,
+      Floor: entrega.floor, Apartment: entrega.apartment,
+      City: entrega.city, ProvinceCode: _provinceCode(entrega.state),
+      PostalCode: entrega.zip || fact.zip,
+      PhoneNumber1: '', PhoneNumber2: ''
+    },
+    OrderItems: items, Payments: [],
+    CashPayments: [{ PaymentID: digits ? parseInt(digits, 10) : 1,
+                     PaymentMethod: cfg.orders_payment_method, PaymentTotal: total }]
+  };
+
+  var registro = {
+    order_id: idOrden,
+    suborder_id: _primero(item && item.suborderId, detalle.suborderId),
+    fecha_compra: fechaCompra ? Utilities.formatDate(new Date(_fechaMs(fechaCompra) || Date.now()),
+                                                     TZ_AR, 'yyyy-MM-dd HH:mm:ss') : '',
+    cliente: nombreCompleto,
+    documento: doc,
+    cuil: cuil,
+    email: email,
+    total: total,
+    items: resumen.join(' · '),
+    origen: 'api',
+    aviso: aviso
+  };
+
+  return [orden, [], registro];
+}
+
+/**
+ * Trae una página de órdenes de Frávega y las deja listas para mandar a Tango.
+ * El frontend la llama una vez por página y va acumulando.
+ */
+function apiOrdersApiPreview(user, p) {
+  p = p || {};
+  var pagina = parseInt(p.pagina || 1, 10) || 1;
+  var cfg = _configMap();
+  var t0 = Date.now();
+
+  var body = fravegaFetchOrdersPage(pagina, cfg);
+  var items = _apiItems(body);
+  var campoId = _elegirCampoId(items, cfg);
+
+  var rels = _skuRelations();
+  var indiceItem = {};
+  Object.keys(rels).forEach(function (s) {
+    if (rels[s].item_id) indiceItem[rels[s].item_id] = s;
+  });
+  var sent = _sentIds();
+
+  var pausa = parseInt(cfg.orders_api_pause_ms || '400', 10);
+  if (isNaN(pausa) || pausa < 0) pausa = 400;
+  var maxDet = parseInt(cfg.orders_api_max_detalle || '120', 10) || 120;
+  var esperaMin = parseInt(cfg.orders_api_espera_min || '90', 10);
+  if (isNaN(esperaMin) || esperaMin < 0) esperaMin = 0;
+  var corte = Date.now() - esperaMin * 60 * 1000;
+
+  var orders = [], registros = {}, nuevas = [], saltadas = [],
+      excluidas = [], esperando = [], fallidas = [];
+  var detalles = 0, truncada = false;
+
+  for (var i = 0; i < items.length; i++) {
+    var it = items[i];
+    var oid = _primero(it.orderId, it.OrderId);
+    var sid = _primero(it.suborderId, it.SuborderId);
+    var idOrden = (campoId === 'orderId') ? (oid || sid) : (sid || oid);
+    if (!idOrden) continue;
+
+    if (sent[idOrden]) { saltadas.push(idOrden); continue; }
+
+    // ── La espera de Envío Pack, verificada orden por orden ──
+    // El filtro purchasedateto ya debería dejarlas afuera, pero lo volvemos a
+    // chequear acá: si la API ignorara el filtro, una orden demasiado nueva
+    // llegaría a Tango antes de que Envío Pack genere el envío.
+    var fc = _fechaMs(_primero(it.purchaseDate, it.createdOn));
+    if (esperaMin && fc && fc > corte) {
+      esperando.push({ orden: idOrden,
+                       compra: Utilities.formatDate(new Date(fc), TZ_AR, 'yyyy-MM-dd HH:mm'),
+                       faltan_min: Math.ceil((fc - corte) / 60000) });
+      continue;
+    }
+
+    if (detalles >= maxDet || (Date.now() - t0) > 4.5 * 60 * 1000) { truncada = true; break; }
+
+    var detalle;
+    try {
+      detalle = fravegaOrderDetail(oid, sid, cfg);
+      detalles++;
+    } catch (e) {
+      fallidas.push({ orden: idOrden, error: e.message });
+      continue;
+    }
+    if (pausa) Utilities.sleep(pausa);
+
+    var res = _buildOrderFromApi(idOrden, it, detalle, rels, indiceItem, cfg);
+    if (res[1].length) {
+      res[1].forEach(function (sku) {
+        _pendingAdd(sku, 'Fravega', 'Detectado por API en la orden ' + idOrden + ' sin relación');
+      });
+      excluidas.push({ orden: idOrden, skus_sin_relacion: res[1] });
+      continue;
+    }
+
+    orders.push(res[0]);
+    registros[idOrden] = res[2];
+    nuevas.push({
+      orden: idOrden,
+      suborden: res[2].suborder_id,
+      cliente: res[2].cliente,
+      documento: res[2].documento,
+      fecha: res[2].fecha_compra,
+      items: res[0].OrderItems.length,
+      total: res[0].Total,
+      entrega: _primero(it.deliveryType, it.DeliveryType),
+      aviso: res[2].aviso
+    });
+  }
+
+  log_(user.email, 'ordenes', 'Órdenes leídas de la API de Frávega', 'info',
+       'pagina=' + pagina + '/' + (body.pages || 1) + ' total=' + (body.total || 0) +
+       ' nuevas=' + nuevas.length + ' saltadas=' + saltadas.length +
+       ' esperando=' + esperando.length + ' excluidas=' + excluidas.length +
+       ' fallidas=' + fallidas.length + ' campo_id=' + campoId,
+       Date.now() - t0);
+
+  return {
+    pagina: Number(body.currentPage || pagina),
+    paginas: Number(body.pages || 1),
+    total: Number(body.total || 0),
+    en_pagina: items.length,
+    campo_id: campoId,
+    espera_min: esperaMin,
+    orders: orders, registros: registros,
+    nuevas: nuevas, saltadas: saltadas, excluidas: excluidas,
+    esperando: esperando, fallidas: fallidas,
+    truncada: truncada
+  };
+}
+
+/** Manda a Tango las órdenes que armó apiOrdersApiPreview. */
+function apiOrdersApiSend(user, p) {
+  p = p || {};
+  var orders = p.orders || [];
+  var registros = p.registros || {};
+  if (!orders.length) return { enviadas: [], rechazadas: [] };
+
+  var vt = tangoVerify();
+  if (!vt[0]) throw new Error('Token de Tango inválido: ' + vt[1]);
+
+  var sent = _sentIds();
+  var pendientes = orders.filter(function (o) { return !sent[o.OrderID]; });
+  if (!pendientes.length) {
+    return { enviadas: [], rechazadas: orders.map(function (o) {
+      return { orden: o.OrderID, error: 'Ya figuraba en OrdenesEnviadas; no se reenvió' };
+    }) };
+  }
+  return _sendOrders(pendientes, user, p.archivo || 'API Frávega', null, registros);
+}
+
+/**
+ * Prueba de conexión que se puede correr desde la pantalla de Órdenes.
+ * No manda nada a Tango: solo consulta y reporta qué encontró.
+ */
+function apiOrdersApiTest() {
+  var cfg = _configMap();
+  var out = { ok: false, mensaje: '', total: 0, muestra: [], detalle_ok: false };
+
+  var body;
+  try { body = fravegaFetchOrdersPage(1, cfg); }
+  catch (e) { out.mensaje = e.message; return out; }
+
+  var items = _apiItems(body);
+  out.ok = true;
+  out.total = Number(body.total || 0);
+  out.paginas = Number(body.pages || 1);
+  out.campo_id = _elegirCampoId(items, cfg);
+  out.espera_min = parseInt(cfg.orders_api_espera_min || '90', 10);
+  out.mensaje = 'Conexión OK · ' + out.total + ' orden(es) pendientes de facturación';
+
+  if (!items.length) {
+    out.mensaje += ' — no hay nada pendiente en la ventana configurada';
+    return out;
+  }
+
+  var rels = _skuRelations();
+  var indiceItem = {};
+  Object.keys(rels).forEach(function (s) { if (rels[s].item_id) indiceItem[rels[s].item_id] = s; });
+
+  var primero = items[0];
+  var oid = _primero(primero.orderId), sid = _primero(primero.suborderId);
+  var detalle = null;
+  try { detalle = fravegaOrderDetail(oid, sid, cfg); out.detalle_ok = true; }
+  catch (e) { out.detalle_error = e.message; }
+
+  out.modo_detalle = getConfig('orders_api_detalle_modo');
+
+  items.slice(0, 5).forEach(function (it) {
+    var prods = _apiProductos(null, it);
+    var skus = prods.map(function (p) {
+      var s = _primero(p.sellerSku, p.sku);
+      var t = _resolverSkuApi(s, rels, indiceItem);
+      return s + (t ? (t === s ? ' (= SKU Tango)' : ' → Tango ' + t) : ' ⚠ sin relación');
+    });
+    out.muestra.push({
+      orderId: _primero(it.orderId), suborderId: _primero(it.suborderId),
+      cliente: _primero(it.clientName), fecha: _primero(it.purchaseDate, it.createdOn),
+      entrega: _primero(it.deliveryType), skus: skus.join(' · ')
+    });
+  });
+
+  if (detalle) {
+    var sd = detalle.shippingData || {};
+    var sa = sd.shippingAddress || {};
+    var bi = detalle.billingInfo || {};
+    var ba = bi.billingAddress || {};
+    out.domicilio_facturacion = _primero(ba.street) + ' ' + _primero(ba.number) + ', ' +
+      _primero(ba.city) + ', ' + _primero(ba.state) + ' CP ' + _primero(ba.zipCode);
+    out.domicilio_entrega = _primero(sa.street) + ' ' + _primero(sa.number) + ', ' +
+      _primero(sa.city) + ', ' + _primero(sa.state) + ' CP ' + _primero(sa.zipCode);
+    out.operador_logistico = _primero(sd.logisticOperator);
+    var b = detalle.buyer || {};
+    out.comprador = (_primero(b.firstName) + ' ' + _primero(b.lastName)).trim() +
+      ' · doc ' + _primero(b.documentNumber) + ' · CUIL ' + _primero(b.cuil);
+  }
+  return out;
 }
 
 /* ═══════════════ MÓDULO FACTURAS ═══════════════ */
@@ -1007,12 +1616,30 @@ function apiInvoicesGenerate(user, ordenesRows, facturasRows) {
     });
   });
 
-  // Generar el .xlsx con la ESTRUCTURA COMPLETA que pide Frávega:
-  //   Hoja "Ordenes": 7 columnas (las 4 extra van vacías, se completan luego)
-  //   Hoja "Transportadoras": 50 opciones (para el dropdown)
-  //   Hoja "config": version / operation
+  var xls = _generarXlsxFacturas(filas);
+
+  _appendRow(SH.INVOICES, [_now(), user.email, xls.archivo, filas.length,
+                           sinFactura.length, sobrantes.length,
+                           JSON.stringify({ sin_factura: sinFactura, sobrantes: sobrantes })]);
+  log_(user.email, 'facturas', 'Exportación generada (desde CSV)', 'ok',
+       'cargadas=' + filas.length + ' sin_factura=' + sinFactura.length +
+       ' sobrantes=' + sobrantes.length);
+
+  return { archivo: xls.archivo, cargadas: filas.length,
+           sin_factura: sinFactura, sobrantes: sobrantes,
+           base64: xls.base64 };
+}
+
+/**
+ * Arma el .xlsx con la ESTRUCTURA COMPLETA que pide Frávega:
+ *   Hoja "Ordenes": 7 columnas (las 4 extra van vacías, se completan luego)
+ *   Hoja "Transportadoras": 50 opciones (para el dropdown)
+ *   Hoja "config": version / operation
+ * `filas` es una lista de [orden, nroFactura, fecha].
+ */
+function _generarXlsxFacturas(filas) {
   var nombre = 'Tabla-modelo-facturas COMPLETO ' +
-    Utilities.formatDate(new Date(), 'America/Argentina/Buenos_Aires', 'yyyyMMdd_HHmmss');
+    Utilities.formatDate(new Date(), TZ_AR, 'yyyyMMdd_HHmmss');
   var ss = SpreadsheetApp.create(nombre);
 
   // Hoja Ordenes
@@ -1022,7 +1649,6 @@ function apiInvoicesGenerate(user, ordenesRows, facturasRows) {
     'Orden*', 'Nro Factura*', 'Fecha*', 'Url factura',
     'Nro Seguimiento', 'Url seguimiento', 'Transportadora']]);
   if (filas.length) {
-    // filas ya trae [orden, nroFactura, fecha]; completamos las 4 columnas vacías
     var full = filas.map(function (f) { return [f[0], f[1], f[2], '', '', '', '']; });
     hoja.getRange(2, 1, full.length, 7).setValues(full);
   }
@@ -1051,16 +1677,170 @@ function apiInvoicesGenerate(user, ordenesRows, facturasRows) {
     { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() } }).getBlob();
   DriveApp.getFileById(ss.getId()).setTrashed(true);  // no acumular copias en Drive
 
-  _appendRow(SH.INVOICES, [_now(), user.email, nombre + '.xlsx', filas.length,
+  return { archivo: nombre + '.xlsx', base64: Utilities.base64Encode(xlsx.getBytes()) };
+}
+
+/* ── Facturación cruzando contra el historial de OrdenesEnviadas ──────────
+ * Con las órdenes entrando por API ya no hace falta volver a subir el CSV de
+ * Frávega: la app guardó cliente, documento y total de cada pedido que le mandó
+ * a Tango. Subís solo el reporte de facturación de Tango y el cruce se hace
+ * primero por número de documento (que es unívoco) y recién después por nombre.
+ * Cada orden que se matchea queda marcada como facturada, así no se vuelve a
+ * usar en la próxima exportación. */
+
+/** Busca en el reporte de Tango la columna que trae el documento del cliente. */
+function _columnaDocumento(fila) {
+  var alias = ['nro_doc', 'nrodoc', 'nro_docum', 'nro_documento', 'documento', 'doc',
+               'dni', 'cuit', 'nro_cuit', 'cuit_cuil', 'cuil', 'nro_iva', 'nro_ident'];
+  var claves = Object.keys(fila || {});
+  for (var i = 0; i < claves.length; i++) {
+    var norm = String(claves[i]).toLowerCase().replace(/[^a-z0-9]/g, '_');
+    if (alias.indexOf(norm) !== -1) return claves[i];
+  }
+  return '';
+}
+
+/** Solo los dígitos, para comparar documentos sin importar puntos ni guiones. */
+function _soloDigitos(v) { return String(v === null || v === undefined ? '' : v).replace(/\D/g, ''); }
+
+/** Las órdenes que se mandaron a Tango y todavía no tienen factura cargada. */
+function apiInvoicesPendientes() {
+  var rows = _readRows(SH.SENT, 1000);
+  var pend = [], sinDatos = 0;
+  rows.forEach(function (r) {
+    var estado = String(r.estado_facturacion || '').toLowerCase();
+    if (estado === 'facturada') return;
+    var cliente = String(r.cliente || '').trim();
+    var doc = _soloDigitos(r.documento);
+    if (!cliente && !doc) { sinDatos++; return; }   // filas viejas, de antes de la API
+    pend.push({ orden: String(r.order_id), suborden: String(r.suborder_id || ''),
+                cliente: cliente, documento: doc,
+                fecha_compra: String(r.fecha_compra || ''),
+                total: r.total, items: String(r.items || ''),
+                origen: String(r.origen || '') });
+  });
+  return { pendientes: pend.reverse(), sin_datos: sinDatos, total: pend.length };
+}
+
+/**
+ * Cruza el reporte de facturación de Tango contra el historial de órdenes
+ * enviadas y genera el .xlsx para Frávega. NO necesita el CSV de órdenes.
+ */
+function apiInvoicesFromHistory(user, facturasRows) {
+  if (!facturasRows || !facturasRows.length) throw new Error('El reporte de facturación llegó vacío');
+  ['RAZON_SOCI', 'N_COMP', 'FECHA_EMI'].forEach(function (c) {
+    if (!(c in facturasRows[0])) throw new Error("El reporte no tiene la columna '" + c + "'");
+  });
+
+  var addPrefix = getConfig('invoices_add_prefix') === '1';
+  var prefijo = getConfig('invoices_prefix') || 'FVG-';
+  var colDoc = _columnaDocumento(facturasRows[0]);
+
+  var sheet = _sheet(SH.SENT);
+  var last = sheet.getLastRow();
+  if (last < 2) throw new Error('El historial de órdenes enviadas está vacío. ' +
+                                'Primero ingresá pedidos con la API o el CSV.');
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+                     .map(function (h) { return String(h).trim(); });
+  var col = {};
+  headers.forEach(function (h, i) { col[h] = i; });
+  ['estado_facturacion', 'nro_factura', 'fecha_factura', 'facturada_en'].forEach(function (c) {
+    if (col[c] === undefined) {
+      throw new Error('A la hoja OrdenesEnviadas le falta la columna "' + c +
+                      '". Ejecutá MIGRAR_ORDENES_API() desde el editor.');
+    }
+  });
+  var datos = sheet.getRange(2, 1, last - 1, headers.length).getValues();
+
+  // Pool de facturas ordenadas por número, indexadas por documento y por nombre.
+  var facturas = facturasRows.slice().sort(function (a, b) {
+    return String(a['N_COMP']).localeCompare(String(b['N_COMP']));
+  });
+  var usadas = {}, porDoc = {}, porNombre = {};
+  facturas.forEach(function (f, i) {
+    f.__i = i;
+    if (colDoc) {
+      var d = _soloDigitos(f[colDoc]);
+      if (d) (porDoc[d] = porDoc[d] || []).push(f);
+    }
+    var k = _normKey(f['RAZON_SOCI']);
+    (porNombre[k] = porNombre[k] || []).push(f);
+  });
+
+  function tomar(lista) {
+    if (!lista) return null;
+    for (var i = 0; i < lista.length; i++) {
+      if (!usadas[lista[i].__i]) { usadas[lista[i].__i] = true; return lista[i]; }
+    }
+    return null;
+  }
+
+  var filas = [], sinFactura = [], matcheadas = 0;
+  var porDocCount = 0, porNombreCount = 0;
+  var ts = _now();
+
+  for (var r = 0; r < datos.length; r++) {
+    var fila = datos[r];
+    var estado = String(fila[col.estado_facturacion] || '').toLowerCase();
+    if (estado === 'facturada') continue;
+
+    var orden = String(fila[col.order_id] || '').trim();
+    if (!orden) continue;
+    var cliente = String(fila[col.cliente] || '').trim();
+    var doc = _soloDigitos(fila[col.documento]);
+    if (!cliente && !doc) continue;   // fila vieja sin datos: no se puede matchear
+
+    // 1) por documento (unívoco)  2) por nombre normalizado (respaldo)
+    var f = doc ? tomar(porDoc[doc]) : null;
+    if (f) porDocCount++;
+    if (!f && cliente) { f = tomar(porNombre[_normKey(cliente)]); if (f) porNombreCount++; }
+
+    if (!f) {
+      sinFactura.push({ orden: orden, cliente: cliente, documento: doc });
+      continue;
+    }
+
+    var ordenSalida = orden;
+    if (addPrefix && ordenSalida.toUpperCase().indexOf(prefijo.toUpperCase()) !== 0) {
+      ordenSalida = prefijo + ordenSalida;
+    }
+    var nroFactura = String(f['N_COMP']).replace(/[\s\-]/g, '');
+    var fechaFactura = _fechaFmt(f['FECHA_EMI']);
+    filas.push([ordenSalida, nroFactura, fechaFactura]);
+
+    fila[col.estado_facturacion] = 'facturada';
+    fila[col.nro_factura] = nroFactura;
+    fila[col.fecha_factura] = fechaFactura;
+    fila[col.facturada_en] = ts;
+    matcheadas++;
+  }
+
+  if (matcheadas) sheet.getRange(2, 1, datos.length, headers.length).setValues(datos);
+
+  var sobrantes = [];
+  facturas.forEach(function (f) {
+    if (!usadas[f.__i]) {
+      sobrantes.push({ cliente: String(f['RAZON_SOCI']), factura: String(f['N_COMP']) });
+    }
+  });
+
+  var xls = _generarXlsxFacturas(filas);
+
+  _appendRow(SH.INVOICES, [_now(), user.email, xls.archivo, filas.length,
                            sinFactura.length, sobrantes.length,
-                           JSON.stringify({ sin_factura: sinFactura, sobrantes: sobrantes })]);
-  log_(user.email, 'facturas', 'Exportación generada', 'ok',
-       'cargadas=' + filas.length + ' sin_factura=' + sinFactura.length +
+                           JSON.stringify({ sin_factura: sinFactura, sobrantes: sobrantes,
+                                            por_documento: porDocCount,
+                                            por_nombre: porNombreCount })]);
+  log_(user.email, 'facturas', 'Exportación generada (desde el historial)', 'ok',
+       'cargadas=' + filas.length + ' por_documento=' + porDocCount +
+       ' por_nombre=' + porNombreCount + ' sin_factura=' + sinFactura.length +
        ' sobrantes=' + sobrantes.length);
 
-  return { archivo: nombre + '.xlsx', cargadas: filas.length,
+  return { archivo: xls.archivo, cargadas: filas.length,
            sin_factura: sinFactura, sobrantes: sobrantes,
-           base64: Utilities.base64Encode(xlsx.getBytes()) };
+           por_documento: porDocCount, por_nombre: porNombreCount,
+           columna_documento: colDoc || '(el reporte no trae documento: se matcheó solo por nombre)',
+           base64: xls.base64 };
 }
 
 /* ═══════════════ MÓDULO SKUs / PENDIENTES ═══════════════ */
@@ -1849,6 +2629,65 @@ function _sentIds() {
   var out = {};
   _colValues(_sheet(SH.SENT), 1).forEach(function (id) { out[id] = true; });
   return out;
+}
+
+/** Fila de OrdenesEnviadas con todo lo que se le mandó a Tango. */
+function _filaSent(id, reg, ts) {
+  reg = reg || {};
+  return [id, reg.suborder_id || '', ts, reg.fecha_compra || '',
+          reg.cliente || '', reg.documento || '', reg.cuil || '', reg.email || '',
+          (reg.total === undefined || reg.total === null) ? '' : reg.total,
+          reg.items || '', reg.origen || 'csv', 'pendiente', '', '', ''];
+}
+
+/**
+ * Prepara una planilla que YA existe para el ingreso de órdenes por API:
+ * agrega las columnas nuevas de OrdenesEnviadas y las claves de configuración
+ * que falten. Es idempotente: se puede correr las veces que quieras y no toca
+ * los datos que ya están.
+ */
+function MIGRAR_ORDENES_API() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // 1. Columnas nuevas en OrdenesEnviadas
+  var s = ss.getSheetByName(SH.SENT);
+  if (!s) {
+    s = _ensureSheet(ss, SH.SENT, COLS_SENT);
+  } else {
+    var ancho = Math.max(s.getLastColumn(), 1);
+    var heads = s.getRange(1, 1, 1, ancho).getValues()[0]
+                 .map(function (h) { return String(h).trim(); });
+    // La hoja vieja tenía solo [order_id, fecha_hora]. La fecha estaba en la
+    // columna 2 y ahora va en la 3, así que la movemos antes de renombrar nada.
+    var esVieja = heads.length <= 2 && heads[1] === 'fecha_hora';
+    if (esVieja && s.getLastRow() > 1) {
+      var n = s.getLastRow() - 1;
+      var fechas = s.getRange(2, 2, n, 1).getValues();
+      s.getRange(2, 2, n, 1).clearContent();
+      s.getRange(2, 3, n, 1).setValues(fechas);
+      s.getRange(2, 11, n, 1).setValue('csv');           // origen
+      s.getRange(2, 12, n, 1).setValue('pendiente');     // estado_facturacion
+    }
+    COLS_SENT.forEach(function (h, i) {
+      if (String(heads[i] || '').trim() !== h) {
+        s.getRange(1, i + 1).setValue(h).setFontWeight('bold');
+      }
+    });
+    s.setFrozenRows(1);
+  }
+
+  // 2. Claves de configuración que falten
+  var cfg = ss.getSheetByName(SH.CONFIG);
+  if (cfg) {
+    var existentes = _colValues(cfg, 1);
+    DEFAULT_CONFIG.forEach(function (row) {
+      if (existentes.indexOf(row[0]) === -1) cfg.appendRow(row);
+    });
+  }
+
+  log_('sistema', 'sistema', 'Migración de órdenes por API aplicada', 'ok', '');
+  return 'Listo. OrdenesEnviadas quedó con las columnas nuevas y la configuración ' +
+         'de la API de Frávega. Las órdenes viejas quedaron marcadas como origen=csv.';
 }
 
 function _prop(key) {
