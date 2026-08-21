@@ -62,7 +62,7 @@ var SH = {
 var COLS_SENT = ['order_id', 'suborder_id', 'fecha_hora', 'fecha_compra',
                  'cliente', 'documento', 'cuil', 'email', 'total', 'items',
                  'origen', 'estado_facturacion', 'nro_factura', 'fecha_factura',
-                 'facturada_en'];
+                 'facturada_en', 'canal'];
 
 var DEFAULT_CONFIG = [
   ['stock_warehouse_code', '04', 'Depósito de Tango para el stock'],
@@ -96,6 +96,22 @@ var DEFAULT_CONFIG = [
   ['orders_api_detalle_modo', '', 'Forma del endpoint de detalle que funcionó (se detecta solo)'],
   ['orders_api_facturar_envio', '0', 'Sumar el costo de envío al total (0 si usás Frávega Envíos)'],
   ['orders_api_tipo_entrega', '', 'Filtrar por tipo de entrega: vacío = todos · SP = sucursal · HD = domicilio'],
+  // ── Ingreso de órdenes de OnCity (VTEX OMS) ─────────────────────────────
+  ['oncity_estados', 'ready-for-handling', 'Estados de VTEX a importar (separados por coma)'],
+  ['oncity_desde_fecha', '', 'No traer pedidos anteriores a esta fecha (aaaa-mm-dd). Vacío = usar los días de abajo'],
+  ['oncity_dias_atras', '60', 'Ventana de búsqueda hacia atrás (días)'],
+  ['oncity_page_size', '50', 'Pedidos por página de VTEX'],
+  ['oncity_orders_pause_ms', '300', 'Pausa entre consultas de detalle a VTEX (ms)'],
+  ['oncity_max_detalle', '120', 'Máximo de detalles por ejecución'],
+  ['oncity_precio_divisor', '100', 'VTEX devuelve centavos: dividir por 100'],
+  ['oncity_facturar_envio', '0', 'Sumar el costo de envío al total'],
+  ['oncity_sale_condition', '01', 'Condición de venta de Tango para OnCity'],
+  ['oncity_counterfoil', '', 'Talonario de pedido para OnCity (vacío = el mismo que Frávega)'],
+  ['oncity_invoice_counterfoil', '', 'Talonario de factura para OnCity (vacío = el mismo que Frávega)'],
+  ['oncity_orders_warehouse', '', 'Depósito de pedidos para OnCity (vacío = el mismo que Frávega)'],
+  ['oncity_seller_code', '', 'Vendedor para OnCity (vacío = el mismo que Frávega)'],
+  ['invoices_match_importe', '1', 'Usar también el importe para matchear facturas'],
+  ['invoices_tolerancia_importe', '1', 'Diferencia máxima de importe aceptada (en pesos)'],
   ['invoices_origen', 'historial', 'De dónde salen las órdenes a facturar: historial | csv'],
   ['invoices_add_prefix', '1', 'Agregar prefijo al Nro de orden'],
   ['invoices_prefix', 'FVG-', 'Prefijo'],
@@ -248,9 +264,13 @@ function doPost(e) {
       case 'orders.apiSend':     out = apiOrdersApiSend(user, p); break;
       case 'orders.apiTest':     out = apiOrdersApiTest(); break;
       case 'invoices.generate':  out = apiInvoicesGenerate(user, p.ordenes, p.facturas); break;
-      case 'invoices.pendientes':out = apiInvoicesPendientes(); break;
+      case 'invoices.pendientes':out = apiInvoicesPendientes(p.canal || ''); break;
       case 'invoices.fromHistory': out = apiInvoicesFromHistory(user, p.facturas); break;
       case 'invoices.history':   out = _readRows(SH.INVOICES, 50).reverse(); break;
+      // ── OnCity (VTEX) ──
+      case 'oncity.orders.preview': out = apiOncityOrdersPreview(user, p); break;
+      case 'oncity.orders.send':    out = apiOncityOrdersSend(user, p); break;
+      case 'oncity.invoices':       out = apiOncityInvoices(user, p); break;
       case 'skus.list':          out = apiSkusList(p.q || ''); break;
       case 'skus.save':          out = apiSkusSave(user, p); break;
       case 'skus.delete':        out = apiSkusDelete(user, p.sku_tango); break;
@@ -1106,7 +1126,8 @@ function fravegaFetchOrdersPage(pagina, cfg) {
       throw new Error('Frávega rechazó las credenciales para órdenes (HTTP ' + res.code +
         '). El token de Seller Center necesita permiso de "operador OMS y Operador ' +
         'Facturante": hay que pedírselo a seller support. El mismo token sigue ' +
-        'funcionando para stock, así que no es un problema de configuración.');
+        'funcionando para stock, así que no es un problema de configuración. ' +
+        'Respuesta de Frávega: ' + res.error);
     }
     throw new Error('Frávega /orders: ' + res.error);
   }
@@ -1544,6 +1565,335 @@ function apiOrdersApiTest() {
   return out;
 }
 
+/* ═══════════════ MÓDULO ÓRDENES DE ONCITY (VTEX OMS) ═══════════════
+ * Misma idea que Frávega, contra la API de pedidos de VTEX.
+ *
+ *   1. GET /api/oms/pvt/orders?f_status=ready-for-handling → los pedidos
+ *      "Listo para preparación", que son los que muestra el panel de Carga
+ *      Masiva de OnCity.
+ *   2. GET /api/oms/pvt/orders/{orderId} → el detalle con cliente, domicilio
+ *      e ítems.
+ *   3. Se arma el payload de Tango y se manda por el /order/batch de siempre.
+ *
+ * DIFERENCIAS CON FRÁVEGA, verificadas contra pedidos reales:
+ *   · VTEX devuelve los importes en CENTAVOS (2137036 = $21.370,36). Se
+ *     dividen por oncity_precio_divisor.
+ *   · El orderId (RMS-1655781718593-01) es exactamente la columna A de la
+ *     plantilla de Carga Masiva, así que sirve de clave para facturar.
+ *   · Viene el DNI sin enmascarar y también el teléfono, que Frávega no da.
+ *   · No hace falta esperar como con Envío Pack: OnCity ya asigna la
+ *     transportadora antes de poner el pedido en este estado.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/** Config de Tango para OnCity, con los valores de Frávega como respaldo. */
+function _cfgOncity(cfg) {
+  return {
+    orders_counterfoil: cfg.oncity_counterfoil || cfg.orders_counterfoil,
+    orders_invoice_counterfoil: cfg.oncity_invoice_counterfoil || cfg.orders_invoice_counterfoil,
+    orders_warehouse_code: cfg.oncity_orders_warehouse || cfg.orders_warehouse_code,
+    orders_seller_code: cfg.oncity_seller_code || cfg.orders_seller_code,
+    orders_sale_condition: cfg.oncity_sale_condition || cfg.orders_sale_condition,
+    orders_iva_category: cfg.orders_iva_category,
+    orders_document_type: cfg.orders_document_type,
+    orders_payment_method: cfg.orders_payment_method,
+    divisor: parseFloat(cfg.oncity_precio_divisor || '100') || 100,
+    facturar_envio: cfg.oncity_facturar_envio === '1'
+  };
+}
+
+/** Una página de pedidos de VTEX para un estado puntual. */
+function vtexOrdersPage(estado, pagina, cfg) {
+  var perPage = parseInt(cfg.oncity_page_size || '50', 10) || 50;
+  if (perPage > 100) perPage = 100;
+
+  var desde;
+  if (cfg.oncity_desde_fecha) {
+    desde = new Date(String(cfg.oncity_desde_fecha) + 'T00:00:00Z');
+    if (isNaN(desde.getTime())) desde = null;
+  }
+  if (!desde) {
+    var dias = parseInt(cfg.oncity_dias_atras || '60', 10) || 60;
+    desde = new Date(Date.now() - dias * 86400000);
+  }
+
+  var path = '/api/oms/pvt/orders?per_page=' + perPage + '&page=' + pagina +
+             '&orderBy=creationDate,desc' +
+             '&f_status=' + encodeURIComponent(estado) +
+             '&f_creationDate=' + encodeURIComponent(
+               'creationDate:[' + _isoUtc(desde) + ' TO ' + _isoUtc(new Date()) + ']');
+
+  var r = _vtexFetch(path);
+  var code = r.getResponseCode();
+  if (code !== 200) {
+    if (code === 401 || code === 403) {
+      throw new Error('VTEX rechazó la lectura de pedidos (HTTP ' + code + '). La AppKey ' +
+        'necesita permiso sobre OMS: en el admin de VTEX, Account Settings → Roles, ' +
+        'agregarle "OMS full access" al rol de la AppKey.');
+    }
+    throw new Error('VTEX /oms/orders HTTP ' + code + ': ' + r.getContentText().slice(0, 250));
+  }
+  return JSON.parse(r.getContentText() || '{}');
+}
+
+/** Detalle completo de un pedido de VTEX. */
+function vtexOrderDetail(orderId) {
+  var r = _vtexFetch('/api/oms/pvt/orders/' + encodeURIComponent(orderId));
+  if (r.getResponseCode() !== 200) {
+    throw new Error('VTEX detalle ' + orderId + ' HTTP ' + r.getResponseCode() + ': ' +
+                    r.getContentText().slice(0, 200));
+  }
+  return JSON.parse(r.getContentText() || '{}');
+}
+
+/**
+ * Payload de Tango a partir de un pedido de VTEX.
+ * Devuelve [orden, skusSinRelacion, registro].
+ */
+function _buildOrderFromVtex(d, porRef, porSkuId, rels, c) {
+  var div = c.divisor;
+  var items = [], unmapped = [], totalItems = 0, resumen = [];
+
+  (d.items || []).forEach(function (it) {
+    var ref = String(it.refId || '').trim();
+    var skuId = String(it.id || '').trim();
+    var tango = porRef[ref] || porSkuId[skuId] || (rels[ref] ? ref : '');
+    if (!tango) { unmapped.push(ref || skuId || '(sin refId)'); return; }
+
+    var cant = Number(it.quantity) || 1;
+    var unitCent = Number(it.sellingPrice);
+    if (!isFinite(unitCent) || unitCent <= 0) unitCent = Number(it.price) || 0;
+    var unit = Math.round((unitCent / div) * 100) / 100;
+    totalItems += unit * cant;
+    resumen.push(tango + ' x' + cant);
+
+    items.push({
+      ProductCode: ref || skuId,
+      SKUCode: tango,
+      Description: String(it.name || rels[tango].descripcion || '').slice(0, 400),
+      Quantity: cant,
+      UnitPrice: unit,
+      DiscountPercentage: 0.0
+    });
+  });
+  if (unmapped.length) return [null, unmapped, null];
+  if (!items.length) return [null, ['(el pedido no trae ítems)'], null];
+
+  var total = Math.round(totalItems * 100) / 100;
+  var envio = 0;
+  (d.totals || []).forEach(function (t) {
+    if (String(t.id).toLowerCase() === 'shipping') envio = (Number(t.value) || 0) / div;
+  });
+  if (c.facturar_envio) total = Math.round((total + envio) * 100) / 100;
+
+  // Aviso si nuestro total no coincide con el que informa VTEX.
+  var totalVtex = Math.round((Number(d.value) || 0) / div * 100) / 100;
+  var aviso = '';
+  if (totalVtex > 0 && Math.abs(totalVtex - total) > 1) {
+    aviso = 'VTEX informa un total de ' + totalVtex + ' y los ítems suman ' + total +
+            (envio ? ' (envío: ' + envio + ')' : '');
+  }
+
+  var cli = d.clientProfileData || {};
+  var sh = d.shippingData || {};
+  var ad = sh.address || {};
+
+  var nombre = _primero(cli.firstName);
+  var apellido = _primero(cli.lastName);
+  if (!nombre && !apellido) {
+    var partido = _cleanName(_primero(d.clientName, ad.receiverName));
+    nombre = partido[0]; apellido = partido[1];
+  }
+  var doc = _dni(_primero(cli.document, cli.corporateDocument));
+  var email = _primero(cli.email);
+  var tel = _primero(cli.phone);
+
+  var calle = _primero(ad.street).slice(0, 30);
+  var nro = _primero(ad.number);
+  var compl = _primero(ad.complement);
+  var ciudad = _primero(ad.city, ad.neighborhood).slice(0, 20);
+  var prov = _provinceCode(_primero(ad.state));
+  var cp = _primero(ad.postalCode);
+
+  // El orderId de OnCity (RMS-1655781718593-01) tiene demasiados dígitos para
+  // el PaymentID de Tango. Usamos "sequence", que es un entero corto y único.
+  var pagoId = parseInt(_primero(d.sequence).replace(/\D/g, ''), 10);
+  if (!pagoId || pagoId > 2000000000) {
+    var dg = String(d.orderId || '').replace(/\D/g, '');
+    pagoId = dg ? parseInt(dg.slice(-9), 10) : 1;
+  }
+
+  var ms = _fechaMs(d.creationDate);
+  var fechaTango = ms
+    ? Utilities.formatDate(new Date(ms), TZ_AR, "yyyy-MM-dd'T'HH:mm:ss")
+    : _fechaTango(d.creationDate);
+
+  var orden = {
+    OrderID: String(d.orderId), OrderNumber: String(d.orderId),
+    OrderCounterfoil: parseInt(c.orders_counterfoil, 10),
+    InvoiceCounterfoil: parseInt(c.orders_invoice_counterfoil, 10),
+    Date: fechaTango,
+    Total: total, PaidTotal: total, FinancialSurcharge: 0.0,
+    WarehouseCode: c.orders_warehouse_code, SellerCode: c.orders_seller_code,
+    SaleConditionCode: c.orders_sale_condition,
+    ValidateTotalWithPaidTotal: false, ValidateTotalWithItems: false,
+    Customer: {
+      CustomerID: /^\d+$/.test(doc) ? parseInt(doc, 10) : 1,
+      Code: '000000',
+      DocumentType: c.orders_document_type,
+      DocumentNumber: doc,
+      IVACategoryCode: c.orders_iva_category,
+      User: String(d.orderId),
+      Email: email || (String(d.orderId) + '@oncity.com'),
+      FirstName: nombre, LastName: apellido, BusinessName: _primero(cli.corporateName),
+      Street: calle, HouseNumber: nro, Floor: '', Apartment: compl,
+      City: ciudad, ProvinceCode: prov, PostalCode: cp,
+      PhoneNumber1: tel, PhoneNumber2: ''
+    },
+    Shipping: {
+      ShippingID: 1,
+      Street: calle, HouseNumber: nro, Floor: '', Apartment: compl,
+      City: ciudad, ProvinceCode: prov, PostalCode: cp,
+      PhoneNumber1: tel, PhoneNumber2: ''
+    },
+    OrderItems: items, Payments: [],
+    CashPayments: [{ PaymentID: pagoId,
+                     PaymentMethod: c.orders_payment_method, PaymentTotal: total }]
+  };
+
+  var li = (sh.logisticsInfo || [])[0] || {};
+  var registro = {
+    order_id: String(d.orderId),
+    suborder_id: _primero(d.marketplaceOrderId),
+    fecha_compra: ms ? Utilities.formatDate(new Date(ms), TZ_AR, 'yyyy-MM-dd HH:mm:ss') : '',
+    cliente: (nombre + ' ' + apellido).trim(),
+    documento: doc,
+    cuil: '',
+    email: email,
+    total: total,
+    items: resumen.join(' · '),
+    origen: 'api',
+    canal: 'oncity',
+    aviso: aviso,
+    transportadora: _primero(li.deliveryCompany)
+  };
+
+  return [orden, [], registro];
+}
+
+/** Trae los pedidos de OnCity y los deja listos para mandar a Tango. */
+function apiOncityOrdersPreview(user, p) {
+  p = p || {};
+  var cfg = _configMap();
+  var c = _cfgOncity(cfg);
+  var t0 = Date.now();
+
+  var estados = String(cfg.oncity_estados || 'ready-for-handling')
+    .split(',').map(function (s) { return s.trim(); }).filter(String);
+
+  var rels = _skuRelations();
+  var porRef = {}, porSkuId = {};
+  Object.keys(rels).forEach(function (s) {
+    if (rels[s].oncity_refid) porRef[rels[s].oncity_refid] = s;
+    if (rels[s].oncity_sku_id) porSkuId[rels[s].oncity_sku_id] = s;
+  });
+  var sent = _sentIds();
+
+  var pausa = parseInt(cfg.oncity_orders_pause_ms || '300', 10);
+  if (isNaN(pausa) || pausa < 0) pausa = 300;
+  var maxDet = parseInt(cfg.oncity_max_detalle || '120', 10) || 120;
+
+  var orders = [], registros = {}, nuevas = [],
+      saltadas = [], excluidas = [], fallidas = [];
+  var detalles = 0, truncada = false, totalListados = 0;
+
+  for (var e = 0; e < estados.length && !truncada; e++) {
+    var pagina = 1, paginas = 1;
+    while (pagina <= paginas && !truncada) {
+      var body = vtexOrdersPage(estados[e], pagina, cfg);
+      var paging = body.paging || {};
+      paginas = Number(paging.pages || 1);
+      var lista = body.list || [];
+      totalListados += lista.length;
+      if (!lista.length) break;
+
+      for (var i = 0; i < lista.length; i++) {
+        var oid = String(lista[i].orderId || '');
+        if (!oid) continue;
+        if (sent[oid]) { saltadas.push(oid); continue; }
+
+        if (detalles >= maxDet || (Date.now() - t0) > 4.5 * 60 * 1000) {
+          truncada = true; break;
+        }
+
+        var d;
+        try { d = vtexOrderDetail(oid); detalles++; }
+        catch (err) { fallidas.push({ orden: oid, error: err.message }); continue; }
+        if (pausa) Utilities.sleep(pausa);
+
+        var res = _buildOrderFromVtex(d, porRef, porSkuId, rels, c);
+        if (res[1].length) {
+          res[1].forEach(function (sku) {
+            _pendingAdd(sku, 'OnCity', 'Detectado en el pedido ' + oid + ' sin relación');
+          });
+          excluidas.push({ orden: oid, skus_sin_relacion: res[1] });
+          continue;
+        }
+
+        orders.push(res[0]);
+        registros[oid] = res[2];
+        nuevas.push({
+          orden: oid,
+          cliente: res[2].cliente,
+          documento: res[2].documento,
+          fecha: res[2].fecha_compra,
+          items: res[0].OrderItems.length,
+          total: res[0].Total,
+          transportadora: res[2].transportadora,
+          estado: String(lista[i].status || ''),
+          aviso: res[2].aviso
+        });
+      }
+      pagina++;
+    }
+  }
+
+  log_(user.email, 'ordenes', 'Pedidos leídos de OnCity (VTEX)', 'info',
+       'estados=' + estados.join('+') + ' listados=' + totalListados +
+       ' nuevas=' + nuevas.length + ' saltadas=' + saltadas.length +
+       ' excluidas=' + excluidas.length + ' fallidas=' + fallidas.length,
+       Date.now() - t0);
+
+  return {
+    estados: estados, listados: totalListados,
+    orders: orders, registros: registros,
+    nuevas: nuevas, saltadas: saltadas,
+    excluidas: excluidas, fallidas: fallidas,
+    truncada: truncada,
+    condicion_venta: c.orders_sale_condition,
+    talonario: c.orders_counterfoil
+  };
+}
+
+/** Manda a Tango los pedidos de OnCity ya armados. */
+function apiOncityOrdersSend(user, p) {
+  p = p || {};
+  var orders = p.orders || [];
+  var registros = p.registros || {};
+  if (!orders.length) return { enviadas: [], rechazadas: [] };
+
+  var vt = tangoVerify();
+  if (!vt[0]) throw new Error('Token de Tango inválido: ' + vt[1]);
+
+  var sent = _sentIds();
+  var pendientes = orders.filter(function (o) { return !sent[o.OrderID]; });
+  if (!pendientes.length) {
+    return { enviadas: [], rechazadas: orders.map(function (o) {
+      return { orden: o.OrderID, error: 'Ya figuraba en OrdenesEnviadas; no se reenvió' };
+    }) };
+  }
+  return _sendOrders(pendientes, user, p.archivo || 'API OnCity', null, registros);
+}
+
 /* ═══════════════ MÓDULO FACTURAS ═══════════════ */
 
 function _normKey(s) {
@@ -1692,6 +2042,17 @@ function _generarXlsxFacturas(filas) {
 function _columnaDocumento(fila) {
   var alias = ['nro_doc', 'nrodoc', 'nro_docum', 'nro_documento', 'documento', 'doc',
                'dni', 'cuit', 'nro_cuit', 'cuit_cuil', 'cuil', 'nro_iva', 'nro_ident'];
+  return _buscarColumna(fila, alias);
+}
+
+/** Busca la columna del importe total de la factura. */
+function _columnaImporte(fila) {
+  var alias = ['importe', 'imp_total', 'importe_total', 'total', 'total_comp',
+               'imp_neto', 'neto', 'monto', 'imp_tot', 'total_factura'];
+  return _buscarColumna(fila, alias);
+}
+
+function _buscarColumna(fila, alias) {
   var claves = Object.keys(fila || {});
   for (var i = 0; i < claves.length; i++) {
     var norm = String(claves[i]).toLowerCase().replace(/[^a-z0-9]/g, '_');
@@ -1703,13 +2064,30 @@ function _columnaDocumento(fila) {
 /** Solo los dígitos, para comparar documentos sin importar puntos ni guiones. */
 function _soloDigitos(v) { return String(v === null || v === undefined ? '' : v).replace(/\D/g, ''); }
 
+/** Texto o número → número. Tolera "$ 1.234,56" y "1234.56". */
+function _aNumero(v) {
+  if (v === null || v === undefined || v === '') return NaN;
+  if (typeof v === 'number') return v;
+  var s = String(v).replace(/[^0-9,.\-]/g, '');
+  if (s.indexOf(',') !== -1 && s.indexOf('.') !== -1) {
+    // formato argentino: 1.234,56
+    s = s.replace(/\./g, '').replace(',', '.');
+  } else if (s.indexOf(',') !== -1) {
+    s = s.replace(',', '.');
+  }
+  var n = parseFloat(s);
+  return isNaN(n) ? NaN : n;
+}
+
 /** Las órdenes que se mandaron a Tango y todavía no tienen factura cargada. */
-function apiInvoicesPendientes() {
-  var rows = _readRows(SH.SENT, 1000);
+function apiInvoicesPendientes(canal) {
+  var rows = _readRows(SH.SENT, 2000);
   var pend = [], sinDatos = 0;
   rows.forEach(function (r) {
     var estado = String(r.estado_facturacion || '').toLowerCase();
     if (estado === 'facturada') return;
+    var ch = String(r.canal || 'fravega').toLowerCase();
+    if (canal && ch !== canal) return;
     var cliente = String(r.cliente || '').trim();
     var doc = _soloDigitos(r.documento);
     if (!cliente && !doc) { sinDatos++; return; }   // filas viejas, de antes de la API
@@ -1717,24 +2095,31 @@ function apiInvoicesPendientes() {
                 cliente: cliente, documento: doc,
                 fecha_compra: String(r.fecha_compra || ''),
                 total: r.total, items: String(r.items || ''),
-                origen: String(r.origen || '') });
+                origen: String(r.origen || ''), canal: ch });
   });
   return { pendientes: pend.reverse(), sin_datos: sinDatos, total: pend.length };
 }
 
-/**
- * Cruza el reporte de facturación de Tango contra el historial de órdenes
- * enviadas y genera el .xlsx para Frávega. NO necesita el CSV de órdenes.
- */
-function apiInvoicesFromHistory(user, facturasRows) {
-  if (!facturasRows || !facturasRows.length) throw new Error('El reporte de facturación llegó vacío');
+/* ── El cruce contra el reporte de Tango ──────────────────────────────────
+ * Se busca en este orden, y la primera que da se usa:
+ *   1. documento + importe   ← el más fuerte, y el que separa canales solo
+ *   2. documento
+ *   3. nombre + importe
+ *   4. nombre
+ * El importe entra en juego porque un mismo cliente puede haber comprado en
+ * los dos marketplaces: el documento solo no alcanzaría para saber cuál de
+ * las dos facturas le corresponde a cada orden. */
+function _matchearFacturas(facturasRows, canal) {
   ['RAZON_SOCI', 'N_COMP', 'FECHA_EMI'].forEach(function (c) {
     if (!(c in facturasRows[0])) throw new Error("El reporte no tiene la columna '" + c + "'");
   });
 
-  var addPrefix = getConfig('invoices_add_prefix') === '1';
-  var prefijo = getConfig('invoices_prefix') || 'FVG-';
+  var usarImporte = getConfig('invoices_match_importe') === '1';
+  var tolerancia = parseFloat(getConfig('invoices_tolerancia_importe') || '1');
+  if (isNaN(tolerancia) || tolerancia < 0) tolerancia = 1;
+
   var colDoc = _columnaDocumento(facturasRows[0]);
+  var colImp = usarImporte ? _columnaImporte(facturasRows[0]) : '';
 
   var sheet = _sheet(SH.SENT);
   var last = sheet.getLastRow();
@@ -1759,88 +2144,189 @@ function apiInvoicesFromHistory(user, facturasRows) {
   var usadas = {}, porDoc = {}, porNombre = {};
   facturas.forEach(function (f, i) {
     f.__i = i;
+    f.__imp = colImp ? _aNumero(f[colImp]) : NaN;
     if (colDoc) {
       var d = _soloDigitos(f[colDoc]);
       if (d) (porDoc[d] = porDoc[d] || []).push(f);
     }
-    var k = _normKey(f['RAZON_SOCI']);
-    (porNombre[k] = porNombre[k] || []).push(f);
+    (porNombre[_normKey(f['RAZON_SOCI'])] = porNombre[_normKey(f['RAZON_SOCI'])] || []).push(f);
   });
 
-  function tomar(lista) {
+  function tomar(lista, importe) {
     if (!lista) return null;
     for (var i = 0; i < lista.length; i++) {
-      if (!usadas[lista[i].__i]) { usadas[lista[i].__i] = true; return lista[i]; }
+      var f = lista[i];
+      if (usadas[f.__i]) continue;
+      if (importe !== null) {
+        if (isNaN(f.__imp) || isNaN(importe)) continue;
+        if (Math.abs(f.__imp - importe) > tolerancia) continue;
+      }
+      usadas[f.__i] = true;
+      return f;
     }
     return null;
   }
 
-  var filas = [], sinFactura = [], matcheadas = 0;
-  var porDocCount = 0, porNombreCount = 0;
+  var asignaciones = {}, sinFactura = [];
+  var conteo = { doc_importe: 0, doc: 0, nombre_importe: 0, nombre: 0 };
   var ts = _now();
+  var cambios = false;
 
   for (var r = 0; r < datos.length; r++) {
     var fila = datos[r];
-    var estado = String(fila[col.estado_facturacion] || '').toLowerCase();
-    if (estado === 'facturada') continue;
+    if (String(fila[col.estado_facturacion] || '').toLowerCase() === 'facturada') continue;
+
+    var ch = String(col.canal !== undefined ? (fila[col.canal] || 'fravega') : 'fravega').toLowerCase();
+    if (canal && ch !== canal) continue;
 
     var orden = String(fila[col.order_id] || '').trim();
     if (!orden) continue;
     var cliente = String(fila[col.cliente] || '').trim();
     var doc = _soloDigitos(fila[col.documento]);
     if (!cliente && !doc) continue;   // fila vieja sin datos: no se puede matchear
+    var importe = _aNumero(fila[col.total]);
+    var nk = cliente ? _normKey(cliente) : '';
 
-    // 1) por documento (unívoco)  2) por nombre normalizado (respaldo)
-    var f = doc ? tomar(porDoc[doc]) : null;
-    if (f) porDocCount++;
-    if (!f && cliente) { f = tomar(porNombre[_normKey(cliente)]); if (f) porNombreCount++; }
+    var f = null, via = '';
+    if (doc && colImp && !isNaN(importe)) { f = tomar(porDoc[doc], importe); if (f) { via = 'doc_importe'; } }
+    if (!f && doc) { f = tomar(porDoc[doc], null); if (f) via = 'doc'; }
+    if (!f && nk && colImp && !isNaN(importe)) { f = tomar(porNombre[nk], importe); if (f) via = 'nombre_importe'; }
+    if (!f && nk) { f = tomar(porNombre[nk], null); if (f) via = 'nombre'; }
 
     if (!f) {
-      sinFactura.push({ orden: orden, cliente: cliente, documento: doc });
+      sinFactura.push({ orden: orden, cliente: cliente, documento: doc,
+                        total: isNaN(importe) ? '' : importe });
       continue;
     }
+    conteo[via]++;
 
-    var ordenSalida = orden;
-    if (addPrefix && ordenSalida.toUpperCase().indexOf(prefijo.toUpperCase()) !== 0) {
-      ordenSalida = prefijo + ordenSalida;
-    }
     var nroFactura = String(f['N_COMP']).replace(/[\s\-]/g, '');
     var fechaFactura = _fechaFmt(f['FECHA_EMI']);
-    filas.push([ordenSalida, nroFactura, fechaFactura]);
+    asignaciones[orden] = { nro_factura: nroFactura, fecha_factura: fechaFactura,
+                            cliente: cliente, via: via };
 
     fila[col.estado_facturacion] = 'facturada';
     fila[col.nro_factura] = nroFactura;
     fila[col.fecha_factura] = fechaFactura;
     fila[col.facturada_en] = ts;
-    matcheadas++;
+    cambios = true;
   }
 
-  if (matcheadas) sheet.getRange(2, 1, datos.length, headers.length).setValues(datos);
+  if (cambios) sheet.getRange(2, 1, datos.length, headers.length).setValues(datos);
 
   var sobrantes = [];
   facturas.forEach(function (f) {
     if (!usadas[f.__i]) {
-      sobrantes.push({ cliente: String(f['RAZON_SOCI']), factura: String(f['N_COMP']) });
+      sobrantes.push({ cliente: String(f['RAZON_SOCI']), factura: String(f['N_COMP']),
+                       importe: isNaN(f.__imp) ? '' : f.__imp });
     }
+  });
+
+  return {
+    asignaciones: asignaciones, sin_factura: sinFactura, sobrantes: sobrantes,
+    conteo: conteo,
+    columna_documento: colDoc || '(el reporte no trae documento)',
+    columna_importe: colImp || (usarImporte ? '(el reporte no trae importe)' : '(desactivado)')
+  };
+}
+
+/**
+ * FRÁVEGA — cruza el reporte de Tango contra el historial y genera el .xlsx.
+ * No necesita el CSV de órdenes.
+ */
+function apiInvoicesFromHistory(user, facturasRows) {
+  if (!facturasRows || !facturasRows.length) throw new Error('El reporte de facturación llegó vacío');
+
+  var m = _matchearFacturas(facturasRows, 'fravega');
+  var addPrefix = getConfig('invoices_add_prefix') === '1';
+  var prefijo = getConfig('invoices_prefix') || 'FVG-';
+
+  var filas = [];
+  Object.keys(m.asignaciones).forEach(function (orden) {
+    var a = m.asignaciones[orden];
+    var salida = orden;
+    if (addPrefix && salida.toUpperCase().indexOf(prefijo.toUpperCase()) !== 0) {
+      salida = prefijo + salida;
+    }
+    filas.push([salida, a.nro_factura, a.fecha_factura]);
   });
 
   var xls = _generarXlsxFacturas(filas);
 
   _appendRow(SH.INVOICES, [_now(), user.email, xls.archivo, filas.length,
-                           sinFactura.length, sobrantes.length,
-                           JSON.stringify({ sin_factura: sinFactura, sobrantes: sobrantes,
-                                            por_documento: porDocCount,
-                                            por_nombre: porNombreCount })]);
-  log_(user.email, 'facturas', 'Exportación generada (desde el historial)', 'ok',
-       'cargadas=' + filas.length + ' por_documento=' + porDocCount +
-       ' por_nombre=' + porNombreCount + ' sin_factura=' + sinFactura.length +
-       ' sobrantes=' + sobrantes.length);
+                           m.sin_factura.length, m.sobrantes.length,
+                           JSON.stringify({ sin_factura: m.sin_factura,
+                                            sobrantes: m.sobrantes, conteo: m.conteo })]);
+  log_(user.email, 'facturas', 'Exportación Frávega (desde el historial)', 'ok',
+       'cargadas=' + filas.length + ' ' + JSON.stringify(m.conteo) +
+       ' sin_factura=' + m.sin_factura.length + ' sobrantes=' + m.sobrantes.length);
 
   return { archivo: xls.archivo, cargadas: filas.length,
-           sin_factura: sinFactura, sobrantes: sobrantes,
-           por_documento: porDocCount, por_nombre: porNombreCount,
-           columna_documento: colDoc || '(el reporte no trae documento: se matcheó solo por nombre)',
+           sin_factura: m.sin_factura, sobrantes: m.sobrantes,
+           conteo: m.conteo,
+           columna_documento: m.columna_documento, columna_importe: m.columna_importe,
            base64: xls.base64 };
+}
+
+/**
+ * ONCITY — completa la plantilla de Carga Masiva.
+ * Recibe la plantilla EXPORTADA del panel de OnCity tal cual (como matriz de
+ * filas, incluida la de encabezados) y el reporte de facturación de Tango.
+ * Devuelve la MISMA matriz con la columna B (Nro. de Factura) completada; el
+ * resto de las columnas se devuelven intactas, porque la fecha, el valor y la
+ * transportadora ya vienen bien de OnCity y no hay que tocarlas.
+ * La columna E (Url de la factura) se deja vacía, como acordamos.
+ */
+function apiOncityInvoices(user, p) {
+  p = p || {};
+  var plantilla = p.plantilla || [];
+  var facturasRows = p.facturas || [];
+  if (plantilla.length < 2) throw new Error('La plantilla de OnCity llegó vacía o sin filas de datos');
+  if (!facturasRows.length) throw new Error('El reporte de facturación llegó vacío');
+
+  var m = _matchearFacturas(facturasRows, 'oncity');
+
+  var encabezados = plantilla[0];
+  var COL_ORDEN = 0, COL_FACTURA = 1;
+  var salida = [encabezados.slice()];
+  var completadas = 0, sinMatch = [], yaTenian = 0;
+
+  for (var i = 1; i < plantilla.length; i++) {
+    var fila = (plantilla[i] || []).slice();
+    while (fila.length < encabezados.length) fila.push('');
+    var orden = String(fila[COL_ORDEN] || '').trim();
+    if (!orden) continue;                       // fila vacía del final de la planilla
+
+    if (String(fila[COL_FACTURA] || '').trim()) { yaTenian++; salida.push(fila); continue; }
+
+    var a = m.asignaciones[orden];
+    if (a) {
+      fila[COL_FACTURA] = a.nro_factura;
+      completadas++;
+    } else {
+      sinMatch.push(orden);
+    }
+    salida.push(fila);
+  }
+
+  var nombre = 'invoice_shipment_completo_' +
+    Utilities.formatDate(new Date(), TZ_AR, 'yyyyMMdd_HHmmss') + '.xlsx';
+
+  _appendRow(SH.INVOICES, [_now(), user.email, nombre, completadas,
+                           sinMatch.length, m.sobrantes.length,
+                           JSON.stringify({ sin_match_en_plantilla: sinMatch,
+                                            sin_factura_en_historial: m.sin_factura,
+                                            sobrantes: m.sobrantes, conteo: m.conteo })]);
+  log_(user.email, 'facturas', 'Exportación OnCity (plantilla completada)', 'ok',
+       'completadas=' + completadas + ' ' + JSON.stringify(m.conteo) +
+       ' sin_match=' + sinMatch.length + ' sobrantes=' + m.sobrantes.length);
+
+  return {
+    archivo: nombre, filas: salida, completadas: completadas,
+    ya_tenian: yaTenian, sin_match: sinMatch,
+    sin_factura: m.sin_factura, sobrantes: m.sobrantes, conteo: m.conteo,
+    columna_documento: m.columna_documento, columna_importe: m.columna_importe
+  };
 }
 
 /* ═══════════════ MÓDULO SKUs / PENDIENTES ═══════════════ */
@@ -2637,7 +3123,8 @@ function _filaSent(id, reg, ts) {
   return [id, reg.suborder_id || '', ts, reg.fecha_compra || '',
           reg.cliente || '', reg.documento || '', reg.cuil || '', reg.email || '',
           (reg.total === undefined || reg.total === null) ? '' : reg.total,
-          reg.items || '', reg.origen || 'csv', 'pendiente', '', '', ''];
+          reg.items || '', reg.origen || 'csv', 'pendiente', '', '', '',
+          reg.canal || 'fravega'];
 }
 
 /**

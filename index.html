@@ -432,12 +432,17 @@ function viewOrdenes() {
     class="px-4 py-2 text-sm rounded-lg ${ORDENES_MODO === id
       ? "bg-violet-700 text-white font-medium" : "border bg-white text-gray-600"}">${txt}</button>`;
 
+  const bloque = ORDENES_MODO === "oncity" ? bloqueOrdenesOncity()
+               : ORDENES_MODO === "csv" ? bloqueOrdenesCsv()
+               : bloqueOrdenesApi();
+
   setMain(H("Ingreso de Órdenes") + `
-    <div class="flex gap-2 mb-4">
-      ${tab("api", "🔌 Directo desde Frávega (API)")}
-      ${tab("csv", "📄 Subiendo el CSV")}
+    <div class="flex gap-2 mb-4 flex-wrap">
+      ${tab("api", "🔌 Frávega (API)")}
+      ${tab("oncity", "🏬 OnCity (API)")}
+      ${tab("csv", "📄 Frávega por CSV")}
     </div>
-    ${ORDENES_MODO === "api" ? bloqueOrdenesApi() : bloqueOrdenesCsv()}
+    ${bloque}
     ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Historial de importaciones</div>
       <div id="ordenes-hist">${spinner("Cargando historial...")}</div>`)}`);
   cargarHistorialOrdenes();  // llena SOLO el div del historial, sin tocar la carga
@@ -447,7 +452,196 @@ function cambiarModoOrdenes(modo) {
   ORDENES_MODO = modo;
   localStorage.setItem("tf_ordenes_modo", modo);
   API_ORDENES = null;
+  ONCITY_ORDENES = null;
   viewOrdenes();
+}
+
+/* ══════════════ ÓRDENES · ONCITY (VTEX) ══════════════ */
+let ONCITY_ORDENES = null;
+
+function bloqueOrdenesOncity() {
+  return card(`
+    <div class="text-sm text-gray-600 mb-3">
+      Trae los pedidos de OnCity en estado <b>"Listo para preparación"</b> directamente de la
+      API de VTEX — los mismos que ves en <i>Pedidos → Carga Masiva Facturas y datos envíos</i>.
+      <div class="mt-2 text-xs bg-violet-50 border border-violet-200 text-violet-900 rounded-lg px-3 py-2">
+        Los pedidos de OnCity entran a Tango con su propia <b>condición de venta</b> (configurable
+        en Configuración), para que queden distinguibles de los de Frávega. Los importes de VTEX
+        vienen en centavos y se dividen por 100 automáticamente.
+      </div>
+      <div class="mt-2 text-xs bg-amber-50 border border-amber-200 text-amber-900 rounded-lg px-3 py-2">
+        ⚠️ <b>Primera vez:</b> OnCity nunca se cargó por esta app, así que van a aparecer todos
+        los pedidos pendientes, incluidos los que ya hayas facturado a mano en Tango.
+        <b>Destildá esos antes de enviar</b> para no duplicarlos. De la segunda vez en adelante
+        se saltean solos.
+      </div>
+    </div>
+    <div class="flex items-center gap-3 flex-wrap">
+      <button onclick="buscarOrdenesOncity()" class="bg-violet-700 hover:bg-violet-800 text-white px-5 py-2.5 rounded-lg font-medium">
+        1️⃣ Buscar pedidos en OnCity</button>
+    </div>
+    <div id="ordenes-resultado" class="mt-4"></div>`, "mb-4");
+}
+
+async function buscarOrdenesOncity() {
+  const box = $("ordenes-resultado");
+  box.innerHTML = spinner("Consultando los pedidos de OnCity en VTEX...");
+  try {
+    ONCITY_ORDENES = await api("oncity.orders.preview", {});
+  } catch (e) {
+    ONCITY_ORDENES = null;
+    box.innerHTML = `<div class="border border-red-200 bg-red-50 rounded-lg p-4">
+      <div class="font-bold text-red-700 mb-1">No se pudieron traer los pedidos</div>
+      <div class="text-sm text-red-700">${esc(e.message)}</div></div>`;
+    return;
+  }
+  pintarOrdenesOncity();
+}
+
+function pintarOrdenesOncity() {
+  const a = ONCITY_ORDENES;
+  if (!a) return;
+  const money = (n) => "$ " + Number(n).toLocaleString("es-AR",
+    { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  $("ordenes-resultado").innerHTML = `
+    <div class="border rounded-lg p-4 bg-gray-50">
+      <div class="text-sm mb-2">
+        <b>${a.listados}</b> pedido(s) leídos en estado <code>${esc(a.estados.join(", "))}</code>
+        <span class="text-gray-400">· condición de venta en Tango: <b>${esc(a.condicion_venta)}</b>
+        · talonario ${esc(a.talonario)}</span>
+      </div>
+      <div class="flex gap-4 text-sm mb-3 flex-wrap">
+        <span>🆕 Nuevos: <b>${a.nuevas.length}</b></span>
+        <span>⏩ Ya enviados: <b>${a.saltadas.length}</b></span>
+        <span class="${a.excluidas.length ? "text-red-600" : ""}">🚫 Sin relación de SKU: <b>${a.excluidas.length}</b></span>
+        ${a.fallidas.length ? `<span class="text-red-600">⚠️ Con error: <b>${a.fallidas.length}</b></span>` : ""}
+      </div>
+
+      ${a.truncada ? `<div class="text-sm bg-amber-50 border border-amber-200 text-amber-900 rounded p-3 mb-3">
+        Se cortó la lectura para no pasar el límite de tiempo de Google. Enviá estos y volvé a
+        apretar "Buscar" para traer el resto.</div>` : ""}
+
+      ${a.nuevas.length ? `
+        <div class="flex items-center gap-3 mb-2 text-sm">
+          <button onclick="marcarTodosOncity(true)" class="text-violet-700 underline">Tildar todos</button>
+          <button onclick="marcarTodosOncity(false)" class="text-violet-700 underline">Destildar todos</button>
+          <span id="onc-contador" class="text-gray-500"></span>
+        </div>
+        <div class="max-h-96 overflow-y-auto mb-3">
+        <table class="data w-full"><thead><tr>
+          <th class="w-8"></th><th>Pedido</th><th>Cliente</th><th>DNI</th><th>Fecha</th>
+          <th>Ítems</th><th>Total</th><th>Transportadora</th></tr></thead><tbody>
+        ${a.nuevas.map((o, i) => `<tr>
+          <td><input type="checkbox" class="onc-chk w-4 h-4" data-i="${i}" checked onchange="contarOncity()"></td>
+          <td class="font-mono text-xs">${esc(o.orden)}</td>
+          <td>${esc(o.cliente)}</td>
+          <td class="font-mono text-xs">${esc(o.documento)}</td>
+          <td class="text-xs">${esc(o.fecha)}</td>
+          <td class="text-center">${o.items}</td>
+          <td>${money(o.total)}${o.aviso ? `<div class="text-xs text-amber-700" title="${esc(o.aviso)}">⚠ revisar total</div>` : ""}</td>
+          <td class="text-xs text-gray-500">${esc(o.transportadora || "—")}</td>
+        </tr>`).join("")}</tbody></table></div>` : ""}
+
+      ${a.excluidas.length ? `<div class="text-sm text-red-700 bg-red-50 border border-red-200 rounded p-3 mb-3">
+        Estos pedidos NO se envían porque tienen SKUs sin relación (ya quedaron en
+        <a href="#pendientes" class="underline font-medium">Pendientes</a>):
+        ${a.excluidas.map((x) => `<div>· ${esc(x.orden)} → SKU ${x.skus_sin_relacion.map(esc).join(", ")}</div>`).join("")}</div>` : ""}
+
+      ${a.fallidas.length ? `<div class="text-sm text-red-700 bg-red-50 border border-red-200 rounded p-3 mb-3">
+        No se pudo leer el detalle de estos pedidos:
+        ${a.fallidas.map((x) => `<div>· ${esc(x.orden)}: ${esc(x.error)}</div>`).join("")}</div>` : ""}
+
+      ${a.nuevas.length ? `<button onclick="enviarOrdenesOncity()"
+        class="bg-green-700 hover:bg-green-800 text-white px-5 py-2.5 rounded-lg font-medium">
+        2️⃣ Confirmar y enviar los tildados a Tango</button>` :
+        '<div class="text-gray-500 text-sm">No hay pedidos nuevos para enviar.</div>'}
+    </div>`;
+  contarOncity();
+}
+
+function marcarTodosOncity(v) {
+  document.querySelectorAll(".onc-chk").forEach((c) => { c.checked = v; });
+  contarOncity();
+}
+
+function contarOncity() {
+  const n = document.querySelectorAll(".onc-chk:checked").length;
+  const el = $("onc-contador");
+  if (el) el.textContent = `${n} tildado(s) de ${document.querySelectorAll(".onc-chk").length}`;
+}
+
+function indicesOncitySeleccionados() {
+  return Array.from(document.querySelectorAll(".onc-chk:checked"))
+    .map((c) => Number(c.dataset.i));
+}
+
+function enviarOrdenesOncity() {
+  const a = ONCITY_ORDENES;
+  if (!a) return;
+  const idx = indicesOncitySeleccionados();
+  if (!idx.length) return toast("No hay ningún pedido tildado", "warning");
+
+  const elegidas = idx.map((i) => a.nuevas[i].orden);
+  const orders = a.orders.filter((o) => elegidas.indexOf(o.OrderID) !== -1);
+  const total = orders.length;
+
+  confirmar(`Se van a crear ${total} pedido(s) de OnCity en Tango, con condición de venta ` +
+            `${a.condicion_venta}. ¿Continuar?`, async () => {
+    const TANDA = 25;
+    const enviadas = [], rechazadas = [];
+    const box = $("ordenes-resultado");
+
+    for (let i = 0; i < total; i += TANDA) {
+      const lote = orders.slice(i, i + TANDA);
+      const regs = {};
+      lote.forEach((o) => { if (a.registros[o.OrderID]) regs[o.OrderID] = a.registros[o.OrderID]; });
+      const desde = i + 1, hasta = Math.min(i + TANDA, total);
+
+      box.innerHTML = `
+        <div class="border rounded-lg p-4 bg-violet-50">
+          ${spinner(`Enviando pedidos ${desde}–${hasta} de ${total} a Tango...`)}
+          <div class="text-xs text-gray-500 mt-2">Aceptados hasta ahora: ${enviadas.length}
+            ${rechazadas.length ? `· rechazados: ${rechazadas.length}` : ""}</div>
+          <div class="w-full bg-violet-200 rounded-full h-2 mt-2">
+            <div class="bg-violet-700 h-2 rounded-full" style="width:${Math.round(hasta / total * 100)}%"></div></div>
+        </div>`;
+      try {
+        const r = await api("oncity.orders.send", { orders: lote, registros: regs, archivo: "API OnCity" });
+        enviadas.push(...r.enviadas);
+        rechazadas.push(...r.rechazadas);
+      } catch (e) {
+        rechazadas.push({ orden: `tanda ${desde}-${hasta}`, error: e.message });
+      }
+    }
+
+    box.innerHTML = `
+      <div class="border rounded-lg p-4 ${rechazadas.length ? "bg-amber-50" : "bg-green-50"}">
+        <div class="font-bold mb-2">✅ Enviados y aceptados por Tango: ${enviadas.length} de ${total}</div>
+        <div class="text-sm text-gray-600 mb-2">Para facturar, andá a
+          <a href="#facturas" class="underline text-violet-700">Exportación de Facturas → OnCity</a>,
+          subí la plantilla que exportás del panel y el reporte de Tango.</div>
+        <div class="max-h-40 overflow-y-auto">
+          ${enviadas.map((id) => `<span class="inline-block bg-white border rounded px-2 py-0.5 text-xs mr-1 mb-1">${esc(id)}</span>`).join("")}
+        </div>
+        ${rechazadas.length ? `<div class="font-bold mt-3 mb-1 text-red-700">❌ Rechazados: ${rechazadas.length}</div>
+          <div class="max-h-40 overflow-y-auto">
+          ${rechazadas.map((f) => `<div class="text-sm text-red-700">· ${esc(f.orden)}: ${esc(f.error)}</div>`).join("")}
+          </div>` : ""}
+      </div>`;
+    toast(`${enviadas.length} pedidos de OnCity enviados a Tango`, rechazadas.length ? "warning" : "ok");
+
+    try {
+      await api("orders.recordImport", {
+        archivo: "API OnCity", total_filas: a.listados,
+        filas_pendientes: a.nuevas.length + a.saltadas.length, nuevas: total,
+        enviadas: enviadas, rechazadas: rechazadas,
+        excluidas: a.excluidas || [], saltadas: a.saltadas || [],
+      });
+    } catch (e) { /* el historial es secundario */ }
+    ONCITY_ORDENES = null;
+    cargarHistorialOrdenes();
+  });
 }
 
 function bloqueOrdenesApi() {
@@ -824,18 +1018,24 @@ function viewFacturas() {
     class="px-4 py-2 text-sm rounded-lg ${FACTURAS_MODO === id
       ? "bg-violet-700 text-white font-medium" : "border bg-white text-gray-600"}">${txt}</button>`;
 
+  const bloque = FACTURAS_MODO === "oncity" ? bloqueFacturasOncity()
+               : FACTURAS_MODO === "csv" ? bloqueFacturasCsv()
+               : bloqueFacturasHistorial();
+
   setMain(H("Exportación de Facturas") + `
-    <div class="flex gap-2 mb-4">
-      ${tab("historial", "🗂️ Contra el historial (solo el reporte de Tango)")}
-      ${tab("csv", "📄 Subiendo los dos archivos")}
+    <div class="flex gap-2 mb-4 flex-wrap">
+      ${tab("historial", "🗂️ Frávega (contra el historial)")}
+      ${tab("oncity", "🏬 OnCity (plantilla)")}
+      ${tab("csv", "📄 Frávega con los dos archivos")}
     </div>
-    ${FACTURAS_MODO === "historial" ? bloqueFacturasHistorial() : bloqueFacturasCsv()}
+    ${bloque}
     ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Historial de exportaciones</div>
       <div id="fac-hist">${spinner("Cargando historial...")}</div>
       <p class="text-xs text-gray-400 mt-2">El archivo se descarga en el momento de generarlo
       (no queda guardado en el servidor).</p>`)}`);
   cargarHistorialFacturas();
-  if (FACTURAS_MODO === "historial") cargarPendientesFacturar();
+  if (FACTURAS_MODO === "historial") cargarPendientesFacturar("fravega");
+  if (FACTURAS_MODO === "oncity") cargarPendientesFacturar("oncity");
 }
 
 function cambiarModoFacturas(modo) {
@@ -883,11 +1083,11 @@ function bloqueFacturasCsv() {
     <div id="fac-resultado" class="mt-4"></div>`, "mb-4");
 }
 
-async function cargarPendientesFacturar() {
+async function cargarPendientesFacturar(canal) {
   const cont = $("fac-pendientes");
   if (!cont) return;
   let r;
-  try { r = await api("invoices.pendientes"); }
+  try { r = await api("invoices.pendientes", { canal: canal || "" }); }
   catch (e) { cont.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
   if (!$("fac-pendientes")) return;
   const p = r.pendientes || [];
@@ -909,6 +1109,113 @@ async function cargarPendientesFacturar() {
         ${p.length > 200 ? `<div class="text-xs text-gray-400 mt-1">…y ${p.length - 200} más</div>` : ""}
       </div>` : '<div class="text-sm text-gray-400">No hay órdenes pendientes de facturar.</div>'}
     </div>`;
+}
+
+function bloqueFacturasOncity() {
+  return card(`
+    <div class="text-sm text-gray-600 mb-3">
+      Subí los dos archivos y te devuelvo la <b>misma plantilla de OnCity</b> con la columna
+      <b>Nro. de Factura</b> completada, lista para importar en
+      <i>Pedidos → Carga Masiva Facturas y datos envíos → Importar plantilla</i>.
+      <div class="mt-2 text-xs bg-violet-50 border border-violet-200 text-violet-900 rounded-lg px-3 py-2">
+        La fecha, el valor y la transportadora se devuelven <b>intactos</b>, tal como los exportó
+        OnCity. La columna "Url de la factura" queda vacía. El cruce se hace por
+        <b>documento + importe</b> contra los pedidos que esta app le mandó a Tango.
+      </div>
+    </div>
+    <div id="fac-pendientes" class="mb-4">${spinner("Contando pedidos pendientes de facturar...")}</div>
+    <div class="grid md:grid-cols-2 gap-4 mb-4">
+      <div><label class="text-xs text-gray-500 uppercase">1. Plantilla exportada de OnCity</label><br>
+        <input type="file" id="onc-plantilla" accept=".xlsx,.xls"
+          class="text-sm file:mr-3 file:px-4 file:py-2 file:rounded-lg file:border-0 file:bg-violet-100 file:text-violet-800">
+        <div class="text-xs text-gray-400 mt-1">El invoice_shipment_….xlsx que bajás con "Exportar plantilla"</div></div>
+      <div><label class="text-xs text-gray-500 uppercase">2. Reporte de facturación (Tango)</label><br>
+        <input type="file" id="onc-libro" accept=".xlsx,.xls,.csv"
+          class="text-sm file:mr-3 file:px-4 file:py-2 file:rounded-lg file:border-0 file:bg-violet-100 file:text-violet-800"></div>
+    </div>
+    <button onclick="generarFacturasOncity()" class="bg-violet-700 text-white px-5 py-2.5 rounded-lg font-medium">
+      Completar plantilla</button>
+    <div id="fac-resultado" class="mt-4"></div>`, "mb-4");
+}
+
+/**
+ * Lee la plantilla de OnCity SIN convertir tipos: la fecha viene como texto
+ * ("21/08/2026 10:17:45") y el valor como número. Si dejáramos que la librería
+ * los interprete, al reescribir el archivo cambiarían de formato y OnCity lo
+ * rechazaría. Por eso raw:true y cellDates:false.
+ */
+function leerPlantillaOncity(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("No se pudo leer la plantilla"));
+    reader.onload = (e) => {
+      try {
+        const wb = XLSX.read(e.target.result, { type: "array", cellDates: false });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        resolve({
+          hoja: wb.SheetNames[0],
+          filas: XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: "" }),
+        });
+      } catch (err) { reject(err); }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+async function generarFacturasOncity() {
+  const fp = $("onc-plantilla"), fl = $("onc-libro");
+  if (!fp.files.length || !fl.files.length) return toast("Subí los dos archivos", "warning");
+  $("fac-resultado").innerHTML = spinner("Cruzando el reporte contra los pedidos de OnCity...");
+  try {
+    const [plantilla, facturasRows] = await Promise.all(
+      [leerPlantillaOncity(fp.files[0]), parseFile(fl.files[0])]);
+
+    const cab = (plantilla.filas[0] || []).map((h) => String(h).toLowerCase());
+    if (!cab.length || cab[0].indexOf("orden") === -1) {
+      throw new Error('La primera columna de la plantilla no parece ser "Nro. de orden". ' +
+                      "¿Subiste el archivo exportado de OnCity?");
+    }
+
+    const r = await api("oncity.invoices", { plantilla: plantilla.filas, facturas: facturasRows });
+
+    // Reescribimos el xlsx conservando la hoja original y los tipos de cada celda
+    const ws = XLSX.utils.aoa_to_sheet(r.filas);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, plantilla.hoja || "Principal");
+    XLSX.writeFile(wb, r.archivo);
+
+    const c = r.conteo || {};
+    $("fac-resultado").innerHTML = `
+      <div class="border rounded-lg p-4 bg-green-50">
+        <div class="font-bold mb-2">✅ Plantilla completada y descargada — ${r.completadas} factura(s) cargada(s)</div>
+        <div class="text-sm mb-2">${esc(r.archivo)}</div>
+        <div class="text-sm text-gray-600 mb-2">
+          Cruce: por documento+importe <b>${c.doc_importe || 0}</b> ·
+          solo documento <b>${c.doc || 0}</b> ·
+          nombre+importe <b>${c.nombre_importe || 0}</b> ·
+          solo nombre <b>${c.nombre || 0}</b>
+          <div class="text-xs text-gray-500">Columnas usadas del reporte de Tango —
+            documento: ${esc(r.columna_documento)} · importe: ${esc(r.columna_importe)}</div>
+          ${r.ya_tenian ? `<div class="text-xs text-gray-500">${r.ya_tenian} fila(s) ya traían número de factura y se dejaron como estaban.</div>` : ""}
+        </div>
+        ${r.sin_match.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 mb-2">
+          ⚠️ ${r.sin_match.length} pedido(s) de la plantilla sin factura asignada:
+          ${r.sin_match.slice(0, 30).map((o) => `<div>· ${esc(o)}</div>`).join("")}
+          ${r.sin_match.length > 30 ? `<div class="text-xs mt-1">…y ${r.sin_match.length - 30} más</div>` : ""}
+          <div class="text-xs mt-1">Puede ser que todavía no los hayas facturado en Tango, o que
+            el pedido no se haya cargado por esta app.</div></div>` : ""}
+        ${r.sobrantes.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2">
+          ⚠️ ${r.sobrantes.length} factura(s) del reporte que no se asignaron a ningún pedido de OnCity:
+          ${r.sobrantes.slice(0, 30).map((s) => `<div>· ${esc(s.cliente)} — ${esc(s.factura)}${s.importe !== "" ? " ($ " + esc(s.importe) + ")" : ""}</div>`).join("")}
+          ${r.sobrantes.length > 30 ? `<div class="text-xs mt-1">…y ${r.sobrantes.length - 30} más</div>` : ""}
+          <div class="text-xs mt-1">Es esperable si el reporte también trae facturas de Frávega.</div></div>` : ""}
+      </div>`;
+    toast("Plantilla de OnCity completada", "ok");
+    cargarHistorialFacturas();
+    cargarPendientesFacturar("oncity");
+  } catch (e) {
+    $("fac-resultado").innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`;
+  }
 }
 
 /** Descarga el .xlsx que devuelve el backend en base64. */
@@ -937,9 +1244,12 @@ async function generarFacturasHistorial() {
         <div class="font-bold mb-2">✅ Archivo generado y descargado — ${r.cargadas} orden(es) cargada(s)</div>
         <div class="text-sm mb-2">${esc(r.archivo)}</div>
         <div class="text-sm text-gray-600 mb-2">
-          Matcheadas por documento: <b>${r.por_documento}</b> · por nombre: <b>${r.por_nombre}</b>
-          <div class="text-xs text-gray-500">Columna de documento usada del reporte de Tango:
-            ${esc(r.columna_documento)}</div>
+          Cruce: por documento+importe <b>${(r.conteo || {}).doc_importe || 0}</b> ·
+          solo documento <b>${(r.conteo || {}).doc || 0}</b> ·
+          nombre+importe <b>${(r.conteo || {}).nombre_importe || 0}</b> ·
+          solo nombre <b>${(r.conteo || {}).nombre || 0}</b>
+          <div class="text-xs text-gray-500">Columnas usadas del reporte de Tango —
+            documento: ${esc(r.columna_documento)} · importe: ${esc(r.columna_importe)}</div>
         </div>
         ${r.sin_factura.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 mb-2">
           ⚠️ ${r.sin_factura.length} orden(es) enviadas a Tango sin factura en el reporte:
@@ -1307,8 +1617,24 @@ const CONFIG_CAMPOS = [
     ["orders_api_tipo_entrega", "Filtrar tipo de entrega: vacío = todos · SP · HD", "text"],
     ["orders_api_facturar_envio", "Sumar el costo de envío al total (dejar apagado con Frávega Envíos)", "bool"],
   ]],
+  ["Órdenes de OnCity (VTEX)", [
+    ["oncity_sale_condition", "Condición de venta de Tango para OnCity", "text"],
+    ["oncity_estados", "Estados de VTEX a importar (separados por coma)", "text"],
+    ["oncity_desde_fecha", "No traer pedidos anteriores a (aaaa-mm-dd)", "text"],
+    ["oncity_dias_atras", "Ventana de búsqueda hacia atrás (días)", "text"],
+    ["oncity_orders_pause_ms", "Pausa entre consultas de detalle a VTEX (ms)", "text"],
+    ["oncity_max_detalle", "Máximo de detalles por ejecución", "text"],
+    ["oncity_precio_divisor", "Divisor de precios (VTEX manda centavos: 100)", "text"],
+    ["oncity_facturar_envio", "Sumar el costo de envío al total", "bool"],
+    ["oncity_counterfoil", "Talonario de pedido (vacío = el mismo que Frávega)", "text"],
+    ["oncity_invoice_counterfoil", "Talonario de factura (vacío = el mismo que Frávega)", "text"],
+    ["oncity_orders_warehouse", "Depósito de pedidos (vacío = el mismo que Frávega)", "text"],
+    ["oncity_seller_code", "Vendedor (vacío = el mismo que Frávega)", "text"],
+  ]],
   ["Facturas", [
-    ["invoices_add_prefix", "Agregar prefijo al Nro de orden", "bool"],
+    ["invoices_match_importe", "Usar también el importe para matchear facturas", "bool"],
+    ["invoices_tolerancia_importe", "Diferencia máxima de importe aceptada ($)", "text"],
+    ["invoices_add_prefix", "Agregar prefijo al Nro de orden (Frávega)", "bool"],
     ["invoices_prefix", "Prefijo", "text"],
     ["invoices_estado_objetivo", "Estado de facturación a matchear (solo modo CSV)", "text"],
   ]],
