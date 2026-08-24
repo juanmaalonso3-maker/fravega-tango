@@ -28,8 +28,48 @@ var INITIAL_CREDENTIALS = {
   // app de preparación de pedidos del depósito.
   VTEX_ACCOUNT: 'kenta993',
   VTEX_APP_KEY: 'vtexappkey-kenta993-ZVANCF',
-  VTEX_APP_TOKEN: 'PPUAHFRMQHAHDCSTDANVNXOPAMMOQBZXXVCGOQGPDQBDYQFRIVRXRSOQRINKZZFHBVWZTINNOCZSNLTZJTNUDJJOFPWBZUKABGRTRRSHSLRFFGFZOKKXMQYSJTZUBPEC'
+  VTEX_APP_TOKEN: 'PPUAHFRMQHAHDCSTDANVNXOPAMMOQBZXXVCGOQGPDQBDYQFRIVRXRSOQRINKZZFHBVWZTINNOCZSNLTZJTNUDJJOFPWBZUKABGRTRRSHSLRFFGFZOKKXMQYSJTZUBPEC',
+  // Frávega también corre sobre VTEX: los pedidos NO salen del Seller Center
+  // (esa API nos devolvía 401) sino de la Orders API de VTEX, con estas
+  // credenciales propias. El Seller Center se sigue usando para el stock.
+  // El nombre de cuenta sale del propio AppKey: vtexappkey-{cuenta}-XXXXXX.
+  FRAVEGA_VTEX_ACCOUNT: 'fravegasellerprod1380',
+  FRAVEGA_VTEX_APP_KEY: 'vtexappkey-fravegasellerprod1380-UETFEE',
+  FRAVEGA_VTEX_APP_TOKEN: 'IRNRUTGGUCUGSLHTRONNXBBBURFFHVIAKVXGLXIBCMNENIHCZJPBYDXTIDRMADTJIHWRTEJSGSUEQFHYQNOVECIIUZDLUCUTKOAPTTJHIDOMDHHHGFIHFEODMCUCYCQB'
 };
+
+/**
+ * Los dos marketplaces corren sobre VTEX, cada uno con su cuenta y su
+ * configuración. Todo el módulo de pedidos trabaja con este descriptor, así
+ * que agregar un tercer canal mañana es agregar una entrada acá.
+ *
+ *   props     → dónde están las credenciales en Script Properties
+ *   prefijo   → prefijo de sus claves en la hoja Config
+ *   relRef    → columna de RelacionesSKU que matchea el refId de sus pedidos
+ *   relId     → columna con el id interno de VTEX (si la hay)
+ */
+var CANALES = {
+  fravega: {
+    nombre: 'Frávega',
+    props: { account: 'FRAVEGA_VTEX_ACCOUNT', key: 'FRAVEGA_VTEX_APP_KEY', token: 'FRAVEGA_VTEX_APP_TOKEN' },
+    prefijo: 'fvtex_',
+    relRef: 'refid',
+    relId: ''
+  },
+  oncity: {
+    nombre: 'OnCity',
+    props: { account: 'VTEX_ACCOUNT', key: 'VTEX_APP_KEY', token: 'VTEX_APP_TOKEN' },
+    prefijo: 'oncity_',
+    relRef: 'oncity_refid',
+    relId: 'oncity_sku_id'
+  }
+};
+
+function _canal(nombre) {
+  var c = CANALES[String(nombre || '').toLowerCase()];
+  if (!c) throw new Error('Canal desconocido: ' + nombre);
+  return c;
+}
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -105,11 +145,24 @@ var DEFAULT_CONFIG = [
   ['oncity_max_detalle', '120', 'Máximo de detalles por ejecución'],
   ['oncity_precio_divisor', '100', 'VTEX devuelve centavos: dividir por 100'],
   ['oncity_facturar_envio', '0', 'Sumar el costo de envío al total'],
+  ['oncity_espera_min', '0', 'Minutos de antigüedad mínima del pedido (OnCity no lo necesita)'],
+  ['oncity_id_field', 'auto', 'Nro de Orden: auto | orderId | marketplaceOrderId'],
   ['oncity_sale_condition', '01', 'Condición de venta de Tango para OnCity'],
   ['oncity_counterfoil', '', 'Talonario de pedido para OnCity (vacío = el mismo que Frávega)'],
   ['oncity_invoice_counterfoil', '', 'Talonario de factura para OnCity (vacío = el mismo que Frávega)'],
   ['oncity_orders_warehouse', '', 'Depósito de pedidos para OnCity (vacío = el mismo que Frávega)'],
   ['oncity_seller_code', '', 'Vendedor para OnCity (vacío = el mismo que Frávega)'],
+  // ── Pedidos de Frávega por VTEX (reemplaza al Seller Center, que da 401) ──
+  ['fvtex_estados', 'ready-for-handling', 'Estados de VTEX a importar (separados por coma)'],
+  ['fvtex_desde_fecha', '', 'No traer pedidos anteriores a esta fecha (aaaa-mm-dd)'],
+  ['fvtex_dias_atras', '30', 'Ventana de búsqueda hacia atrás (días)'],
+  ['fvtex_page_size', '50', 'Pedidos por página de VTEX'],
+  ['fvtex_orders_pause_ms', '300', 'Pausa entre consultas de detalle (ms)'],
+  ['fvtex_max_detalle', '120', 'Máximo de detalles por ejecución'],
+  ['fvtex_precio_divisor', '100', 'VTEX devuelve centavos: dividir por 100'],
+  ['fvtex_facturar_envio', '0', 'Sumar el costo de envío al total (0 con Frávega Envíos)'],
+  ['fvtex_espera_min', '90', 'Minutos de antigüedad mínima del pedido (Envío Pack necesita 90)'],
+  ['fvtex_id_field', 'auto', 'Nro de Orden: auto | orderId | marketplaceOrderId'],
   ['invoices_match_importe', '1', 'Usar también el importe para matchear facturas'],
   ['invoices_tolerancia_importe', '1', 'Diferencia máxima de importe aceptada (en pesos)'],
   ['invoices_origen', 'historial', 'De dónde salen las órdenes a facturar: historial | csv'],
@@ -268,9 +321,10 @@ function doPost(e) {
       case 'invoices.fromHistory': out = apiInvoicesFromHistory(user, p.facturas); break;
       case 'invoices.history':   out = _readRows(SH.INVOICES, 50).reverse(); break;
       // ── OnCity (VTEX) ──
-      case 'oncity.orders.preview': out = apiOncityOrdersPreview(user, p); break;
-      case 'oncity.orders.send':    out = apiOncityOrdersSend(user, p); break;
-      case 'oncity.invoices':       out = apiOncityInvoices(user, p); break;
+      case 'vtex.orders.preview': out = apiVtexOrdersPreview(user, p); break;
+      case 'vtex.orders.send':    out = apiVtexOrdersSend(user, p); break;
+      case 'vtex.test':           out = apiVtexTest(p.canal); break;
+      case 'oncity.invoices':     out = apiOncityInvoices(user, p); break;
       case 'skus.list':          out = apiSkusList(p.q || ''); break;
       case 'skus.save':          out = apiSkusSave(user, p); break;
       case 'skus.delete':        out = apiSkusDelete(user, p.sku_tango); break;
@@ -1565,70 +1619,105 @@ function apiOrdersApiTest() {
   return out;
 }
 
-/* ═══════════════ MÓDULO ÓRDENES DE ONCITY (VTEX OMS) ═══════════════
- * Misma idea que Frávega, contra la API de pedidos de VTEX.
+/* ═══════════════ MÓDULO PEDIDOS POR VTEX (Frávega y OnCity) ═══════════════
+ * Los dos marketplaces corren sobre VTEX, así que comparten todo el módulo.
+ * Cambia la cuenta, las credenciales y la configuración de Tango; la mecánica
+ * es idéntica:
  *
  *   1. GET /api/oms/pvt/orders?f_status=ready-for-handling → los pedidos
- *      "Listo para preparación", que son los que muestra el panel de Carga
- *      Masiva de OnCity.
+ *      listos para preparar, que son los que hay que facturar.
  *   2. GET /api/oms/pvt/orders/{orderId} → el detalle con cliente, domicilio
  *      e ítems.
  *   3. Se arma el payload de Tango y se manda por el /order/batch de siempre.
  *
- * DIFERENCIAS CON FRÁVEGA, verificadas contra pedidos reales:
- *   · VTEX devuelve los importes en CENTAVOS (2137036 = $21.370,36). Se
- *     dividen por oncity_precio_divisor.
- *   · El orderId (RMS-1655781718593-01) es exactamente la columna A de la
- *     plantilla de Carga Masiva, así que sirve de clave para facturar.
- *   · Viene el DNI sin enmascarar y también el teléfono, que Frávega no da.
- *   · No hace falta esperar como con Envío Pack: OnCity ya asigna la
- *     transportadora antes de poner el pedido en este estado.
+ * COSAS DE VTEX QUE HAY QUE TENER EN CUENTA, verificadas contra pedidos reales
+ * de OnCity:
+ *   · Los importes vienen en CENTAVOS (2137036 = $21.370,36).
+ *   · El orderId (RMS-1655781718593-01) es el mismo texto que usa la plantilla
+ *     de facturación, así que sirve como clave para cerrar el circuito.
+ *   · Viene el DNI sin enmascarar y también el teléfono.
+ *   · El orderId tiene demasiados dígitos para el PaymentID de Tango: se usa
+ *     "sequence", que es un entero corto y único.
+ *
+ * IMPORTANTE (documentación de Frávega): los sellers con Frávega Envíos NO
+ * deben ejecutar "start-handling" por API, porque eso lo hace solo el backoffice
+ * de Frávega Envíos al procesar el pedido. Este módulo solo LEE pedidos, nunca
+ * cambia su estado, así que no interfiere con ese circuito.
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/** Config de Tango para OnCity, con los valores de Frávega como respaldo. */
-function _cfgOncity(cfg) {
+/** Lee una clave de config del canal, con respaldo en la clave general. */
+function _cfgCanalVal(cfg, canal, clave, respaldo) {
+  var c = _canal(canal);
+  var v = cfg[c.prefijo + clave];
+  if (v !== undefined && String(v).trim() !== '') return String(v).trim();
+  return respaldo === undefined ? '' : respaldo;
+}
+
+/** Config de Tango para un canal, con los valores generales como respaldo. */
+function _cfgCanal(cfg, canal) {
   return {
-    orders_counterfoil: cfg.oncity_counterfoil || cfg.orders_counterfoil,
-    orders_invoice_counterfoil: cfg.oncity_invoice_counterfoil || cfg.orders_invoice_counterfoil,
-    orders_warehouse_code: cfg.oncity_orders_warehouse || cfg.orders_warehouse_code,
-    orders_seller_code: cfg.oncity_seller_code || cfg.orders_seller_code,
-    orders_sale_condition: cfg.oncity_sale_condition || cfg.orders_sale_condition,
+    canal: canal,
+    nombre: _canal(canal).nombre,
+    orders_counterfoil: _cfgCanalVal(cfg, canal, 'counterfoil', cfg.orders_counterfoil),
+    orders_invoice_counterfoil: _cfgCanalVal(cfg, canal, 'invoice_counterfoil', cfg.orders_invoice_counterfoil),
+    orders_warehouse_code: _cfgCanalVal(cfg, canal, 'orders_warehouse', cfg.orders_warehouse_code),
+    orders_seller_code: _cfgCanalVal(cfg, canal, 'seller_code', cfg.orders_seller_code),
+    orders_sale_condition: _cfgCanalVal(cfg, canal, 'sale_condition', cfg.orders_sale_condition),
     orders_iva_category: cfg.orders_iva_category,
     orders_document_type: cfg.orders_document_type,
     orders_payment_method: cfg.orders_payment_method,
-    divisor: parseFloat(cfg.oncity_precio_divisor || '100') || 100,
-    facturar_envio: cfg.oncity_facturar_envio === '1'
+    divisor: parseFloat(_cfgCanalVal(cfg, canal, 'precio_divisor', '100')) || 100,
+    facturar_envio: _cfgCanalVal(cfg, canal, 'facturar_envio', '0') === '1',
+    estados: String(_cfgCanalVal(cfg, canal, 'estados', 'ready-for-handling'))
+      .split(',').map(function (s) { return s.trim(); }).filter(String),
+    desde_fecha: _cfgCanalVal(cfg, canal, 'desde_fecha', ''),
+    dias_atras: parseInt(_cfgCanalVal(cfg, canal, 'dias_atras', '60'), 10) || 60,
+    page_size: Math.min(100, parseInt(_cfgCanalVal(cfg, canal, 'page_size', '50'), 10) || 50),
+    pausa: Math.max(0, parseInt(_cfgCanalVal(cfg, canal, 'orders_pause_ms', '300'), 10) || 0),
+    max_detalle: parseInt(_cfgCanalVal(cfg, canal, 'max_detalle', '120'), 10) || 120,
+    espera_min: Math.max(0, parseInt(_cfgCanalVal(cfg, canal, 'espera_min', '0'), 10) || 0),
+    id_field: _cfgCanalVal(cfg, canal, 'id_field', 'auto')
   };
 }
 
-/** Una página de pedidos de VTEX para un estado puntual. */
-function vtexOrdersPage(estado, pagina, cfg) {
-  var perPage = parseInt(cfg.oncity_page_size || '50', 10) || 50;
-  if (perPage > 100) perPage = 100;
+/** Índices de RelacionesSKU para traducir lo que viene en el pedido. */
+function _indiceSkuCanal(canal, rels) {
+  var c = _canal(canal);
+  var porRef = {}, porSkuId = {};
+  Object.keys(rels).forEach(function (s) {
+    var ref = rels[s][c.relRef];
+    if (ref) porRef[String(ref)] = s;
+    if (c.relId && rels[s][c.relId]) porSkuId[String(rels[s][c.relId])] = s;
+  });
+  return { porRef: porRef, porSkuId: porSkuId };
+}
 
+/** Una página de pedidos de VTEX para un estado puntual. */
+function vtexOrdersPage(canal, estado, pagina, c) {
   var desde;
-  if (cfg.oncity_desde_fecha) {
-    desde = new Date(String(cfg.oncity_desde_fecha) + 'T00:00:00Z');
+  if (c.desde_fecha) {
+    desde = new Date(String(c.desde_fecha) + 'T00:00:00Z');
     if (isNaN(desde.getTime())) desde = null;
   }
-  if (!desde) {
-    var dias = parseInt(cfg.oncity_dias_atras || '60', 10) || 60;
-    desde = new Date(Date.now() - dias * 86400000);
-  }
+  if (!desde) desde = new Date(Date.now() - c.dias_atras * 86400000);
 
-  var path = '/api/oms/pvt/orders?per_page=' + perPage + '&page=' + pagina +
+  // La espera (Envío Pack) se aplica como tope superior de la fecha de compra.
+  var hasta = new Date(Date.now() - c.espera_min * 60 * 1000);
+
+  var path = '/api/oms/pvt/orders?per_page=' + c.page_size + '&page=' + pagina +
              '&orderBy=creationDate,desc' +
              '&f_status=' + encodeURIComponent(estado) +
              '&f_creationDate=' + encodeURIComponent(
-               'creationDate:[' + _isoUtc(desde) + ' TO ' + _isoUtc(new Date()) + ']');
+               'creationDate:[' + _isoUtc(desde) + ' TO ' + _isoUtc(hasta) + ']');
 
-  var r = _vtexFetch(path);
+  var r = _vtexFetch(path, null, canal);
   var code = r.getResponseCode();
   if (code !== 200) {
     if (code === 401 || code === 403) {
-      throw new Error('VTEX rechazó la lectura de pedidos (HTTP ' + code + '). La AppKey ' +
-        'necesita permiso sobre OMS: en el admin de VTEX, Account Settings → Roles, ' +
-        'agregarle "OMS full access" al rol de la AppKey.');
+      throw new Error('VTEX (' + _canal(canal).nombre + ') rechazó la lectura de pedidos ' +
+        '(HTTP ' + code + '). La AppKey necesita permiso sobre OMS: en el admin de VTEX, ' +
+        'Account Settings → Roles, agregarle "OMS full access" al rol de la AppKey. ' +
+        'Si la cuenta la administra el marketplace, hay que pedírselo a ellos.');
     }
     throw new Error('VTEX /oms/orders HTTP ' + code + ': ' + r.getContentText().slice(0, 250));
   }
@@ -1636,8 +1725,8 @@ function vtexOrdersPage(estado, pagina, cfg) {
 }
 
 /** Detalle completo de un pedido de VTEX. */
-function vtexOrderDetail(orderId) {
-  var r = _vtexFetch('/api/oms/pvt/orders/' + encodeURIComponent(orderId));
+function vtexOrderDetail(canal, orderId) {
+  var r = _vtexFetch('/api/oms/pvt/orders/' + encodeURIComponent(orderId), null, canal);
   if (r.getResponseCode() !== 200) {
     throw new Error('VTEX detalle ' + orderId + ' HTTP ' + r.getResponseCode() + ': ' +
                     r.getContentText().slice(0, 200));
@@ -1646,17 +1735,35 @@ function vtexOrderDetail(orderId) {
 }
 
 /**
+ * Decide qué identificador usar como Nro de Orden en Tango.
+ * VTEX da dos: orderId (RMS-1655781718593-01) y marketplaceOrderId
+ * (1655781718593-01). Si ya hay pedidos cargados, se fija cuál de los dos
+ * aparece en OrdenesEnviadas y usa ese, para no duplicar nada.
+ */
+function _elegirIdVtex(lista, c) {
+  if (c.id_field === 'orderId' || c.id_field === 'marketplaceOrderId') return c.id_field;
+  var sent = _sentIds();
+  var hitsOrder = 0, hitsMkp = 0;
+  lista.forEach(function (o) {
+    if (o.orderId && sent[String(o.orderId)]) hitsOrder++;
+    if (o.marketplaceOrderId && sent[String(o.marketplaceOrderId)]) hitsMkp++;
+  });
+  if (hitsMkp > hitsOrder) return 'marketplaceOrderId';
+  return 'orderId';
+}
+
+/**
  * Payload de Tango a partir de un pedido de VTEX.
  * Devuelve [orden, skusSinRelacion, registro].
  */
-function _buildOrderFromVtex(d, porRef, porSkuId, rels, c) {
+function _buildOrderFromVtex(d, idOrden, idx, rels, c) {
   var div = c.divisor;
   var items = [], unmapped = [], totalItems = 0, resumen = [];
 
   (d.items || []).forEach(function (it) {
     var ref = String(it.refId || '').trim();
     var skuId = String(it.id || '').trim();
-    var tango = porRef[ref] || porSkuId[skuId] || (rels[ref] ? ref : '');
+    var tango = idx.porRef[ref] || idx.porSkuId[skuId] || (rels[ref] ? ref : '');
     if (!tango) { unmapped.push(ref || skuId || '(sin refId)'); return; }
 
     var cant = Number(it.quantity) || 1;
@@ -1714,11 +1821,11 @@ function _buildOrderFromVtex(d, porRef, porSkuId, rels, c) {
   var prov = _provinceCode(_primero(ad.state));
   var cp = _primero(ad.postalCode);
 
-  // El orderId de OnCity (RMS-1655781718593-01) tiene demasiados dígitos para
-  // el PaymentID de Tango. Usamos "sequence", que es un entero corto y único.
+  // El orderId tiene demasiados dígitos para el PaymentID de Tango (entero).
+  // "sequence" es un número corto y único por pedido.
   var pagoId = parseInt(_primero(d.sequence).replace(/\D/g, ''), 10);
   if (!pagoId || pagoId > 2000000000) {
-    var dg = String(d.orderId || '').replace(/\D/g, '');
+    var dg = String(idOrden).replace(/\D/g, '');
     pagoId = dg ? parseInt(dg.slice(-9), 10) : 1;
   }
 
@@ -1728,7 +1835,7 @@ function _buildOrderFromVtex(d, porRef, porSkuId, rels, c) {
     : _fechaTango(d.creationDate);
 
   var orden = {
-    OrderID: String(d.orderId), OrderNumber: String(d.orderId),
+    OrderID: String(idOrden), OrderNumber: String(idOrden),
     OrderCounterfoil: parseInt(c.orders_counterfoil, 10),
     InvoiceCounterfoil: parseInt(c.orders_invoice_counterfoil, 10),
     Date: fechaTango,
@@ -1742,8 +1849,8 @@ function _buildOrderFromVtex(d, porRef, porSkuId, rels, c) {
       DocumentType: c.orders_document_type,
       DocumentNumber: doc,
       IVACategoryCode: c.orders_iva_category,
-      User: String(d.orderId),
-      Email: email || (String(d.orderId) + '@oncity.com'),
+      User: String(idOrden),
+      Email: email || (String(idOrden) + '@marketplace.com'),
       FirstName: nombre, LastName: apellido, BusinessName: _primero(cli.corporateName),
       Street: calle, HouseNumber: nro, Floor: '', Apartment: compl,
       City: ciudad, ProvinceCode: prov, PostalCode: cp,
@@ -1762,7 +1869,7 @@ function _buildOrderFromVtex(d, porRef, porSkuId, rels, c) {
 
   var li = (sh.logisticsInfo || [])[0] || {};
   var registro = {
-    order_id: String(d.orderId),
+    order_id: String(idOrden),
     suborder_id: _primero(d.marketplaceOrderId),
     fecha_compra: ms ? Utilities.formatDate(new Date(ms), TZ_AR, 'yyyy-MM-dd HH:mm:ss') : '',
     cliente: (nombre + ' ' + apellido).trim(),
@@ -1772,7 +1879,7 @@ function _buildOrderFromVtex(d, porRef, porSkuId, rels, c) {
     total: total,
     items: resumen.join(' · '),
     origen: 'api',
-    canal: 'oncity',
+    canal: c.canal,
     aviso: aviso,
     transportadora: _primero(li.deliveryCompany)
   };
@@ -1780,76 +1887,69 @@ function _buildOrderFromVtex(d, porRef, porSkuId, rels, c) {
   return [orden, [], registro];
 }
 
-/** Trae los pedidos de OnCity y los deja listos para mandar a Tango. */
-function apiOncityOrdersPreview(user, p) {
+/** Trae los pedidos de un canal y los deja listos para mandar a Tango. */
+function apiVtexOrdersPreview(user, p) {
   p = p || {};
+  var canal = String(p.canal || 'oncity').toLowerCase();
   var cfg = _configMap();
-  var c = _cfgOncity(cfg);
+  var c = _cfgCanal(cfg, canal);
   var t0 = Date.now();
 
-  var estados = String(cfg.oncity_estados || 'ready-for-handling')
-    .split(',').map(function (s) { return s.trim(); }).filter(String);
-
   var rels = _skuRelations();
-  var porRef = {}, porSkuId = {};
-  Object.keys(rels).forEach(function (s) {
-    if (rels[s].oncity_refid) porRef[rels[s].oncity_refid] = s;
-    if (rels[s].oncity_sku_id) porSkuId[rels[s].oncity_sku_id] = s;
-  });
+  var idx = _indiceSkuCanal(canal, rels);
   var sent = _sentIds();
-
-  var pausa = parseInt(cfg.oncity_orders_pause_ms || '300', 10);
-  if (isNaN(pausa) || pausa < 0) pausa = 300;
-  var maxDet = parseInt(cfg.oncity_max_detalle || '120', 10) || 120;
 
   var orders = [], registros = {}, nuevas = [],
       saltadas = [], excluidas = [], fallidas = [];
-  var detalles = 0, truncada = false, totalListados = 0;
+  var detalles = 0, truncada = false, totalListados = 0, campoId = '';
 
-  for (var e = 0; e < estados.length && !truncada; e++) {
+  for (var e = 0; e < c.estados.length && !truncada; e++) {
     var pagina = 1, paginas = 1;
     while (pagina <= paginas && !truncada) {
-      var body = vtexOrdersPage(estados[e], pagina, cfg);
-      var paging = body.paging || {};
-      paginas = Number(paging.pages || 1);
+      var body = vtexOrdersPage(canal, c.estados[e], pagina, c);
+      paginas = Number((body.paging || {}).pages || 1);
       var lista = body.list || [];
       totalListados += lista.length;
       if (!lista.length) break;
+      if (!campoId) campoId = _elegirIdVtex(lista, c);
 
       for (var i = 0; i < lista.length; i++) {
-        var oid = String(lista[i].orderId || '');
-        if (!oid) continue;
-        if (sent[oid]) { saltadas.push(oid); continue; }
+        var it = lista[i];
+        var idOrden = String((campoId === 'marketplaceOrderId'
+          ? (it.marketplaceOrderId || it.orderId)
+          : (it.orderId || it.marketplaceOrderId)) || '');
+        if (!idOrden) continue;
+        if (sent[idOrden]) { saltadas.push(idOrden); continue; }
 
-        if (detalles >= maxDet || (Date.now() - t0) > 4.5 * 60 * 1000) {
+        if (detalles >= c.max_detalle || (Date.now() - t0) > 4.5 * 60 * 1000) {
           truncada = true; break;
         }
 
         var d;
-        try { d = vtexOrderDetail(oid); detalles++; }
-        catch (err) { fallidas.push({ orden: oid, error: err.message }); continue; }
-        if (pausa) Utilities.sleep(pausa);
+        try { d = vtexOrderDetail(canal, it.orderId); detalles++; }
+        catch (err) { fallidas.push({ orden: idOrden, error: err.message }); continue; }
+        if (c.pausa) Utilities.sleep(c.pausa);
 
-        var res = _buildOrderFromVtex(d, porRef, porSkuId, rels, c);
+        var res = _buildOrderFromVtex(d, idOrden, idx, rels, c);
         if (res[1].length) {
           res[1].forEach(function (sku) {
-            _pendingAdd(sku, 'OnCity', 'Detectado en el pedido ' + oid + ' sin relación');
+            _pendingAdd(sku, c.nombre, 'Detectado en el pedido ' + idOrden + ' sin relación');
           });
-          excluidas.push({ orden: oid, skus_sin_relacion: res[1] });
+          excluidas.push({ orden: idOrden, skus_sin_relacion: res[1] });
           continue;
         }
 
         orders.push(res[0]);
-        registros[oid] = res[2];
+        registros[idOrden] = res[2];
         nuevas.push({
-          orden: oid,
+          orden: idOrden,
           cliente: res[2].cliente,
           documento: res[2].documento,
           fecha: res[2].fecha_compra,
           items: res[0].OrderItems.length,
           total: res[0].Total,
           transportadora: res[2].transportadora,
-          estado: String(lista[i].status || ''),
+          estado: String(it.status || ''),
           aviso: res[2].aviso
         });
       }
@@ -1857,26 +1957,29 @@ function apiOncityOrdersPreview(user, p) {
     }
   }
 
-  log_(user.email, 'ordenes', 'Pedidos leídos de OnCity (VTEX)', 'info',
-       'estados=' + estados.join('+') + ' listados=' + totalListados +
+  log_(user.email, 'ordenes', 'Pedidos leídos de ' + c.nombre + ' (VTEX)', 'info',
+       'estados=' + c.estados.join('+') + ' listados=' + totalListados +
        ' nuevas=' + nuevas.length + ' saltadas=' + saltadas.length +
-       ' excluidas=' + excluidas.length + ' fallidas=' + fallidas.length,
-       Date.now() - t0);
+       ' excluidas=' + excluidas.length + ' fallidas=' + fallidas.length +
+       ' campo_id=' + campoId, Date.now() - t0);
 
   return {
-    estados: estados, listados: totalListados,
+    canal: canal, nombre: c.nombre,
+    estados: c.estados, listados: totalListados, campo_id: campoId || c.id_field,
     orders: orders, registros: registros,
     nuevas: nuevas, saltadas: saltadas,
     excluidas: excluidas, fallidas: fallidas,
     truncada: truncada,
     condicion_venta: c.orders_sale_condition,
-    talonario: c.orders_counterfoil
+    talonario: c.orders_counterfoil,
+    espera_min: c.espera_min
   };
 }
 
-/** Manda a Tango los pedidos de OnCity ya armados. */
-function apiOncityOrdersSend(user, p) {
+/** Manda a Tango los pedidos ya armados de un canal. */
+function apiVtexOrdersSend(user, p) {
   p = p || {};
+  var canal = String(p.canal || 'oncity').toLowerCase();
   var orders = p.orders || [];
   var registros = p.registros || {};
   if (!orders.length) return { enviadas: [], rechazadas: [] };
@@ -1891,7 +1994,72 @@ function apiOncityOrdersSend(user, p) {
       return { orden: o.OrderID, error: 'Ya figuraba en OrdenesEnviadas; no se reenvió' };
     }) };
   }
-  return _sendOrders(pendientes, user, p.archivo || 'API OnCity', null, registros);
+  return _sendOrders(pendientes, user, p.archivo || ('API ' + _canal(canal).nombre),
+                     null, registros);
+}
+
+/**
+ * Prueba de conexión de un canal, para correr desde la pantalla de Órdenes.
+ * No manda nada a Tango: consulta, muestra una muestra y verifica el mapeo.
+ */
+function apiVtexTest(canal) {
+  canal = String(canal || 'oncity').toLowerCase();
+  var cfg = _configMap();
+  var c = _cfgCanal(cfg, canal);
+  var out = { canal: canal, nombre: c.nombre, ok: false, mensaje: '',
+              cuenta: _prop(_canal(canal).props.account),
+              condicion_venta: c.orders_sale_condition,
+              estados: c.estados, muestra: [], detalle_ok: false };
+
+  var body;
+  try { body = vtexOrdersPage(canal, c.estados[0], 1, c); }
+  catch (e) { out.mensaje = e.message; return out; }
+
+  var lista = body.list || [];
+  out.ok = true;
+  out.total = Number((body.paging || {}).total || lista.length);
+  out.paginas = Number((body.paging || {}).pages || 1);
+  out.campo_id = _elegirIdVtex(lista, c);
+  out.mensaje = 'Conexión OK · ' + out.total + ' pedido(s) en ' + c.estados[0];
+
+  if (!lista.length) {
+    out.mensaje += ' — no hay nada pendiente en la ventana configurada';
+    return out;
+  }
+
+  var rels = _skuRelations();
+  var idx = _indiceSkuCanal(canal, rels);
+
+  var d = null;
+  try { d = vtexOrderDetail(canal, lista[0].orderId); out.detalle_ok = true; }
+  catch (e) { out.detalle_error = e.message; }
+
+  lista.slice(0, 5).forEach(function (o) {
+    out.muestra.push({
+      orderId: _primero(o.orderId),
+      marketplaceOrderId: _primero(o.marketplaceOrderId),
+      cliente: _primero(o.clientName),
+      fecha: _primero(o.creationDate),
+      total: (Number(o.totalValue) || 0) / c.divisor,
+      estado: _primero(o.status)
+    });
+  });
+
+  if (d) {
+    var cli = d.clientProfileData || {};
+    var ad = (d.shippingData || {}).address || {};
+    out.comprador = (_primero(cli.firstName) + ' ' + _primero(cli.lastName)).trim() +
+      ' · doc ' + _primero(cli.document) + ' · tel ' + _primero(cli.phone);
+    out.domicilio = _primero(ad.street) + ' ' + _primero(ad.number) + ', ' +
+      _primero(ad.city) + ', ' + _primero(ad.state) + ' CP ' + _primero(ad.postalCode);
+    out.total_detalle = (Number(d.value) || 0) / c.divisor;
+    out.skus = (d.items || []).map(function (it) {
+      var ref = String(it.refId || '');
+      var t = idx.porRef[ref] || idx.porSkuId[String(it.id || '')] || (rels[ref] ? ref : '');
+      return ref + (t ? (t === ref ? ' (= SKU Tango)' : ' → Tango ' + t) : ' ⚠ sin relación');
+    }).join(' · ');
+  }
+  return out;
 }
 
 /* ═══════════════ MÓDULO FACTURAS ═══════════════ */
@@ -2525,7 +2693,9 @@ function apiSettingsGet() {
       fravega_api_token: !!props.getProperty('FRAVEGA_API_TOKEN'),
       google_client_id: !!props.getProperty('GOOGLE_CLIENT_ID'),
       vtex_app_key: !!props.getProperty('VTEX_APP_KEY'),
-      vtex_app_token: !!props.getProperty('VTEX_APP_TOKEN')
+      vtex_app_token: !!props.getProperty('VTEX_APP_TOKEN'),
+      fravega_vtex_key: !!props.getProperty('FRAVEGA_VTEX_APP_KEY'),
+      fravega_vtex_token: !!props.getProperty('FRAVEGA_VTEX_APP_TOKEN')
     },
     proxima_sincronizacion: _proximaSync()
   };
@@ -2833,26 +3003,32 @@ function PROBAR_ONCITY() {
  *   · El stock se escribe contra un depósito (warehouse) puntual de VTEX.
  * ══════════════════════════════════════════════════════════════════════════ */
 
-function _vtexBase() {
-  var acc = _prop('VTEX_ACCOUNT');
-  if (!acc) throw new Error('Falta VTEX_ACCOUNT en Script Properties');
+/* Las tres funciones de abajo aceptan un canal opcional. Si no se pasa nada
+ * usan OnCity, que es como venían funcionando para el stock: así todo el
+ * código que ya existía sigue andando sin tocarlo. */
+
+function _vtexBase(canal) {
+  var c = _canal(canal || 'oncity');
+  var acc = _prop(c.props.account);
+  if (!acc) throw new Error('Falta ' + c.props.account + ' en Script Properties');
   return 'https://' + acc + '.' + VTEX_ENV + '.com.br';
 }
 
-function _vtexHeaders() {
+function _vtexHeaders(canal) {
+  var c = _canal(canal || 'oncity');
   return {
-    'X-VTEX-API-AppKey': _prop('VTEX_APP_KEY'),
-    'X-VTEX-API-AppToken': _prop('VTEX_APP_TOKEN'),
+    'X-VTEX-API-AppKey': _prop(c.props.key),
+    'X-VTEX-API-AppToken': _prop(c.props.token),
     'Accept': 'application/json'
   };
 }
 
-function _vtexFetch(path, opts) {
+function _vtexFetch(path, opts, canal) {
   opts = opts || {};
-  opts.headers = _vtexHeaders();
+  opts.headers = _vtexHeaders(canal);
   opts.muteHttpExceptions = true;
   opts.followRedirects = true;
-  return UrlFetchApp.fetch(_vtexBase() + path, opts);
+  return UrlFetchApp.fetch(_vtexBase(canal) + path, opts);
 }
 
 function vtexPing() {
@@ -3171,6 +3347,13 @@ function MIGRAR_ORDENES_API() {
       if (existentes.indexOf(row[0]) === -1) cfg.appendRow(row);
     });
   }
+
+  // 3. Credenciales de VTEX (las dos cuentas) → Script Properties
+  var props = PropertiesService.getScriptProperties();
+  ['FRAVEGA_VTEX_ACCOUNT', 'FRAVEGA_VTEX_APP_KEY', 'FRAVEGA_VTEX_APP_TOKEN',
+   'VTEX_ACCOUNT', 'VTEX_APP_KEY', 'VTEX_APP_TOKEN'].forEach(function (k) {
+    if (INITIAL_CREDENTIALS[k]) props.setProperty(k, INITIAL_CREDENTIALS[k]);
+  });
 
   log_('sistema', 'sistema', 'Migración de órdenes por API aplicada', 'ok', '');
   return 'Listo. OrdenesEnviadas quedó con las columnas nuevas y la configuración ' +

@@ -421,24 +421,26 @@ function verDetalleSync(jsonStr) {
 
 /* ══════════════ ÓRDENES ══════════════ */
 let ORDENES_ROWS = null, ORDENES_ARCHIVO = "", ORDENES_ANALISIS = null, ORDENES_COMPLETAS = [];
-// Resultado acumulado de la búsqueda por API (todas las páginas juntas)
-let API_ORDENES = null;
-let ORDENES_MODO = localStorage.getItem("tf_ordenes_modo") || "api";
+let ORDENES_MODO = localStorage.getItem("tf_ordenes_modo") || "fravega";
+
+// Los dos marketplaces corren sobre VTEX y comparten todo el flujo: solo
+// cambia el canal que se le manda al backend.
+const CANALES_UI = {
+  fravega: { nombre: "Frávega", icono: "🔵" },
+  oncity:  { nombre: "OnCity",  icono: "🏬" },
+};
+let VTEX_ORDENES = null;   // resultado de la última búsqueda
 
 function viewOrdenes() {
-  // Pintamos la sección PRIMERO y sin await, así el input de archivo nunca se
-  // destruye por una llamada async que llega después.
   const tab = (id, txt) => `<button onclick="cambiarModoOrdenes('${id}')"
     class="px-4 py-2 text-sm rounded-lg ${ORDENES_MODO === id
       ? "bg-violet-700 text-white font-medium" : "border bg-white text-gray-600"}">${txt}</button>`;
 
-  const bloque = ORDENES_MODO === "oncity" ? bloqueOrdenesOncity()
-               : ORDENES_MODO === "csv" ? bloqueOrdenesCsv()
-               : bloqueOrdenesApi();
+  const bloque = ORDENES_MODO === "csv" ? bloqueOrdenesCsv() : bloqueOrdenesVtex(ORDENES_MODO);
 
   setMain(H("Ingreso de Órdenes") + `
     <div class="flex gap-2 mb-4 flex-wrap">
-      ${tab("api", "🔌 Frávega (API)")}
+      ${tab("fravega", "🔵 Frávega (API)")}
       ${tab("oncity", "🏬 OnCity (API)")}
       ${tab("csv", "📄 Frávega por CSV")}
     </div>
@@ -451,55 +453,67 @@ function viewOrdenes() {
 function cambiarModoOrdenes(modo) {
   ORDENES_MODO = modo;
   localStorage.setItem("tf_ordenes_modo", modo);
-  API_ORDENES = null;
-  ONCITY_ORDENES = null;
+  VTEX_ORDENES = null;
   viewOrdenes();
 }
 
-/* ══════════════ ÓRDENES · ONCITY (VTEX) ══════════════ */
-let ONCITY_ORDENES = null;
+/* ── Flujo por API de VTEX, común a los dos marketplaces ────────────── */
 
-function bloqueOrdenesOncity() {
+function bloqueOrdenesVtex(canal) {
+  const n = CANALES_UI[canal].nombre;
+  const esFravega = canal === "fravega";
   return card(`
     <div class="text-sm text-gray-600 mb-3">
-      Trae los pedidos de OnCity en estado <b>"Listo para preparación"</b> directamente de la
-      API de VTEX — los mismos que ves en <i>Pedidos → Carga Masiva Facturas y datos envíos</i>.
-      <div class="mt-2 text-xs bg-violet-50 border border-violet-200 text-violet-900 rounded-lg px-3 py-2">
-        Los pedidos de OnCity entran a Tango con su propia <b>condición de venta</b> (configurable
-        en Configuración), para que queden distinguibles de los de Frávega. Los importes de VTEX
-        vienen en centavos y se dividen por 100 automáticamente.
-      </div>
+      Trae los pedidos de <b>${n}</b> en estado <b>"Listo para preparación"</b> directamente de la
+      API de VTEX. No hace falta descargar ni subir nada.
+      ${esFravega ? `
+        <div class="mt-2 text-xs bg-violet-50 border border-violet-200 text-violet-900 rounded-lg px-3 py-2">
+          Los pedidos de Frávega salen de la <b>Orders API de VTEX</b>, no del Seller Center.
+          El Seller Center se sigue usando para el stock, que funciona bien.
+        </div>
+        <div class="mt-2 text-xs bg-amber-50 border border-amber-200 text-amber-900 rounded-lg px-3 py-2">
+          ⏱️ <b>Envío Pack:</b> solo se traen pedidos con más de 90 minutos (configurable), que es
+          lo que necesita Envío Pack para generar el envío. Esta app <b>nunca ejecuta
+          "start-handling"</b>: según la documentación de Frávega, eso lo hace solo el backoffice
+          de Frávega Envíos al procesar el pedido.
+        </div>` : `
+        <div class="mt-2 text-xs bg-violet-50 border border-violet-200 text-violet-900 rounded-lg px-3 py-2">
+          Los pedidos de OnCity entran a Tango con su propia <b>condición de venta</b>, para que
+          queden distinguibles de los de Frávega.
+        </div>`}
       <div class="mt-2 text-xs bg-amber-50 border border-amber-200 text-amber-900 rounded-lg px-3 py-2">
-        ⚠️ <b>Primera vez:</b> OnCity nunca se cargó por esta app, así que van a aparecer todos
-        los pedidos pendientes, incluidos los que ya hayas facturado a mano en Tango.
-        <b>Destildá esos antes de enviar</b> para no duplicarlos. De la segunda vez en adelante
-        se saltean solos.
+        ⚠️ <b>La primera vez</b> van a aparecer todos los pedidos pendientes, incluidos los que ya
+        hayas facturado a mano en Tango. <b>Destildá esos antes de enviar</b> para no duplicarlos.
+        De la segunda vez en adelante se saltean solos.
       </div>
     </div>
     <div class="flex items-center gap-3 flex-wrap">
-      <button onclick="buscarOrdenesOncity()" class="bg-violet-700 hover:bg-violet-800 text-white px-5 py-2.5 rounded-lg font-medium">
-        1️⃣ Buscar pedidos en OnCity</button>
+      <button onclick="buscarOrdenesVtex('${canal}')"
+        class="bg-violet-700 hover:bg-violet-800 text-white px-5 py-2.5 rounded-lg font-medium">
+        1️⃣ Buscar pedidos en ${n}</button>
+      <button onclick="probarVtex('${canal}')" class="border px-4 py-2.5 rounded-lg text-sm">
+        🔌 Probar conexión</button>
     </div>
     <div id="ordenes-resultado" class="mt-4"></div>`, "mb-4");
 }
 
-async function buscarOrdenesOncity() {
+async function buscarOrdenesVtex(canal) {
   const box = $("ordenes-resultado");
-  box.innerHTML = spinner("Consultando los pedidos de OnCity en VTEX...");
+  box.innerHTML = spinner(`Consultando los pedidos de ${CANALES_UI[canal].nombre} en VTEX...`);
   try {
-    ONCITY_ORDENES = await api("oncity.orders.preview", {});
+    VTEX_ORDENES = await api("vtex.orders.preview", { canal });
   } catch (e) {
-    ONCITY_ORDENES = null;
+    VTEX_ORDENES = null;
     box.innerHTML = `<div class="border border-red-200 bg-red-50 rounded-lg p-4">
       <div class="font-bold text-red-700 mb-1">No se pudieron traer los pedidos</div>
       <div class="text-sm text-red-700">${esc(e.message)}</div></div>`;
     return;
   }
-  pintarOrdenesOncity();
+  pintarOrdenesVtex();
 }
 
-function pintarOrdenesOncity() {
-  const a = ONCITY_ORDENES;
+function pintarOrdenesVtex() {
+  const a = VTEX_ORDENES;
   if (!a) return;
   const money = (n) => "$ " + Number(n).toLocaleString("es-AR",
     { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -507,9 +521,12 @@ function pintarOrdenesOncity() {
   $("ordenes-resultado").innerHTML = `
     <div class="border rounded-lg p-4 bg-gray-50">
       <div class="text-sm mb-2">
-        <b>${a.listados}</b> pedido(s) leídos en estado <code>${esc(a.estados.join(", "))}</code>
-        <span class="text-gray-400">· condición de venta en Tango: <b>${esc(a.condicion_venta)}</b>
-        · talonario ${esc(a.talonario)}</span>
+        <b>${a.listados}</b> pedido(s) leídos de <b>${esc(a.nombre)}</b> en estado
+        <code>${esc(a.estados.join(", "))}</code>
+        <div class="text-xs text-gray-400">Nro de Orden tomado de <code>${esc(a.campo_id)}</code>
+          · condición de venta en Tango: <b>${esc(a.condicion_venta)}</b>
+          · talonario ${esc(a.talonario)}
+          ${a.espera_min ? ` · espera de ${a.espera_min} min` : ""}</div>
       </div>
       <div class="flex gap-4 text-sm mb-3 flex-wrap">
         <span>🆕 Nuevos: <b>${a.nuevas.length}</b></span>
@@ -524,16 +541,16 @@ function pintarOrdenesOncity() {
 
       ${a.nuevas.length ? `
         <div class="flex items-center gap-3 mb-2 text-sm">
-          <button onclick="marcarTodosOncity(true)" class="text-violet-700 underline">Tildar todos</button>
-          <button onclick="marcarTodosOncity(false)" class="text-violet-700 underline">Destildar todos</button>
-          <span id="onc-contador" class="text-gray-500"></span>
+          <button onclick="marcarTodosVtex(true)" class="text-violet-700 underline">Tildar todos</button>
+          <button onclick="marcarTodosVtex(false)" class="text-violet-700 underline">Destildar todos</button>
+          <span id="vtx-contador" class="text-gray-500"></span>
         </div>
         <div class="max-h-96 overflow-y-auto mb-3">
         <table class="data w-full"><thead><tr>
           <th class="w-8"></th><th>Pedido</th><th>Cliente</th><th>DNI</th><th>Fecha</th>
           <th>Ítems</th><th>Total</th><th>Transportadora</th></tr></thead><tbody>
         ${a.nuevas.map((o, i) => `<tr>
-          <td><input type="checkbox" class="onc-chk w-4 h-4" data-i="${i}" checked onchange="contarOncity()"></td>
+          <td><input type="checkbox" class="vtx-chk w-4 h-4" data-i="${i}" checked onchange="contarVtex()"></td>
           <td class="font-mono text-xs">${esc(o.orden)}</td>
           <td>${esc(o.cliente)}</td>
           <td class="font-mono text-xs">${esc(o.documento)}</td>
@@ -552,41 +569,36 @@ function pintarOrdenesOncity() {
         No se pudo leer el detalle de estos pedidos:
         ${a.fallidas.map((x) => `<div>· ${esc(x.orden)}: ${esc(x.error)}</div>`).join("")}</div>` : ""}
 
-      ${a.nuevas.length ? `<button onclick="enviarOrdenesOncity()"
+      ${a.nuevas.length ? `<button onclick="enviarOrdenesVtex()"
         class="bg-green-700 hover:bg-green-800 text-white px-5 py-2.5 rounded-lg font-medium">
         2️⃣ Confirmar y enviar los tildados a Tango</button>` :
         '<div class="text-gray-500 text-sm">No hay pedidos nuevos para enviar.</div>'}
     </div>`;
-  contarOncity();
+  contarVtex();
 }
 
-function marcarTodosOncity(v) {
-  document.querySelectorAll(".onc-chk").forEach((c) => { c.checked = v; });
-  contarOncity();
+function marcarTodosVtex(v) {
+  document.querySelectorAll(".vtx-chk").forEach((c) => { c.checked = v; });
+  contarVtex();
 }
 
-function contarOncity() {
-  const n = document.querySelectorAll(".onc-chk:checked").length;
-  const el = $("onc-contador");
-  if (el) el.textContent = `${n} tildado(s) de ${document.querySelectorAll(".onc-chk").length}`;
+function contarVtex() {
+  const el = $("vtx-contador");
+  if (el) el.textContent = `${document.querySelectorAll(".vtx-chk:checked").length} tildado(s) ` +
+    `de ${document.querySelectorAll(".vtx-chk").length}`;
 }
 
-function indicesOncitySeleccionados() {
-  return Array.from(document.querySelectorAll(".onc-chk:checked"))
-    .map((c) => Number(c.dataset.i));
-}
-
-function enviarOrdenesOncity() {
-  const a = ONCITY_ORDENES;
+function enviarOrdenesVtex() {
+  const a = VTEX_ORDENES;
   if (!a) return;
-  const idx = indicesOncitySeleccionados();
+  const idx = Array.from(document.querySelectorAll(".vtx-chk:checked")).map((c) => Number(c.dataset.i));
   if (!idx.length) return toast("No hay ningún pedido tildado", "warning");
 
   const elegidas = idx.map((i) => a.nuevas[i].orden);
   const orders = a.orders.filter((o) => elegidas.indexOf(o.OrderID) !== -1);
   const total = orders.length;
 
-  confirmar(`Se van a crear ${total} pedido(s) de OnCity en Tango, con condición de venta ` +
+  confirmar(`Se van a crear ${total} pedido(s) de ${a.nombre} en Tango, con condición de venta ` +
             `${a.condicion_venta}. ¿Continuar?`, async () => {
     const TANDA = 25;
     const enviadas = [], rechazadas = [];
@@ -607,7 +619,8 @@ function enviarOrdenesOncity() {
             <div class="bg-violet-700 h-2 rounded-full" style="width:${Math.round(hasta / total * 100)}%"></div></div>
         </div>`;
       try {
-        const r = await api("oncity.orders.send", { orders: lote, registros: regs, archivo: "API OnCity" });
+        const r = await api("vtex.orders.send",
+          { canal: a.canal, orders: lote, registros: regs, archivo: "API " + a.nombre });
         enviadas.push(...r.enviadas);
         rechazadas.push(...r.rechazadas);
       } catch (e) {
@@ -615,12 +628,15 @@ function enviarOrdenesOncity() {
       }
     }
 
+    const linkFactura = a.canal === "oncity"
+      ? 'Exportación de Facturas → OnCity, subí la plantilla del panel y el reporte de Tango'
+      : 'Exportación de Facturas → Frávega, subí solo el reporte de Tango';
+
     box.innerHTML = `
       <div class="border rounded-lg p-4 ${rechazadas.length ? "bg-amber-50" : "bg-green-50"}">
         <div class="font-bold mb-2">✅ Enviados y aceptados por Tango: ${enviadas.length} de ${total}</div>
-        <div class="text-sm text-gray-600 mb-2">Para facturar, andá a
-          <a href="#facturas" class="underline text-violet-700">Exportación de Facturas → OnCity</a>,
-          subí la plantilla que exportás del panel y el reporte de Tango.</div>
+        <div class="text-sm text-gray-600 mb-2">Para facturar: <a href="#facturas"
+          class="underline text-violet-700">${linkFactura}</a>.</div>
         <div class="max-h-40 overflow-y-auto">
           ${enviadas.map((id) => `<span class="inline-block bg-white border rounded px-2 py-0.5 text-xs mr-1 mb-1">${esc(id)}</span>`).join("")}
         </div>
@@ -629,40 +645,65 @@ function enviarOrdenesOncity() {
           ${rechazadas.map((f) => `<div class="text-sm text-red-700">· ${esc(f.orden)}: ${esc(f.error)}</div>`).join("")}
           </div>` : ""}
       </div>`;
-    toast(`${enviadas.length} pedidos de OnCity enviados a Tango`, rechazadas.length ? "warning" : "ok");
+    toast(`${enviadas.length} pedidos de ${a.nombre} enviados a Tango`, rechazadas.length ? "warning" : "ok");
 
     try {
       await api("orders.recordImport", {
-        archivo: "API OnCity", total_filas: a.listados,
+        archivo: "API " + a.nombre, total_filas: a.listados,
         filas_pendientes: a.nuevas.length + a.saltadas.length, nuevas: total,
         enviadas: enviadas, rechazadas: rechazadas,
         excluidas: a.excluidas || [], saltadas: a.saltadas || [],
       });
     } catch (e) { /* el historial es secundario */ }
-    ONCITY_ORDENES = null;
+    VTEX_ORDENES = null;
     cargarHistorialOrdenes();
   });
 }
 
-function bloqueOrdenesApi() {
-  return card(`
-    <div class="text-sm text-gray-600 mb-3">
-      Trae las órdenes <b>cobradas y pendientes de facturación</b> directamente de la API de
-      Frávega. No hace falta descargar ni subir nada.
-      <div class="mt-2 text-xs bg-amber-50 border border-amber-200 text-amber-900 rounded-lg px-3 py-2">
-        ⏱️ <b>Espera de Envío Pack:</b> solo se traen órdenes que ya cumplieron el tiempo mínimo
-        configurado (90 minutos por defecto), que es lo que necesita Envío Pack para generar el
-        envío. Las más nuevas no se pierden: aparecen listadas como "esperando" y entran solas
-        en la próxima búsqueda.
-      </div>
+async function probarVtex(canal) {
+  showModal(`<h3 class="font-bold text-lg mb-3">Probando ${esc(CANALES_UI[canal].nombre)}…</h3>${spinner("Consultando VTEX...")}`);
+  let r;
+  try { r = await api("vtex.test", { canal }); }
+  catch (e) { return showModal(`<h3 class="font-bold text-lg mb-3">Probar conexión</h3>
+    <p class="text-red-600 text-sm">${esc(e.message)}</p>
+    <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`); }
+
+  showModal(`
+    <h3 class="font-bold text-lg mb-3">Probar API de pedidos — ${esc(r.nombre)}</h3>
+    <div class="mb-3 text-sm">${r.ok
+      ? '<span class="text-green-700 font-bold">● Conectado</span>'
+      : '<span class="text-red-600 font-bold">● Sin acceso</span>'} — ${esc(r.mensaje)}</div>
+    <div class="text-sm space-y-1 mb-4">
+      <div>Cuenta de VTEX: <code>${esc(r.cuenta)}</code></div>
+      <div>Estados consultados: <code>${esc((r.estados || []).join(", "))}</code></div>
+      <div>Condición de venta en Tango: <b>${esc(r.condicion_venta)}</b></div>
+      ${r.ok ? `
+        <div>Pedidos pendientes: <b>${r.total}</b> en ${r.paginas} página(s)</div>
+        <div>Nro de Orden tomado de: <code>${esc(r.campo_id)}</code></div>
+        <div>Consulta de detalle: ${r.detalle_ok
+          ? '<span class="text-green-700">funciona</span>'
+          : `<span class="text-red-600">falla</span> — ${esc(r.detalle_error || "")}`}</div>
+        ${r.comprador ? `<div>Comprador de muestra: ${esc(r.comprador)}</div>` : ""}
+        ${r.domicilio ? `<div>Domicilio: ${esc(r.domicilio)}</div>` : ""}
+        ${r.total_detalle !== undefined ? `<div>Total del pedido: <b>$ ${Number(r.total_detalle).toLocaleString("es-AR")}</b> (ya dividido por 100)</div>` : ""}
+        ${r.skus ? `<div>SKUs: <span class="${String(r.skus).indexOf("sin relación") !== -1 ? "text-red-600" : ""}">${esc(r.skus)}</span></div>` : ""}
+      ` : ""}
     </div>
-    <div class="flex items-center gap-3 flex-wrap">
-      <button onclick="buscarOrdenesApi()" class="bg-violet-700 hover:bg-violet-800 text-white px-5 py-2.5 rounded-lg font-medium">
-        1️⃣ Buscar órdenes en Frávega</button>
-      <button onclick="probarApiOrdenes()" class="border px-4 py-2.5 rounded-lg text-sm">🔌 Probar conexión</button>
-    </div>
-    <div id="ordenes-resultado" class="mt-4"></div>`, "mb-4");
+    ${r.muestra && r.muestra.length ? `<div class="text-xs text-gray-500 uppercase mb-1">Muestra de pedidos</div>
+      <table class="data w-full"><thead><tr><th>orderId</th><th>marketplaceOrderId</th><th>Cliente</th><th>Total</th></tr></thead>
+      <tbody>${r.muestra.map((m) => `<tr>
+        <td class="font-mono text-xs">${esc(m.orderId)}</td>
+        <td class="font-mono text-xs">${esc(m.marketplaceOrderId)}</td>
+        <td class="text-xs">${esc(m.cliente)}</td>
+        <td class="text-xs">$ ${Number(m.total).toLocaleString("es-AR")}</td>
+      </tr>`).join("")}</tbody></table>
+      <p class="text-xs text-gray-500 mt-2">Compará estos números con el "Nro de Orden" que usás
+      hoy para facturar. El que coincida es el que hay que dejar en la configuración
+      (<code>${esc(r.canal)}_id_field</code>).</p>` : ""}
+    <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
 }
+
+/* ── Flujo por CSV (Frávega), el de siempre ─────────────────────────── */
 
 function bloqueOrdenesCsv() {
   return card(`
@@ -674,222 +715,6 @@ function bloqueOrdenesCsv() {
       <button onclick="analizarOrdenes()" class="bg-violet-700 text-white px-4 py-2 rounded-lg">1️⃣ Analizar</button>
     </div>
     <div id="ordenes-resultado" class="mt-4"></div>`, "mb-4");
-}
-
-/* ── Búsqueda por API, página por página ────────────────────────────────
- * Cada página es una llamada a Apps Script, así ninguna pasa los 6 minutos
- * de límite. El backend hace una llamada de detalle por orden nueva (con su
- * pausa configurable) porque el listado no trae los domicilios. */
-async function buscarOrdenesApi() {
-  const box = $("ordenes-resultado");
-  box.innerHTML = spinner("Consultando la API de Frávega...");
-
-  const acc = { orders: [], registros: {}, nuevas: [], saltadas: [], excluidas: [],
-                esperando: [], fallidas: [], total: 0, paginas: 1, truncada: false,
-                campo_id: "", espera_min: 90 };
-  let pagina = 1;
-
-  try {
-    while (true) {
-      box.innerHTML = `<div class="border rounded-lg p-4 bg-violet-50">
-        ${spinner(`Leyendo página ${pagina}${acc.paginas > 1 ? " de " + acc.paginas : ""} de Frávega...`)}
-        <div class="text-xs text-gray-600 mt-2">Órdenes nuevas encontradas: ${acc.nuevas.length}
-          ${acc.esperando.length ? ` · esperando el tiempo de envío: ${acc.esperando.length}` : ""}</div>
-        <div class="text-xs text-gray-400 mt-1">Cada orden nueva requiere una consulta de detalle
-          (es la que trae los domicilios), por eso puede tardar.</div>
-      </div>`;
-
-      const r = await api("orders.apiPreview", { pagina });
-      acc.total = r.total; acc.paginas = r.paginas;
-      acc.campo_id = r.campo_id; acc.espera_min = r.espera_min;
-      acc.orders.push(...r.orders);
-      Object.assign(acc.registros, r.registros || {});
-      acc.nuevas.push(...r.nuevas);
-      acc.saltadas.push(...r.saltadas);
-      acc.excluidas.push(...r.excluidas);
-      acc.esperando.push(...r.esperando);
-      acc.fallidas.push(...r.fallidas);
-      if (r.truncada) acc.truncada = true;
-
-      if (r.truncada || pagina >= r.paginas || !r.en_pagina) break;
-      pagina++;
-    }
-  } catch (e) {
-    box.innerHTML = `<div class="border border-red-200 bg-red-50 rounded-lg p-4">
-      <div class="font-bold text-red-700 mb-1">No se pudieron traer las órdenes</div>
-      <div class="text-sm text-red-700">${esc(e.message)}</div></div>`;
-    return;
-  }
-
-  API_ORDENES = acc;
-  pintarOrdenesApi();
-}
-
-function pintarOrdenesApi() {
-  const a = API_ORDENES;
-  if (!a) return;
-  const box = $("ordenes-resultado");
-  const money = (n) => "$ " + Number(n).toLocaleString("es-AR");
-
-  box.innerHTML = `
-    <div class="border rounded-lg p-4 bg-gray-50">
-      <div class="text-sm mb-2">
-        <b>${a.total}</b> orden(es) pendientes de facturación en Frávega
-        <span class="text-gray-400">· Nro de Orden tomado de <code>${esc(a.campo_id)}</code></span>
-      </div>
-      <div class="flex gap-4 text-sm mb-3 flex-wrap">
-        <span>🆕 Nuevas a enviar: <b>${a.nuevas.length}</b></span>
-        <span>⏩ Ya enviadas: <b>${a.saltadas.length}</b></span>
-        <span class="${a.esperando.length ? "text-amber-700" : ""}">⏱️ Esperando el tiempo de envío: <b>${a.esperando.length}</b></span>
-        <span class="${a.excluidas.length ? "text-red-600" : ""}">🚫 Sin relación de SKU: <b>${a.excluidas.length}</b></span>
-        ${a.fallidas.length ? `<span class="text-red-600">⚠️ Con error: <b>${a.fallidas.length}</b></span>` : ""}
-      </div>
-
-      ${a.truncada ? `<div class="text-sm bg-amber-50 border border-amber-200 text-amber-900 rounded p-3 mb-3">
-        Se cortó la lectura para no pasar el límite de tiempo de Google. Enviá estas órdenes y
-        volvé a apretar "Buscar" para traer el resto.</div>` : ""}
-
-      ${a.nuevas.length ? `<div class="max-h-96 overflow-y-auto mb-3">
-        <table class="data w-full"><thead><tr>
-          <th>Orden</th><th>Cliente</th><th>Documento</th><th>Fecha de compra</th>
-          <th>Entrega</th><th>Ítems</th><th>Total</th></tr></thead><tbody>
-        ${a.nuevas.map((o) => `<tr>
-          <td class="font-mono">${esc(o.orden)}</td>
-          <td>${esc(o.cliente)}</td>
-          <td class="font-mono text-xs">${esc(o.documento)}</td>
-          <td class="text-xs">${esc(o.fecha)}</td>
-          <td class="text-xs">${o.entrega === "SP" ? "Sucursal" : o.entrega === "HD" ? "Domicilio" : esc(o.entrega || "—")}</td>
-          <td class="text-center">${o.items}</td>
-          <td>${money(o.total)}${o.aviso ? `<div class="text-xs text-amber-700" title="${esc(o.aviso)}">⚠ revisar total</div>` : ""}</td>
-        </tr>`).join("")}</tbody></table></div>` : ""}
-
-      ${a.esperando.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-3 mb-3">
-        ⏱️ Estas órdenes todavía no cumplieron los ${a.espera_min} minutos que necesita Envío Pack.
-        No hay que hacer nada: entran solas en la próxima búsqueda.
-        ${a.esperando.slice(0, 20).map((x) => `<div>· ${esc(x.orden)} — comprada ${esc(x.compra)}, faltan ${x.faltan_min} min</div>`).join("")}
-        ${a.esperando.length > 20 ? `<div class="text-xs mt-1">…y ${a.esperando.length - 20} más</div>` : ""}</div>` : ""}
-
-      ${a.excluidas.length ? `<div class="text-sm text-red-700 bg-red-50 border border-red-200 rounded p-3 mb-3">
-        Estas órdenes NO se envían porque tienen SKUs sin relación (ya quedaron en
-        <a href="#pendientes" class="underline font-medium">Pendientes</a>):
-        ${a.excluidas.map((x) => `<div>· ${esc(x.orden)} → SKU ${x.skus_sin_relacion.map(esc).join(", ")}</div>`).join("")}</div>` : ""}
-
-      ${a.fallidas.length ? `<div class="text-sm text-red-700 bg-red-50 border border-red-200 rounded p-3 mb-3">
-        No se pudo leer el detalle de estas órdenes:
-        ${a.fallidas.map((x) => `<div>· ${esc(x.orden)}: ${esc(x.error)}</div>`).join("")}</div>` : ""}
-
-      ${a.nuevas.length ? `<button onclick="enviarOrdenesApi()"
-        class="bg-green-700 hover:bg-green-800 text-white px-5 py-2.5 rounded-lg font-medium">
-        2️⃣ Confirmar y enviar ${a.nuevas.length} orden(es) a Tango</button>` :
-        '<div class="text-gray-500 text-sm">No hay órdenes nuevas para enviar.</div>'}
-    </div>`;
-}
-
-function enviarOrdenesApi() {
-  const a = API_ORDENES;
-  if (!a || !a.orders.length) return;
-  const total = a.orders.length;
-
-  confirmar(`Se van a crear ${total} pedido(s) en Tango, en tandas de 25. ¿Continuar?`, async () => {
-    const TANDA = 25;
-    const enviadas = [], rechazadas = [];
-    const box = $("ordenes-resultado");
-
-    for (let i = 0; i < total; i += TANDA) {
-      const lote = a.orders.slice(i, i + TANDA);
-      // Mandamos solo los registros de este lote, para no inflar el payload
-      const regs = {};
-      lote.forEach((o) => { if (a.registros[o.OrderID]) regs[o.OrderID] = a.registros[o.OrderID]; });
-      const desde = i + 1, hasta = Math.min(i + TANDA, total);
-
-      box.innerHTML = `
-        <div class="border rounded-lg p-4 bg-violet-50">
-          ${spinner(`Enviando órdenes ${desde}–${hasta} de ${total} a Tango...`)}
-          <div class="text-xs text-gray-500 mt-2">Aceptadas hasta ahora: ${enviadas.length}
-            ${rechazadas.length ? `· rechazadas: ${rechazadas.length}` : ""}</div>
-          <div class="w-full bg-violet-200 rounded-full h-2 mt-2">
-            <div class="bg-violet-700 h-2 rounded-full" style="width:${Math.round(hasta / total * 100)}%"></div></div>
-        </div>`;
-      try {
-        const r = await api("orders.apiSend", { orders: lote, registros: regs, archivo: "API Frávega" });
-        enviadas.push(...r.enviadas);
-        rechazadas.push(...r.rechazadas);
-      } catch (e) {
-        rechazadas.push({ orden: `tanda ${desde}-${hasta}`, error: e.message });
-      }
-    }
-
-    box.innerHTML = `
-      <div class="border rounded-lg p-4 ${rechazadas.length ? "bg-amber-50" : "bg-green-50"}">
-        <div class="font-bold mb-2">✅ Enviadas y aceptadas por Tango: ${enviadas.length} de ${total}</div>
-        <div class="text-sm text-gray-600 mb-2">Quedaron guardadas con cliente, documento y total en
-          <b>OrdenesEnviadas</b>. Para facturar ya no hace falta volver a subir el CSV de Frávega:
-          andá a <a href="#facturas" class="underline text-violet-700">Exportación de Facturas</a> y
-          subí solo el reporte de Tango.</div>
-        <div class="max-h-40 overflow-y-auto">
-          ${enviadas.map((id) => `<span class="inline-block bg-white border rounded px-2 py-0.5 text-xs mr-1 mb-1">${esc(id)}</span>`).join("")}
-        </div>
-        ${rechazadas.length ? `<div class="font-bold mt-3 mb-1 text-red-700">❌ Rechazadas / con problema: ${rechazadas.length}</div>
-          <div class="max-h-40 overflow-y-auto">
-          ${rechazadas.map((f) => `<div class="text-sm text-red-700">· ${esc(f.orden)}: ${esc(f.error)}</div>`).join("")}
-          </div>` : ""}
-      </div>`;
-    toast(`${enviadas.length} órdenes enviadas a Tango`, rechazadas.length ? "warning" : "ok");
-
-    try {
-      await api("orders.recordImport", {
-        archivo: "API Frávega",
-        total_filas: a.total,
-        filas_pendientes: a.nuevas.length + a.saltadas.length,
-        nuevas: total,
-        enviadas: enviadas,
-        rechazadas: rechazadas,
-        excluidas: a.excluidas || [],
-        saltadas: a.saltadas || [],
-      });
-    } catch (e) { /* el historial es secundario: no cortamos el flujo */ }
-    API_ORDENES = null;
-    cargarHistorialOrdenes();
-  });
-}
-
-/* Diagnóstico de la API de órdenes, sin enviar nada a Tango. */
-async function probarApiOrdenes() {
-  showModal(`<h3 class="font-bold text-lg mb-3">Probando la API de órdenes…</h3>${spinner("Consultando Frávega...")}`);
-  let r;
-  try { r = await api("orders.apiTest"); }
-  catch (e) { return showModal(`<h3 class="font-bold text-lg mb-3">Probar API de órdenes</h3>
-    <p class="text-red-600 text-sm">${esc(e.message)}</p>
-    <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`); }
-
-  showModal(`
-    <h3 class="font-bold text-lg mb-3">Probar API de órdenes de Frávega</h3>
-    <div class="mb-3 text-sm">${r.ok
-      ? '<span class="text-green-700 font-bold">● Conectado</span>'
-      : '<span class="text-red-600 font-bold">● Sin acceso</span>'} — ${esc(r.mensaje)}</div>
-    ${r.ok ? `
-      <div class="text-sm space-y-1 mb-4">
-        <div>Órdenes pendientes: <b>${r.total}</b> en ${r.paginas} página(s)</div>
-        <div>Nro de Orden tomado de: <code>${esc(r.campo_id)}</code></div>
-        <div>Espera de Envío Pack: <b>${r.espera_min} min</b></div>
-        <div>Consulta de detalle: ${r.detalle_ok
-          ? `<span class="text-green-700">funciona</span> (formato <code>${esc(r.modo_detalle)}</code>)`
-          : `<span class="text-red-600">falla</span> — ${esc(r.detalle_error || "")}`}</div>
-        ${r.comprador ? `<div>Comprador de muestra: ${esc(r.comprador)}</div>` : ""}
-        ${r.domicilio_facturacion ? `<div>Domicilio de facturación: ${esc(r.domicilio_facturacion)}</div>` : ""}
-        ${r.domicilio_entrega ? `<div>Domicilio de entrega: ${esc(r.domicilio_entrega)}</div>` : ""}
-        ${r.operador_logistico ? `<div>Operador logístico: <b>${esc(r.operador_logistico)}</b></div>` : ""}
-      </div>
-      ${r.muestra && r.muestra.length ? `<div class="text-xs text-gray-500 uppercase mb-1">Muestra de órdenes</div>
-        <table class="data w-full"><thead><tr><th>orderId</th><th>suborderId</th><th>Cliente</th><th>SKUs</th></tr></thead>
-        <tbody>${r.muestra.map((m) => `<tr>
-          <td class="font-mono text-xs">${esc(m.orderId)}</td>
-          <td class="font-mono text-xs">${esc(m.suborderId)}</td>
-          <td class="text-xs">${esc(m.cliente)}</td>
-          <td class="text-xs ${String(m.skus).indexOf("sin relación") !== -1 ? "text-red-600" : ""}">${esc(m.skus)}</td>
-        </tr>`).join("")}</tbody></table>` : ""}
-    ` : ""}
-    <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
 }
 
 async function cargarHistorialOrdenes() {
@@ -910,7 +735,6 @@ async function cargarHistorialOrdenes() {
       || '<tr><td colspan="7" class="text-gray-400 p-4">Sin importaciones aún</td></tr>'}
     </tbody></table>`;
 }
-
 
 async function analizarOrdenes() {
   const input = $("ordenes-file");
@@ -1607,19 +1431,23 @@ const CONFIG_CAMPOS = [
     ["orders_batch_size", "Órdenes por lote", "text"],
     ["orders_estado_objetivo", "Estado de facturación a importar (solo modo CSV)", "text"],
   ]],
-  ["Órdenes por API de Frávega", [
-    ["orders_api_espera_min", "Espera antes de enviar cada orden, en minutos (Envío Pack necesita 90)", "text"],
-    ["orders_api_dias_atras", "Ventana de búsqueda hacia atrás (días)", "text"],
-    ["orders_api_pause_ms", "Pausa entre consultas de detalle a Frávega (ms)", "text"],
-    ["orders_api_page_size", "Órdenes por página (máx. 100)", "text"],
-    ["orders_api_max_detalle", "Máximo de detalles por ejecución", "text"],
-    ["orders_api_id_field", "Nro de Orden: auto · suborderId · orderId", "text"],
-    ["orders_api_tipo_entrega", "Filtrar tipo de entrega: vacío = todos · SP · HD", "text"],
-    ["orders_api_facturar_envio", "Sumar el costo de envío al total (dejar apagado con Frávega Envíos)", "bool"],
+  ["Pedidos de Frávega (VTEX)", [
+    ["fvtex_espera_min", "Antigüedad mínima del pedido, en minutos (Envío Pack necesita 90)", "text"],
+    ["fvtex_estados", "Estados de VTEX a importar (separados por coma)", "text"],
+    ["fvtex_desde_fecha", "No traer pedidos anteriores a (aaaa-mm-dd)", "text"],
+    ["fvtex_dias_atras", "Ventana de búsqueda hacia atrás (días)", "text"],
+    ["fvtex_id_field", "Nro de Orden: auto · orderId · marketplaceOrderId", "text"],
+    ["fvtex_orders_pause_ms", "Pausa entre consultas de detalle (ms)", "text"],
+    ["fvtex_max_detalle", "Máximo de detalles por ejecución", "text"],
+    ["fvtex_precio_divisor", "Divisor de precios (VTEX manda centavos: 100)", "text"],
+    ["fvtex_facturar_envio", "Sumar el costo de envío al total (apagado con Frávega Envíos)", "bool"],
+    ["fvtex_sale_condition", "Condición de venta (vacío = la general)", "text"],
   ]],
-  ["Órdenes de OnCity (VTEX)", [
+  ["Pedidos de OnCity (VTEX)", [
     ["oncity_sale_condition", "Condición de venta de Tango para OnCity", "text"],
     ["oncity_estados", "Estados de VTEX a importar (separados por coma)", "text"],
+    ["oncity_id_field", "Nro de Orden: auto · orderId · marketplaceOrderId", "text"],
+    ["oncity_espera_min", "Antigüedad mínima del pedido, en minutos", "text"],
     ["oncity_desde_fecha", "No traer pedidos anteriores a (aaaa-mm-dd)", "text"],
     ["oncity_dias_atras", "Ventana de búsqueda hacia atrás (días)", "text"],
     ["oncity_orders_pause_ms", "Pausa entre consultas de detalle a VTEX (ms)", "text"],
@@ -1693,6 +1521,8 @@ async function viewConfig() {
           ${cred(cfg.credenciales.google_client_id, "Google Client ID")}
           ${cred(cfg.credenciales.vtex_app_key, "OnCity · VTEX AppKey")}
           ${cred(cfg.credenciales.vtex_app_token, "OnCity · VTEX AppToken")}
+          ${cred(cfg.credenciales.fravega_vtex_key, "Frávega · VTEX AppKey")}
+          ${cred(cfg.credenciales.fravega_vtex_token, "Frávega · VTEX AppToken")}
           <p class="text-xs text-gray-500 mt-3">Por seguridad, las credenciales se administran en el
           editor de Apps Script: <b>Configuración del proyecto → Script Properties</b>.</p>`)}
       </div>
