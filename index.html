@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-24.6";
+const APP_VERSION = "2026-08-24.7";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -613,6 +613,9 @@ function pintarOrdenesVtex() {
         ${a.fallidas.length ? `<span class="text-red-600">⚠️ Con error: <b>${a.fallidas.length}</b></span>` : ""}
       </div>
 
+      ${a.alerta ? `<div class="text-sm bg-red-50 border-2 border-red-400 text-red-800 rounded p-3 mb-3">
+        <div class="font-bold mb-1">⛔ Frená antes de enviar</div>${esc(a.alerta)}</div>` : ""}
+
       ${a.truncada ? `<div class="text-sm bg-amber-50 border border-amber-200 text-amber-900 rounded p-3 mb-3">
         Se cortó la lectura para no pasar el límite de tiempo de Google. Enviá estos y volvé a
         apretar "Buscar" para traer el resto.</div>` : ""}
@@ -761,7 +764,9 @@ async function probarVtex(canal) {
       ${r.quitar_prefijo ? `<div>Prefijo que se le saca al orderId: <code>${esc(r.quitar_prefijo)}</code></div>` : ""}
       <div>Condición de venta en Tango: <b>${esc(r.condicion_venta)}</b></div>
       ${r.ok ? `
-        <div>Pedidos pendientes: <b>${r.total}</b> en ${r.paginas} página(s)</div>
+        <div>Pedidos pendientes: <b>${r.total}</b>${r.por_estado
+          ? " — " + Object.keys(r.por_estado).map((k) => `<code>${esc(k)}</code>: ${r.por_estado[k]}`).join(" · ")
+          : ""}</div>
         <div>Nro de Orden tomado de: <code>${esc(r.campo_id)}</code></div>
         <div>Consulta de detalle: ${r.detalle_ok
           ? '<span class="text-green-700">funciona</span>'

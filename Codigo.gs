@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-24.6';
+var APP_VERSION = '2026-08-24.7';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -1690,11 +1690,32 @@ function apiOrdersApiTest() {
  * cambia su estado, así que no interfiere con ese circuito.
  * ══════════════════════════════════════════════════════════════════════════ */
 
-/** Lee una clave de config del canal, con respaldo en la clave general. */
+/** Valores por defecto tomados del código, indexados por clave. */
+var _DEFAULTS_CACHE = null;
+function _defaultConfig(clave) {
+  if (!_DEFAULTS_CACHE) {
+    _DEFAULTS_CACHE = {};
+    DEFAULT_CONFIG.forEach(function (r) { _DEFAULTS_CACHE[r[0]] = r[1]; });
+  }
+  return _DEFAULTS_CACHE[clave];
+}
+
+/**
+ * Lee una clave de config del canal.
+ * Orden de búsqueda: hoja Config → DEFAULT_CONFIG del código → respaldo.
+ *
+ * El paso del medio es importante: cuando se agrega una clave nueva al código,
+ * la hoja Config no la tiene hasta que se corre MIGRAR_ORDENES_API(). Sin ese
+ * respaldo, la clave nueva quedaba vacía y la funcionalidad no se activaba, sin
+ * ningún error visible. Fue exactamente lo que pasó con fvtex_quitar_prefijo.
+ */
 function _cfgCanalVal(cfg, canal, clave, respaldo) {
   var c = _canal(canal);
-  var v = cfg[c.prefijo + clave];
+  var k = c.prefijo + clave;
+  var v = cfg[k];
   if (v !== undefined && String(v).trim() !== '') return String(v).trim();
+  var d = _defaultConfig(k);
+  if (d !== undefined && String(d).trim() !== '') return String(d).trim();
   return respaldo === undefined ? '' : respaldo;
 }
 
@@ -2026,8 +2047,25 @@ function apiVtexOrdersPreview(user, p) {
        ' excluidas=' + excluidas.length + ' fallidas=' + fallidas.length +
        ' campo_id=' + campoId, Date.now() - t0);
 
+  // Red de seguridad contra duplicados: si el historial tiene pedidos de este
+  // canal pero NINGUNO de los que trajimos coincide, es casi seguro que el
+  // formato del Nro de Orden no es el correcto (prefijo, campo equivocado).
+  // Mandar así duplicaría en Tango todo lo ya cargado.
+  var yaDelCanal = 0;
+  _readRows(SH.SENT, 2000).forEach(function (r) {
+    if (String(r.canal || 'fravega').toLowerCase() === canal) yaDelCanal++;
+  });
+  var alerta = '';
+  if (yaDelCanal > 0 && saltadas.length === 0 && nuevas.length > 0) {
+    alerta = 'Hay ' + yaDelCanal + ' pedido(s) de ' + c.nombre + ' en el historial, pero ' +
+      'ninguno de los ' + nuevas.length + ' que se trajeron coincide. Revisá el formato del ' +
+      'Nro de Orden (prefijo "' + (c.quitar_prefijo || 'ninguno') + '", campo "' + campoId +
+      '") contra el que usás para facturar ANTES de enviar: si no coincide, Tango va a ' +
+      'recibir duplicados.';
+  }
+
   return {
-    canal: canal, nombre: c.nombre,
+    canal: canal, nombre: c.nombre, alerta: alerta, ya_del_canal: yaDelCanal,
     estados: c.estados, por_estado: porEstado,
     listados: totalListados, campo_id: campoId || c.id_field,
     orders: orders, registros: registros,
@@ -2076,19 +2114,26 @@ function apiVtexTest(canal) {
               estados: c.estados, quitar_prefijo: c.quitar_prefijo,
               muestra: [], detalle_ok: false };
 
-  var body;
-  try { body = vtexOrdersPage(canal, c.estados[0], 1, c); }
-  catch (e) { out.mensaje = e.message; return out; }
-
-  var lista = body.list || [];
+  // Consultamos TODOS los estados configurados, no solo el primero: si no, el
+  // test decía "2 pedidos" mientras la búsqueda real traía 63.
+  var lista = [], porEstado = {}, total = 0;
+  for (var e = 0; e < c.estados.length; e++) {
+    var body;
+    try { body = vtexOrdersPage(canal, c.estados[e], 1, c); }
+    catch (err) { out.mensaje = err.message; return out; }
+    var n = Number((body.paging || {}).total || (body.list || []).length);
+    porEstado[c.estados[e]] = n;
+    total += n;
+    lista = lista.concat(body.list || []);
+  }
   out.ok = true;
-  out.total = Number((body.paging || {}).total || lista.length);
-  out.paginas = Number((body.paging || {}).pages || 1);
+  out.total = total;
+  out.por_estado = porEstado;
   out.campo_id = _elegirIdVtex(lista, c);
-  out.mensaje = 'Conexión OK · ' + out.total + ' pedido(s) en ' + c.estados[0];
+  out.mensaje = 'Conexión OK · ' + total + ' pedido(s) pendientes';
 
   if (!lista.length) {
-    out.mensaje += ' — no hay nada pendiente en la ventana configurada';
+    out.mensaje += ' — no hay nada en la ventana configurada';
     return out;
   }
 
