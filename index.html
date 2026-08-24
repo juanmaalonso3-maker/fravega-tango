@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-21.4";
+const APP_VERSION = "2026-08-24.6";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -599,6 +599,8 @@ function pintarOrdenesVtex() {
       <div class="text-sm mb-2">
         <b>${a.listados}</b> pedido(s) leídos de <b>${esc(a.nombre)}</b> en estado
         <code>${esc(a.estados.join(", "))}</code>
+        ${a.por_estado && Object.keys(a.por_estado).length ? `<div class="text-xs text-gray-500 mt-1">
+          ${Object.keys(a.por_estado).map((k) => `<code>${esc(k)}</code>: ${a.por_estado[k]}`).join(" · ")}</div>` : ""}
         <div class="text-xs text-gray-400">Nro de Orden tomado de <code>${esc(a.campo_id)}</code>
           · condición de venta en Tango: <b>${esc(a.condicion_venta)}</b>
           · talonario ${esc(a.talonario)}
@@ -624,13 +626,16 @@ function pintarOrdenesVtex() {
         <div class="max-h-96 overflow-y-auto mb-3">
         <table class="data w-full"><thead><tr>
           <th class="w-8"></th><th>Pedido</th><th>Cliente</th><th>DNI</th><th>Fecha</th>
-          <th>Ítems</th><th>Total</th><th>Transportadora</th></tr></thead><tbody>
+          <th>Estado</th><th>Ítems</th><th>Total</th><th>Transportadora</th></tr></thead><tbody>
         ${a.nuevas.map((o, i) => `<tr>
           <td><input type="checkbox" class="vtx-chk w-4 h-4" data-i="${i}" checked onchange="contarVtex()"></td>
           <td class="font-mono text-xs">${esc(o.orden)}</td>
           <td>${esc(o.cliente)}</td>
           <td class="font-mono text-xs">${esc(o.documento)}</td>
           <td class="text-xs">${esc(o.fecha)}</td>
+          <td class="text-xs">${badge(o.estado === "ready-for-handling" ? "listo"
+            : o.estado === "handling" ? "preparando" : (o.estado || "—"),
+            o.estado === "handling" ? "warning" : "info")}</td>
           <td class="text-center">${o.items}</td>
           <td>${money(o.total)}${o.aviso ? `<div class="text-xs text-amber-700" title="${esc(o.aviso)}">⚠ revisar total</div>` : ""}</td>
           <td class="text-xs text-gray-500">${esc(o.transportadora || "—")}</td>
@@ -753,6 +758,7 @@ async function probarVtex(canal) {
     <div class="text-sm space-y-1 mb-4">
       <div>Cuenta de VTEX: <code>${esc(r.cuenta)}</code></div>
       <div>Estados consultados: <code>${esc((r.estados || []).join(", "))}</code></div>
+      ${r.quitar_prefijo ? `<div>Prefijo que se le saca al orderId: <code>${esc(r.quitar_prefijo)}</code></div>` : ""}
       <div>Condición de venta en Tango: <b>${esc(r.condicion_venta)}</b></div>
       ${r.ok ? `
         <div>Pedidos pendientes: <b>${r.total}</b> en ${r.paginas} página(s)</div>
@@ -774,9 +780,9 @@ async function probarVtex(canal) {
         <td class="text-xs">${esc(m.cliente)}</td>
         <td class="text-xs">$ ${Number(m.total).toLocaleString("es-AR")}</td>
       </tr>`).join("")}</tbody></table>
-      <p class="text-xs text-gray-500 mt-2">Compará estos números con el "Nro de Orden" que usás
-      hoy para facturar. El que coincida es el que hay que dejar en la configuración
-      (<code>${esc(r.canal)}_id_field</code>).</p>` : ""}
+      <p class="text-xs text-gray-500 mt-2"><b>Nro para Tango</b> es el que se va a usar como
+      Nro de Orden: es el orderId de VTEX sin su prefijo. Tiene que coincidir con el "Nro de
+      Orden" del CSV que usás hoy para facturar.</p>` : ""}
     <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
 }
 

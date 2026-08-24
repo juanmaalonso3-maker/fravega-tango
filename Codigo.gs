@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-21.4';
+var APP_VERSION = '2026-08-24.6';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -156,15 +156,16 @@ var DEFAULT_CONFIG = [
   ['oncity_facturar_envio', '0', 'Sumar el costo de envío al total'],
   ['oncity_espera_min', '0', 'Minutos de antigüedad mínima del pedido (OnCity no lo necesita)'],
   ['oncity_id_field', 'auto', 'Nro de Orden: auto | orderId | marketplaceOrderId'],
+  ['oncity_quitar_prefijo', '', 'Prefijo a sacarle al orderId (OnCity no necesita)'],
   ['oncity_sale_condition', '01', 'Condición de venta de Tango para OnCity'],
   ['oncity_counterfoil', '', 'Talonario de pedido para OnCity (vacío = el mismo que Frávega)'],
   ['oncity_invoice_counterfoil', '', 'Talonario de factura para OnCity (vacío = el mismo que Frávega)'],
   ['oncity_orders_warehouse', '', 'Depósito de pedidos para OnCity (vacío = el mismo que Frávega)'],
   ['oncity_seller_code', '', 'Vendedor para OnCity (vacío = el mismo que Frávega)'],
   // ── Pedidos de Frávega por VTEX (reemplaza al Seller Center, que da 401) ──
-  ['fvtex_estados', 'ready-for-handling', 'Estados de VTEX a importar (separados por coma)'],
+  ['fvtex_estados', 'ready-for-handling,handling', 'Estados de VTEX a importar (separados por coma)'],
   ['fvtex_desde_fecha', '', 'No traer pedidos anteriores a esta fecha (aaaa-mm-dd)'],
-  ['fvtex_dias_atras', '30', 'Ventana de búsqueda hacia atrás (días)'],
+  ['fvtex_dias_atras', '90', 'Ventana de búsqueda hacia atrás (días)'],
   ['fvtex_page_size', '50', 'Pedidos por página de VTEX'],
   ['fvtex_orders_pause_ms', '300', 'Pausa entre consultas de detalle (ms)'],
   ['fvtex_max_detalle', '120', 'Máximo de detalles por ejecución'],
@@ -172,6 +173,7 @@ var DEFAULT_CONFIG = [
   ['fvtex_facturar_envio', '0', 'Sumar el costo de envío al total (0 con Frávega Envíos)'],
   ['fvtex_espera_min', '90', 'Minutos de antigüedad mínima del pedido (Envío Pack necesita 90)'],
   ['fvtex_id_field', 'auto', 'Nro de Orden: auto | orderId | marketplaceOrderId'],
+  ['fvtex_quitar_prefijo', 'FVG-', 'Prefijo a sacarle al orderId de VTEX para que coincida con el Nro de Orden del CSV'],
   ['invoices_match_importe', '1', 'Usar también el importe para matchear facturas'],
   ['invoices_tolerancia_importe', '1', 'Diferencia máxima de importe aceptada (en pesos)'],
   ['invoices_origen', 'historial', 'De dónde salen las órdenes a facturar: historial | csv'],
@@ -290,6 +292,32 @@ function ACTUALIZAR_CONDICION_Y_DEPOSITO() {
        'Aplicado: condición de venta=3 (FRÁVEGA MARKETPLACE), depósito pedidos=04',
        'ok', '');
   return 'Listo: condición de venta = 3 (FRÁVEGA MARKETPLACE), depósito pedidos = 04.';
+}
+
+/**
+ * EJECUTAR UNA VEZ desde el editor después de pegar esta versión.
+ *
+ * Fuerza en la hoja Config los estados de VTEX que hay que traer de Frávega.
+ * Hace falta porque la app lee lo que hay en la hoja, NO lo que dice
+ * DEFAULT_CONFIG: cambiar el código solo afecta a una instalación nueva.
+ *
+ * Por qué estos dos estados: verificado contra el CSV de órdenes del 24/08.
+ * De las órdenes que Frávega marca como "Pendiente" de facturación, unas están
+ * en "ready-for-handling" y la mayoría en "handling" ("Preparando Entrega"),
+ * porque el backoffice de Frávega Envíos les hace el start-handling por su
+ * cuenta. Filtrar solo por ready-for-handling dejaba afuera casi todas.
+ *
+ * Los otros estados que existen y NO se traen:
+ *   invoiced                   → ya facturada (en el CSV figura "Facturada")
+ *   canceled                   → cancelada
+ *   waiting-ffmt-authorization → todavía no autorizada por fulfillment
+ */
+function ACTUALIZAR_ESTADOS_VTEX() {
+  setConfig('fvtex_estados', 'ready-for-handling,handling');
+  setConfig('fvtex_dias_atras', '90');
+  log_('sistema', 'configuracion',
+       'Estados de Frávega actualizados: ready-for-handling + handling', 'ok', '');
+  return 'Listo: Frávega ahora trae ready-for-handling y handling, con ventana de 90 días.';
 }
 
 /* ═══════════════ API HTTP (doPost) ═══════════════ */
@@ -1693,7 +1721,8 @@ function _cfgCanal(cfg, canal) {
     pausa: Math.max(0, parseInt(_cfgCanalVal(cfg, canal, 'orders_pause_ms', '300'), 10) || 0),
     max_detalle: parseInt(_cfgCanalVal(cfg, canal, 'max_detalle', '120'), 10) || 120,
     espera_min: Math.max(0, parseInt(_cfgCanalVal(cfg, canal, 'espera_min', '0'), 10) || 0),
-    id_field: _cfgCanalVal(cfg, canal, 'id_field', 'auto')
+    id_field: _cfgCanalVal(cfg, canal, 'id_field', 'auto'),
+    quitar_prefijo: _cfgCanalVal(cfg, canal, 'quitar_prefijo', '')
   };
 }
 
@@ -1752,6 +1781,20 @@ function vtexOrderDetail(canal, orderId) {
 }
 
 /**
+ * Saca el prefijo que VTEX le agrega al orderId.
+ * En Frávega el pedido que en el CSV figura como "v92813856frvg-01" en VTEX es
+ * "FVG-v92813856frvg-01". Sacarle el prefijo es lo que hace que:
+ *   · no se dupliquen en Tango los pedidos ya cargados por CSV, y
+ *   · la exportación de facturas siga agregando "FVG-" como siempre.
+ */
+function _sinPrefijo(id, prefijo) {
+  var s = String(id || '');
+  if (!prefijo) return s;
+  return s.toUpperCase().indexOf(String(prefijo).toUpperCase()) === 0
+    ? s.slice(String(prefijo).length) : s;
+}
+
+/**
  * Decide qué identificador usar como Nro de Orden en Tango.
  * VTEX da dos: orderId (RMS-1655781718593-01) y marketplaceOrderId
  * (1655781718593-01). Si ya hay pedidos cargados, se fija cuál de los dos
@@ -1762,7 +1805,7 @@ function _elegirIdVtex(lista, c) {
   var sent = _sentIds();
   var hitsOrder = 0, hitsMkp = 0;
   lista.forEach(function (o) {
-    if (o.orderId && sent[String(o.orderId)]) hitsOrder++;
+    if (o.orderId && sent[_sinPrefijo(o.orderId, c.quitar_prefijo)]) hitsOrder++;
     if (o.marketplaceOrderId && sent[String(o.marketplaceOrderId)]) hitsMkp++;
   });
   if (hitsMkp > hitsOrder) return 'marketplaceOrderId';
@@ -1919,6 +1962,7 @@ function apiVtexOrdersPreview(user, p) {
   var orders = [], registros = {}, nuevas = [],
       saltadas = [], excluidas = [], fallidas = [];
   var detalles = 0, truncada = false, totalListados = 0, campoId = '';
+  var porEstado = {};   // cuántos pedidos vinieron de cada estado
 
   for (var e = 0; e < c.estados.length && !truncada; e++) {
     var pagina = 1, paginas = 1;
@@ -1927,14 +1971,16 @@ function apiVtexOrdersPreview(user, p) {
       paginas = Number((body.paging || {}).pages || 1);
       var lista = body.list || [];
       totalListados += lista.length;
+      porEstado[c.estados[e]] = (porEstado[c.estados[e]] || 0) +
+        Number((body.paging || {}).total || lista.length) * (pagina === 1 ? 1 : 0);
       if (!lista.length) break;
       if (!campoId) campoId = _elegirIdVtex(lista, c);
 
       for (var i = 0; i < lista.length; i++) {
         var it = lista[i];
-        var idOrden = String((campoId === 'marketplaceOrderId'
-          ? (it.marketplaceOrderId || it.orderId)
-          : (it.orderId || it.marketplaceOrderId)) || '');
+        var idOrden = (campoId === 'marketplaceOrderId')
+          ? String(it.marketplaceOrderId || it.orderId || '')
+          : _sinPrefijo(it.orderId || it.marketplaceOrderId || '', c.quitar_prefijo);
         if (!idOrden) continue;
         if (sent[idOrden]) { saltadas.push(idOrden); continue; }
 
@@ -1982,7 +2028,8 @@ function apiVtexOrdersPreview(user, p) {
 
   return {
     canal: canal, nombre: c.nombre,
-    estados: c.estados, listados: totalListados, campo_id: campoId || c.id_field,
+    estados: c.estados, por_estado: porEstado,
+    listados: totalListados, campo_id: campoId || c.id_field,
     orders: orders, registros: registros,
     nuevas: nuevas, saltadas: saltadas,
     excluidas: excluidas, fallidas: fallidas,
@@ -2026,7 +2073,8 @@ function apiVtexTest(canal) {
   var out = { canal: canal, nombre: c.nombre, ok: false, mensaje: '',
               cuenta: _prop(_canal(canal).props.account),
               condicion_venta: c.orders_sale_condition,
-              estados: c.estados, muestra: [], detalle_ok: false };
+              estados: c.estados, quitar_prefijo: c.quitar_prefijo,
+              muestra: [], detalle_ok: false };
 
   var body;
   try { body = vtexOrdersPage(canal, c.estados[0], 1, c); }
@@ -2054,6 +2102,7 @@ function apiVtexTest(canal) {
   lista.slice(0, 5).forEach(function (o) {
     out.muestra.push({
       orderId: _primero(o.orderId),
+      nro_para_tango: _sinPrefijo(_primero(o.orderId), c.quitar_prefijo),
       marketplaceOrderId: _primero(o.marketplaceOrderId),
       cliente: _primero(o.clientName),
       fecha: _primero(o.creationDate),
