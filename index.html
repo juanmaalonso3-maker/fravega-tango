@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-21.3";
+const APP_VERSION = "2026-08-21.4";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -321,9 +321,30 @@ function route() {
   const view = currentView();
   document.querySelectorAll(".nav-item").forEach((el) =>
     el.classList.toggle("active", el.dataset.view === view));
-  ({ dashboard: viewDashboard, stock: viewStock, ordenes: viewOrdenes,
-     facturas: viewFacturas, skus: viewSkus, pendientes: viewPendientes,
-     logs: viewLogs, config: viewConfig }[view] || viewDashboard)();
+  const fn = { dashboard: viewDashboard, stock: viewStock, ordenes: viewOrdenes,
+               facturas: viewFacturas, skus: viewSkus, pendientes: viewPendientes,
+               logs: viewLogs, config: viewConfig }[view] || viewDashboard;
+  // Sin este try/catch, si una vista falla ANTES de dibujar, la pantalla se
+  // queda con lo que había antes y parece que no pasó nada. Preferimos mostrar
+  // el error: es la diferencia entre "no anda" y "esto es lo que se rompió".
+  try {
+    fn();
+  } catch (e) {
+    setMain(H("Error al abrir la sección") + card(`
+      <p class="text-red-600 font-medium mb-2">${esc(e.message)}</p>
+      <p class="text-sm text-gray-600 mb-3">Probá recargar con Ctrl+Shift+R. Si sigue,
+        el botón de abajo limpia las preferencias guardadas en este navegador
+        (pestaña elegida, sesión) sin tocar ningún dato del sistema.</p>
+      <button onclick="limpiarPreferencias()" class="border px-4 py-2 rounded-lg text-sm">
+        Limpiar preferencias de este navegador</button>
+      <pre class="text-xs text-gray-400 mt-3 whitespace-pre-wrap">${esc(e.stack || "")}</pre>`));
+    console.error("Error en la vista", view, e);
+  }
+}
+
+function limpiarPreferencias() {
+  ["tf_ordenes_modo", "tf_facturas_modo"].forEach((k) => localStorage.removeItem(k));
+  location.reload();
 }
 
 const setMain = (h) => { $("main").innerHTML = h; };
@@ -466,7 +487,15 @@ function verDetalleSync(jsonStr) {
 
 /* ══════════════ ÓRDENES ══════════════ */
 let ORDENES_ROWS = null, ORDENES_ARCHIVO = "", ORDENES_ANALISIS = null, ORDENES_COMPLETAS = [];
+// El valor guardado puede venir de una versión anterior (antes la pestaña de
+// Frávega se llamaba "api"). Si no es uno de los actuales, lo descartamos: si
+// no, la vista rompe al buscar un canal que no existe.
+const MODOS_ORDENES = ["fravega", "oncity", "csv"];
 let ORDENES_MODO = localStorage.getItem("tf_ordenes_modo") || "fravega";
+if (MODOS_ORDENES.indexOf(ORDENES_MODO) === -1) {
+  ORDENES_MODO = "fravega";
+  localStorage.setItem("tf_ordenes_modo", ORDENES_MODO);
+}
 
 // Los dos marketplaces corren sobre VTEX y comparten todo el flujo: solo
 // cambia el canal que se le manda al backend.
@@ -505,6 +534,7 @@ function cambiarModoOrdenes(modo) {
 /* ── Flujo por API de VTEX, común a los dos marketplaces ────────────── */
 
 function bloqueOrdenesVtex(canal) {
+  if (!CANALES_UI[canal]) canal = "fravega";
   const n = CANALES_UI[canal].nombre;
   const esFravega = canal === "fravega";
   return card(`
@@ -543,6 +573,7 @@ function bloqueOrdenesVtex(canal) {
 }
 
 async function buscarOrdenesVtex(canal) {
+  if (!CANALES_UI[canal]) canal = "fravega";
   const box = $("ordenes-resultado");
   box.innerHTML = spinner(`Consultando los pedidos de ${CANALES_UI[canal].nombre} en VTEX...`);
   try {
@@ -706,6 +737,7 @@ function enviarOrdenesVtex() {
 }
 
 async function probarVtex(canal) {
+  if (!CANALES_UI[canal]) canal = "fravega";
   showModal(`<h3 class="font-bold text-lg mb-3">Probando ${esc(CANALES_UI[canal].nombre)}…</h3>${spinner("Consultando VTEX...")}`);
   let r;
   try { r = await api("vtex.test", { canal }); }
@@ -880,7 +912,12 @@ function enviarOrdenes() {
 }
 
 /* ══════════════ FACTURAS ══════════════ */
+const MODOS_FACTURAS = ["historial", "oncity", "csv"];
 let FACTURAS_MODO = localStorage.getItem("tf_facturas_modo") || "historial";
+if (MODOS_FACTURAS.indexOf(FACTURAS_MODO) === -1) {
+  FACTURAS_MODO = "historial";
+  localStorage.setItem("tf_facturas_modo", FACTURAS_MODO);
+}
 
 function viewFacturas() {
   const tab = (id, txt) => `<button onclick="cambiarModoFacturas('${id}')"
