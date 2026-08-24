@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-24.8';
+var APP_VERSION = '2026-08-24.9';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -185,6 +185,13 @@ var DEFAULT_CONFIG = [
    'v92387730frvg-02,v92039990frvg-01,v92031720frvg-02,v91729694frvg-01,' +
    'v91647562frvg-02,v90875662frvg-02',
    'Pedidos que no hay que traer nunca (separados por coma)'],
+  // ── Ingreso automático de órdenes ───────────────────────────────────────
+  ['orders_auto_enabled', '0', 'Traer y enviar las órdenes a Tango automáticamente'],
+  ['orders_auto_hours', '8,11,14,17,20', 'Horas del día para importar órdenes (0-23, separadas por coma)'],
+  ['orders_auto_canales', 'fravega,oncity', 'Canales que entran en la corrida automática'],
+  ['orders_auto_max', '80', 'Si una corrida encuentra más pedidos que esto, NO envía y avisa'],
+  ['orders_auto_email', '', 'Email para el aviso de cada corrida (vacío = sin aviso)'],
+  ['orders_auto_email_siempre', '0', 'Avisar siempre (1) o solo cuando hay algo para revisar (0)'],
   ['invoices_match_importe', '1', 'Usar también el importe para matchear facturas'],
   ['invoices_tolerancia_importe', '1', 'Diferencia máxima de importe aceptada (en pesos)'],
   ['invoices_origen', 'historial', 'De dónde salen las órdenes a facturar: historial | csv'],
@@ -264,16 +271,31 @@ function SETUP() {
   return 'SETUP completo. Ahora: Implementar → Nueva implementación → App web.';
 }
 
-/** Crea/actualiza los triggers según scheduler_hours. Ejecutar tras cambiar horarios. */
+/**
+ * Crea/actualiza los triggers de stock y de órdenes según la configuración.
+ * La app la llama sola al guardar Configuración; también se puede correr a mano.
+ */
 function configurarTriggers() {
   ScriptApp.getProjectTriggers().forEach(function (t) {
-    if (t.getHandlerFunction() === 'syncProgramada') ScriptApp.deleteTrigger(t);
+    var f = t.getHandlerFunction();
+    if (f === 'syncProgramada' || f === 'ordenesProgramadas') ScriptApp.deleteTrigger(t);
   });
-  var horas = String(getConfig('scheduler_hours') || '7,19').split(',');
-  horas.forEach(function (h) {
-    h = parseInt(h.trim(), 10);
+
+  _crearTriggersHorarios('syncProgramada', getConfig('scheduler_hours') || '7,19');
+
+  // Las órdenes solo se agendan si la automatización está prendida: así no
+  // quedan triggers corriendo mientras se prueba la integración.
+  if (getConfig('orders_auto_enabled') === '1') {
+    _crearTriggersHorarios('ordenesProgramadas',
+                           getConfig('orders_auto_hours') || '8,11,14,17,20');
+  }
+}
+
+function _crearTriggersHorarios(handler, horasTxt) {
+  String(horasTxt).split(',').forEach(function (h) {
+    h = parseInt(String(h).trim(), 10);
     if (!isNaN(h) && h >= 0 && h <= 23) {
-      ScriptApp.newTrigger('syncProgramada').timeBased().everyDays(1).atHour(h).create();
+      ScriptApp.newTrigger(handler).timeBased().everyDays(1).atHour(h).create();
     }
   });
 }
@@ -281,6 +303,12 @@ function configurarTriggers() {
 function syncProgramada() {
   if (getConfig('scheduler_enabled') !== '1') return;
   runStockSync('scheduler');
+}
+
+/** Handler del trigger horario de órdenes. */
+function ordenesProgramadas() {
+  if (getConfig('orders_auto_enabled') !== '1') return;
+  runOrdersImport('scheduler');
 }
 
 /**
@@ -377,6 +405,8 @@ function doPost(e) {
       case 'vtex.orders.send':    out = apiVtexOrdersSend(user, p); break;
       case 'vtex.test':           out = apiVtexTest(p.canal); break;
       case 'vtex.orders.ignore':  out = apiVtexIgnorar(user, p); break;
+      case 'orders.autoStatus':   out = apiOrdersAutoStatus(); break;
+      case 'orders.autoRun':      out = apiOrdersAutoRun(user); break;
       case 'oncity.invoices':     out = apiOncityInvoices(user, p); break;
       case 'skus.list':          out = apiSkusList(p.q || ''); break;
       case 'skus.save':          out = apiSkusSave(user, p); break;
@@ -711,7 +741,12 @@ function apiStockStatus() {
 
 function _proximaSync() {
   if (getConfig('scheduler_enabled') !== '1') return null;
-  var horas = String(getConfig('scheduler_hours') || '7,19').split(',')
+  return _proximaCorrida(getConfig('scheduler_hours') || '7,19');
+}
+
+/** Próxima corrida a partir de una lista de horas "8,11,14". */
+function _proximaCorrida(horasTxt) {
+  var horas = String(horasTxt).split(',')
     .map(function (h) { return parseInt(h.trim(), 10); })
     .filter(function (h) { return !isNaN(h) && h >= 0 && h <= 23; })
     .sort(function (a, b) { return a - b; });
@@ -2023,9 +2058,8 @@ function apiVtexOrdersPreview(user, p) {
         if (setIgnorar[idOrden]) { ignorados.push(idOrden); continue; }
         if (sent[idOrden]) { saltadas.push(idOrden); continue; }
 
-        if (detalles >= c.max_detalle || (Date.now() - t0) > 4.5 * 60 * 1000) {
-          truncada = true; break;
-        }
+        var limite = p.deadline || (t0 + 4.5 * 60 * 1000);
+        if (detalles >= c.max_detalle || Date.now() > limite) { truncada = true; break; }
 
         var d;
         try { d = vtexOrderDetail(canal, it.orderId); detalles++; }
@@ -2215,6 +2249,238 @@ function apiVtexTest(canal) {
   }
   return out;
 }
+
+/* ═══════════════ CORRIDA AUTOMÁTICA DE ÓRDENES ═══════════════
+ * Recorre los canales habilitados, trae los pedidos nuevos y los manda a Tango
+ * sin que nadie toque nada. Es el mismo camino que usa el botón de la pantalla,
+ * así que lo que ves ahí es exactamente lo que hace el trigger.
+ *
+ * Las tres protecciones que hacen que se pueda dejar desatendido:
+ *
+ *   1. OrdenesEnviadas → un pedido ya mandado nunca se reenvía.
+ *   2. Lista de ignorados → los pedidos que VTEX no mueve de estado no vuelven.
+ *   3. Tope por corrida (orders_auto_max) → si de golpe aparecen muchísimos
+ *      pedidos, NO manda nada y avisa. Un número raro casi siempre significa
+ *      que algo cambió del otro lado, y en ese caso es mejor frenar que
+ *      escribir 300 pedidos en Tango.
+ *
+ * Además reparte el tiempo entre canales para no chocar con el límite de 6
+ * minutos de Apps Script: lo que no llegue a entrar queda para la próxima.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+function runOrdersImport(disparadaPor) {
+  var lock = LockService.getScriptLock();
+  // Esperamos un rato: si justo está corriendo la sincronización de stock,
+  // preferimos aguardar antes que saltear la corrida.
+  if (!lock.tryLock(60000)) {
+    log_(disparadaPor, 'ordenes', 'Corrida automática omitida', 'warning',
+         'Había otra tarea en curso');
+    return { resultado: 'omitida', mensaje: 'Ya hay otra tarea en curso' };
+  }
+
+  var t0 = Date.now();
+  var inicio = _now();
+  var cfg = _configMap();
+  var canales = String(cfg.orders_auto_canales || 'fravega,oncity')
+    .split(',').map(function (x) { return x.trim().toLowerCase(); }).filter(String);
+  var maxAuto = parseInt(cfg.orders_auto_max || '80', 10) || 80;
+
+  var res = {
+    resultado: 'ok', inicio: inicio, por_canal: {},
+    enviadas: [], rechazadas: [], excluidas: [], sin_relacion: [],
+    frenada: false, errores: []
+  };
+
+  try {
+    var vt = tangoVerify();
+    if (!vt[0]) throw new Error('Token de Tango inválido: ' + vt[1]);
+
+    for (var i = 0; i < canales.length; i++) {
+      var canal = canales[i];
+      // Repartimos lo que queda del presupuesto de tiempo entre los canales que
+      // faltan, guardando 90 segundos para el envío a Tango.
+      var restanteMs = (4.5 * 60 * 1000) - (Date.now() - t0);
+      if (restanteMs < 30000) {
+        res.errores.push('Se acabó el tiempo antes de procesar ' + canal +
+                         '; entra en la próxima corrida');
+        break;
+      }
+      var deadline = Date.now() + Math.floor(restanteMs / (canales.length - i));
+
+      var prev;
+      try {
+        prev = apiVtexOrdersPreview({ email: disparadaPor }, { canal: canal, deadline: deadline });
+      } catch (e) {
+        res.errores.push(_canal(canal).nombre + ': ' + e.message);
+        log_(disparadaPor, 'ordenes', 'Corrida automática: falló ' + canal, 'error', e.message);
+        continue;
+      }
+
+      var det = {
+        nombre: prev.nombre, leidos: prev.listados,
+        nuevas: prev.nuevas.length, saltadas: prev.saltadas.length,
+        ignorados: (prev.ignorados || []).length,
+        excluidas: prev.excluidas.length, fallidas: prev.fallidas.length,
+        enviadas: 0, rechazadas: 0, truncada: prev.truncada, frenada: false
+      };
+
+      // Los SKU sin relación necesitan que alguien los cargue a mano: van al aviso.
+      prev.excluidas.forEach(function (x) {
+        res.excluidas.push({ canal: canal, orden: x.orden, skus: x.skus_sin_relacion });
+        x.skus_sin_relacion.forEach(function (sk) {
+          if (res.sin_relacion.indexOf(sk) === -1) res.sin_relacion.push(sk);
+        });
+      });
+      prev.fallidas.forEach(function (x) {
+        res.errores.push(_canal(canal).nombre + ' · ' + x.orden + ': ' + x.error);
+      });
+
+      // ── El tope de seguridad ──
+      if (prev.nuevas.length > maxAuto) {
+        det.frenada = true;
+        res.frenada = true;
+        res.errores.push(_canal(canal).nombre + ': aparecieron ' + prev.nuevas.length +
+          ' pedidos nuevos, más que el tope de ' + maxAuto +
+          '. No se envió nada: revisalo a mano desde la pantalla de Ingreso de Órdenes.');
+        log_(disparadaPor, 'ordenes', 'Corrida automática frenada por el tope', 'warning',
+             canal + ' nuevas=' + prev.nuevas.length + ' tope=' + maxAuto);
+        res.por_canal[canal] = det;
+        continue;
+      }
+
+      if (prev.orders.length) {
+        try {
+          var env = _sendOrders(prev.orders, { email: disparadaPor },
+                                'Automático · ' + prev.nombre, null, prev.registros);
+          det.enviadas = env.enviadas.length;
+          det.rechazadas = env.rechazadas.length;
+          env.enviadas.forEach(function (id) { res.enviadas.push({ canal: canal, orden: id }); });
+          env.rechazadas.forEach(function (r) {
+            res.rechazadas.push({ canal: canal, orden: r.orden, error: r.error });
+          });
+        } catch (e) {
+          res.errores.push(_canal(canal).nombre + ' al enviar a Tango: ' + e.message);
+        }
+      }
+      res.por_canal[canal] = det;
+    }
+
+    if (res.rechazadas.length || res.errores.length) res.resultado = 'con observaciones';
+
+    // Una fila por corrida en el historial, igual que una importación manual.
+    var totalLeidos = 0, totalNuevas = 0;
+    Object.keys(res.por_canal).forEach(function (k) {
+      totalLeidos += res.por_canal[k].leidos || 0;
+      totalNuevas += res.por_canal[k].nuevas || 0;
+    });
+    _appendRow(SH.ORDERS, [_now(), disparadaPor, 'Automático (' + canales.join('+') + ')',
+                           totalLeidos, totalNuevas, totalNuevas,
+                           res.enviadas.length, res.rechazadas.length,
+                           JSON.stringify({ por_canal: res.por_canal,
+                                            enviadas: res.enviadas.map(function (x) { return x.orden; }),
+                                            rechazadas: res.rechazadas,
+                                            excluidas: res.excluidas,
+                                            errores: res.errores })]);
+
+    log_(disparadaPor, 'ordenes', 'Corrida automática de órdenes',
+         res.resultado === 'ok' ? 'ok' : 'warning',
+         'enviadas=' + res.enviadas.length + ' rechazadas=' + res.rechazadas.length +
+         ' excluidas=' + res.excluidas.length + ' errores=' + res.errores.length,
+         Date.now() - t0);
+
+    _avisarCorrida(cfg, res);
+    return res;
+
+  } catch (e) {
+    res.resultado = 'falló';
+    res.errores.push(e.message);
+    log_(disparadaPor, 'ordenes', 'Corrida automática abortada', 'error', e.message,
+         Date.now() - t0);
+    _avisarCorrida(cfg, res);
+    return res;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Aviso por mail. Por defecto solo escribe cuando hay algo para mirar
+ * (rechazos, SKU sin relación, errores, o la corrida frenada por el tope):
+ * un mail diario que dice "todo bien" se deja de leer a la semana.
+ */
+function _avisarCorrida(cfg, res) {
+  var destino = String(cfg.orders_auto_email || '').trim();
+  if (!destino) return;
+
+  var hayQueMirar = res.rechazadas.length || res.excluidas.length ||
+                    res.errores.length || res.frenada || res.resultado === 'falló';
+  if (!hayQueMirar && cfg.orders_auto_email_siempre !== '1') return;
+
+  var l = [];
+  l.push('Corrida automática de órdenes — ' + res.inicio);
+  l.push('Resultado: ' + res.resultado);
+  l.push('');
+  Object.keys(res.por_canal).forEach(function (k) {
+    var d = res.por_canal[k];
+    l.push(d.nombre + ':');
+    l.push('  leídos: ' + d.leidos + ' · nuevos: ' + d.nuevas +
+           ' · ya enviados: ' + d.saltadas + ' · ignorados: ' + d.ignorados);
+    l.push('  enviados a Tango: ' + d.enviadas + ' · rechazados: ' + d.rechazadas);
+    if (d.frenada) l.push('  ⚠ FRENADA por el tope de seguridad: no se envió nada.');
+    if (d.truncada) l.push('  · se cortó por tiempo; el resto entra en la próxima corrida');
+    l.push('');
+  });
+
+  if (res.sin_relacion.length) {
+    l.push('SKU sin relación (hay que cargarlos en Relación de SKUs):');
+    l.push('  ' + res.sin_relacion.join(', '));
+    l.push('  Órdenes afectadas, que NO se enviaron:');
+    res.excluidas.forEach(function (x) { l.push('   · ' + x.orden + ' → ' + x.skus.join(', ')); });
+    l.push('');
+  }
+  if (res.rechazadas.length) {
+    l.push('Rechazadas por Tango:');
+    res.rechazadas.forEach(function (x) { l.push('   · ' + x.orden + ': ' + x.error); });
+    l.push('');
+  }
+  if (res.errores.length) {
+    l.push('Errores:');
+    res.errores.forEach(function (x) { l.push('   · ' + x); });
+    l.push('');
+  }
+  l.push('Enviadas: ' + res.enviadas.length);
+
+  try {
+    MailApp.sendEmail(destino,
+      '[Tango ↔ Marketplaces] Órdenes: ' + res.enviadas.length + ' enviadas' +
+      (hayQueMirar ? ' — hay algo para revisar' : ''),
+      l.join('\n'));
+  } catch (e) {
+    log_('sistema', 'ordenes', 'No se pudo mandar el aviso por mail', 'warning', e.message);
+  }
+}
+
+/** Estado de la automatización, para mostrarlo en la pantalla. */
+function apiOrdersAutoStatus() {
+  var cfg = _configMap();
+  var hist = _readRows(SH.ORDERS, 100).filter(function (r) {
+    return String(r.archivo || '').indexOf('Automático') === 0;
+  });
+  return {
+    habilitada: cfg.orders_auto_enabled === '1',
+    horas: cfg.orders_auto_hours || '',
+    canales: String(cfg.orders_auto_canales || '').split(',')
+      .map(function (x) { return x.trim(); }).filter(String),
+    tope: cfg.orders_auto_max || '',
+    email: cfg.orders_auto_email || '',
+    proxima: cfg.orders_auto_enabled === '1'
+      ? _proximaCorrida(cfg.orders_auto_hours || '8,11,14,17,20') : null,
+    ultima: hist.length ? hist[hist.length - 1] : null
+  };
+}
+
+/** Corre la importación automática a pedido, para probarla sin esperar la hora. */
+function apiOrdersAutoRun(user) { return runOrdersImport(user.email); }
 
 /* ═══════════════ MÓDULO FACTURAS ═══════════════ */
 
@@ -2864,9 +3130,9 @@ function apiSettingsSet(user, valores) {
     setConfig(k, valores[k]);
     cambios.push(k + '=' + valores[k]);
   });
-  if ('scheduler_hours' in (valores || {}) || 'scheduler_enabled' in (valores || {})) {
-    configurarTriggers();
-  }
+  var recrear = ['scheduler_hours', 'scheduler_enabled',
+                 'orders_auto_hours', 'orders_auto_enabled'];
+  if (recrear.some(function (k) { return k in (valores || {}); })) configurarTriggers();
   log_(user.email, 'configuracion', 'Configuración actualizada', 'ok', cambios.join(', '));
   return { ok: true, proxima_sincronizacion: _proximaSync() };
 }

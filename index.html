@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-24.8";
+const APP_VERSION = "2026-08-24.9";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -513,6 +513,7 @@ function viewOrdenes() {
   const bloque = ORDENES_MODO === "csv" ? bloqueOrdenesCsv() : bloqueOrdenesVtex(ORDENES_MODO);
 
   setMain(H("Ingreso de Órdenes") + `
+    <div id="auto-panel" class="mb-4"></div>
     <div class="flex gap-2 mb-4 flex-wrap">
       ${tab("fravega", "🔵 Frávega (API)")}
       ${tab("oncity", "🏬 OnCity (API)")}
@@ -522,6 +523,88 @@ function viewOrdenes() {
     ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Historial de importaciones</div>
       <div id="ordenes-hist">${spinner("Cargando historial...")}</div>`)}`);
   cargarHistorialOrdenes();  // llena SOLO el div del historial, sin tocar la carga
+  cargarPanelAuto();
+}
+
+/* ── Automatización: estado y disparo manual ────────────────────────── */
+async function cargarPanelAuto() {
+  const cont = $("auto-panel");
+  if (!cont) return;
+  let a;
+  try { a = await api("orders.autoStatus"); }
+  catch (e) { cont.innerHTML = ""; return; }
+  if (!$("auto-panel")) return;
+
+  const u = a.ultima;
+  const ultimaTxt = u
+    ? `${esc(u.fecha_hora)} — <b>${u.enviadas}</b> enviada(s)` +
+      (Number(u.rechazadas) ? ` · <span class="text-red-600">${u.rechazadas} rechazada(s)</span>` : "")
+    : "todavía no corrió ninguna";
+
+  cont.innerHTML = a.habilitada
+    ? `<div class="bg-green-50 border border-green-300 rounded-xl px-4 py-3 flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
+         <div><span class="text-green-700 font-bold">● Automático activado</span>
+           <span class="text-gray-600">— ${esc(a.canales.join(" y "))} a las ${esc(a.horas)} hs</span></div>
+         <div class="text-gray-600">Próxima: <b>${a.proxima ? esc(a.proxima) : "—"}</b></div>
+         <div class="text-gray-600">Última: ${ultimaTxt}</div>
+         <button onclick="correrAuto()" class="ml-auto border border-green-600 text-green-800 px-3 py-1.5 rounded-lg text-xs">
+           ▶️ Correr ahora</button>
+         <a href="#config" class="text-violet-700 underline text-xs">Configurar</a>
+       </div>`
+    : `<div class="bg-gray-100 border border-gray-300 rounded-xl px-4 py-3 flex flex-wrap items-center gap-x-6 gap-y-2 text-sm">
+         <div><span class="text-gray-500 font-bold">● Automático desactivado</span>
+           <span class="text-gray-600">— las órdenes se traen a mano con los botones de abajo</span></div>
+         <div class="text-gray-600">Última corrida automática: ${ultimaTxt}</div>
+         <a href="#config" class="ml-auto text-violet-700 underline text-xs">Activarlo en Configuración</a>
+       </div>`;
+}
+
+function correrAuto() {
+  confirmar("Se van a traer los pedidos nuevos de todos los canales configurados y se van a " +
+            "enviar a Tango, igual que lo haría el proceso automático. ¿Continuar?", async () => {
+    const cont = $("auto-panel");
+    cont.innerHTML = `<div class="bg-violet-50 border border-violet-300 rounded-xl p-4">
+      ${spinner("Corriendo la importación automática... puede tardar varios minutos")}</div>`;
+    let r;
+    try { r = await api("orders.autoRun"); }
+    catch (e) {
+      cont.innerHTML = `<div class="bg-red-50 border border-red-300 rounded-xl p-4 text-sm text-red-700">
+        ${esc(e.message)}</div>`;
+      return;
+    }
+    mostrarResultadoAuto(r);
+    cargarHistorialOrdenes();
+  });
+}
+
+function mostrarResultadoAuto(r) {
+  const filas = Object.keys(r.por_canal || {}).map((k) => {
+    const d = r.por_canal[k];
+    return `<tr><td>${esc(d.nombre)}</td><td class="text-center">${d.leidos}</td>
+      <td class="text-center">${d.nuevas}</td><td class="text-center">${d.saltadas}</td>
+      <td class="text-center font-bold text-green-700">${d.enviadas}</td>
+      <td class="text-center ${d.rechazadas ? "text-red-600 font-bold" : ""}">${d.rechazadas}</td>
+      <td class="text-xs">${d.frenada ? '<span class="text-red-600">frenada por el tope</span>'
+        : d.truncada ? "cortada por tiempo" : "ok"}</td></tr>`;
+  }).join("");
+
+  showModal(`
+    <h3 class="font-bold text-lg mb-3">Corrida automática — ${esc(r.resultado)}</h3>
+    <table class="data w-full mb-3"><thead><tr>
+      <th>Canal</th><th>Leídos</th><th>Nuevos</th><th>Ya enviados</th>
+      <th>Enviados</th><th>Rechazados</th><th></th></tr></thead><tbody>${filas}</tbody></table>
+    ${r.excluidas && r.excluidas.length ? `<div class="text-sm text-red-700 bg-red-50 border border-red-200 rounded p-3 mb-2">
+      ⚠️ ${r.excluidas.length} orden(es) no se enviaron por SKU sin relación:
+      ${r.excluidas.slice(0, 15).map((x) => `<div>· ${esc(x.orden)} → ${x.skus.map(esc).join(", ")}</div>`).join("")}
+      <div class="mt-1"><a href="#pendientes" class="underline font-medium" onclick="closeModal()">Ir a SKU Pendientes</a></div></div>` : ""}
+    ${r.rechazadas && r.rechazadas.length ? `<div class="text-sm text-red-700 bg-red-50 border border-red-200 rounded p-3 mb-2">
+      ❌ Rechazadas por Tango:
+      ${r.rechazadas.slice(0, 15).map((x) => `<div>· ${esc(x.orden)}: ${esc(x.error)}</div>`).join("")}</div>` : ""}
+    ${r.errores && r.errores.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-3">
+      ${r.errores.map((e) => `<div>· ${esc(e)}</div>`).join("")}</div>` : ""}
+    <div class="mt-4 text-right"><button onclick="closeModal(); viewOrdenes();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
+  toast(`${r.enviadas.length} orden(es) enviadas a Tango`,
+        (r.rechazadas.length || r.errores.length) ? "warning" : "ok");
 }
 
 function cambiarModoOrdenes(modo) {
@@ -1531,9 +1614,17 @@ const CONFIG_CAMPOS = [
     ["oncity_dry_run", "Modo simulación (calcula pero NO escribe en VTEX)", "bool"],
     ["oncity_pause_ms", "Pausa entre llamadas a VTEX (ms)", "text"],
   ]],
-  ["Automatización", [
-    ["scheduler_enabled", "Sincronización automática habilitada", "bool"],
+  ["Automatización del stock", [
+    ["scheduler_enabled", "Sincronización de stock automática", "bool"],
     ["scheduler_hours", "Horas del día (0-23, separadas por coma)", "text"],
+  ]],
+  ["Automatización de las órdenes", [
+    ["orders_auto_enabled", "Traer y enviar las órdenes a Tango automáticamente", "bool"],
+    ["orders_auto_hours", "Horas del día (0-23, separadas por coma)", "text"],
+    ["orders_auto_canales", "Canales que entran (fravega, oncity)", "text"],
+    ["orders_auto_max", "Tope: si una corrida encuentra más pedidos que esto, NO envía y avisa", "text"],
+    ["orders_auto_email", "Email para los avisos (vacío = sin aviso)", "text"],
+    ["orders_auto_email_siempre", "Avisar siempre (si no, solo cuando hay algo para revisar)", "bool"],
   ]],
   ["Órdenes", [
     ["orders_counterfoil", "Talonario de pedido", "text"],
