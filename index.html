@@ -46,6 +46,7 @@
       <div id="user-name" class="text-white truncate"></div>
       <div id="user-email" class="opacity-70 truncate mb-2"></div>
       <button onclick="logout()" class="text-violet-300 hover:text-white underline">Cerrar sesión</button>
+      <div id="app-version" class="opacity-40 mt-2 text-[10px]"></div>
     </div>
   </aside>
   <main id="main" class="flex-1 p-6 overflow-x-auto"></main>
@@ -65,6 +66,10 @@
 /* ══════════════ CONFIGURACIÓN (completar al desplegar) ══════════════ */
 // URL de la App web de Apps Script (Implementar → App web → URL que termina en /exec)
 const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217FMXf2niVvhFI93a9dbT5XZxWBkoigYyz-LiP5nA79Sh3/exec";
+// Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
+// Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
+// raros como "Acción desconocida".
+const APP_VERSION = "2026-08-21.3";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -251,17 +256,57 @@ function logout() {
   TOKEN = ""; USER = null; location.hash = ""; location.reload();
 }
 
+/* ══════════════ Control de versión ══════════════ */
+// Compara la versión de este archivo con la del backend desplegado. Sin esto,
+// un HTML viejo contra un backend nuevo (o al revés) falla con mensajes que no
+// dicen nada, como "Acción desconocida: oncity.orders.preview".
+async function verificarVersion() {
+  let v;
+  try { v = await api("version"); }
+  catch (e) {
+    return mostrarAvisoVersion(
+      "No se pudo consultar la versión del backend (" + e.message + "). " +
+      "Puede que la implementación de Apps Script esté desactualizada.");
+  }
+  if (!v || !v.version) {
+    return mostrarAvisoVersion(
+      "El backend no informa su versión, así que es anterior a la " + APP_VERSION + ". " +
+      "Falta pegar el Codigo.gs nuevo y hacer Implementar → Nueva versión.");
+  }
+  if (v.version !== APP_VERSION) {
+    return mostrarAvisoVersion(
+      "Esta pantalla es la versión " + APP_VERSION + " y el backend desplegado es la " +
+      v.version + ". Mientras no coincidan va a haber funciones que fallen.");
+  }
+}
+
+function mostrarAvisoVersion(texto) {
+  const div = document.createElement("div");
+  div.className = "bg-red-600 text-white px-4 py-3 text-sm";
+  div.innerHTML = `<b>⚠️ Versiones desincronizadas.</b> ${esc(texto)}
+    <div class="text-xs mt-1 opacity-90">
+      1) Pegá el <b>Codigo.gs</b> nuevo y guardá ·
+      2) Implementar → Administrar implementaciones → ✏️ → <b>Nueva versión</b> → Implementar ·
+      3) Subí el <b>index.html</b> nuevo ·
+      4) Recargá acá con <b>Ctrl+Shift+R</b> (o Cmd+Shift+R) para saltear la caché.
+    </div>`;
+  const main = $("app-screen");
+  main.insertBefore(div, main.firstChild);
+}
+
 /* ══════════════ Shell ══════════════ */
 function showApp() {
   $("login-screen").classList.add("hidden");
   $("app-screen").classList.remove("hidden");
   $("user-name").textContent = USER.name || "";
   $("user-email").textContent = USER.email || "";
+  $("app-version").textContent = "v" + APP_VERSION;
   $("nav").innerHTML = VIEWS.map((v) =>
     `<a href="#${v.id}" data-view="${v.id}"
         class="nav-item block px-3 py-2 rounded-lg hover:bg-violet-900">${v.label}</a>`).join("");
   window.addEventListener("hashchange", route);
   route();
+  verificarVersion();
 }
 
 function currentView() {

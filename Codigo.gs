@@ -71,6 +71,15 @@ function _canal(nombre) {
   return c;
 }
 
+/**
+ * Versión del backend. El index.html tiene la suya y las compara al arrancar:
+ * si no coinciden, avisa en pantalla. Es para no volver a perder tiempo cuando
+ * el código está pegado pero la implementación quedó en una versión vieja, o
+ * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
+ * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
+ */
+var APP_VERSION = '2026-08-21.3';
+
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
 var SESSION_HOURS = 12;
@@ -286,7 +295,8 @@ function ACTUALIZAR_CONDICION_Y_DEPOSITO() {
 /* ═══════════════ API HTTP (doPost) ═══════════════ */
 
 function doGet() {
-  return _json({ ok: true, servicio: 'Plataforma Tango-Fravega', hora: _now() });
+  return _json({ ok: true, servicio: 'Plataforma Tango-Fravega',
+                 version: APP_VERSION, hora: _now() });
 }
 
 function doPost(e) {
@@ -298,6 +308,9 @@ function doPost(e) {
   try {
     // Login: única acción sin token de sesión
     if (action === 'login') return _json(login(req.credential));
+    // Sin sesión: sirve para que el frontend verifique que está hablando con
+    // la versión del backend que le corresponde.
+    if (action === 'version') return _json({ ok: true, data: { version: APP_VERSION } });
 
     var user = _checkSession(req.token); // lanza si es inválido
     var p = req.payload || {};
@@ -336,7 +349,11 @@ function doPost(e) {
       case 'settings.set':       out = apiSettingsSet(user, p.valores); break;
       case 'oncity.warehouses':  out = vtexWarehouses(); break;
       case 'oncity.test':        out = apiOncityTest(); break;
-      default: throw new Error('Acción desconocida: ' + action);
+      default: throw new Error('Acción desconocida: ' + action +
+        '. El backend desplegado es la versión ' + APP_VERSION + ' y no conoce esa acción: ' +
+        'seguramente el index.html y la implementación de Apps Script no están en la misma ' +
+        'versión. Revisá que hayas hecho Implementar → Nueva versión, y recargá la página ' +
+        'con Ctrl+Shift+R.');
     }
     return _json({ ok: true, data: out });
   } catch (err) {
