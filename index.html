@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-24.7";
+const APP_VERSION = "2026-08-24.8";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -610,6 +610,7 @@ function pintarOrdenesVtex() {
         <span>🆕 Nuevos: <b>${a.nuevas.length}</b></span>
         <span>⏩ Ya enviados: <b>${a.saltadas.length}</b></span>
         <span class="${a.excluidas.length ? "text-red-600" : ""}">🚫 Sin relación de SKU: <b>${a.excluidas.length}</b></span>
+        ${a.ignorados && a.ignorados.length ? `<span class="text-gray-500" title="${esc(a.ignorados.join(", "))}">🙈 Ignorados: <b>${a.ignorados.length}</b></span>` : ""}
         ${a.fallidas.length ? `<span class="text-red-600">⚠️ Con error: <b>${a.fallidas.length}</b></span>` : ""}
       </div>
 
@@ -625,6 +626,9 @@ function pintarOrdenesVtex() {
           <button onclick="marcarTodosVtex(true)" class="text-violet-700 underline">Tildar todos</button>
           <button onclick="marcarTodosVtex(false)" class="text-violet-700 underline">Destildar todos</button>
           <span id="vtx-contador" class="text-gray-500"></span>
+          <button onclick="ignorarVtex()" class="ml-auto text-gray-500 hover:text-red-600 underline"
+            title="Saca los tildados de la lista para siempre. Para pedidos que VTEX no mueve de estado y reaparecen en cada búsqueda.">
+            🙈 Ignorar los tildados</button>
         </div>
         <div class="max-h-96 overflow-y-auto mb-3">
         <table class="data w-full"><thead><tr>
@@ -741,6 +745,23 @@ function enviarOrdenesVtex() {
     } catch (e) { /* el historial es secundario */ }
     VTEX_ORDENES = null;
     cargarHistorialOrdenes();
+  });
+}
+
+function ignorarVtex() {
+  const a = VTEX_ORDENES;
+  if (!a) return;
+  const idx = Array.from(document.querySelectorAll(".vtx-chk:checked")).map((c) => Number(c.dataset.i));
+  if (!idx.length) return toast("No hay ningún pedido tildado", "warning");
+  const ordenes = idx.map((i) => a.nuevas[i].orden);
+
+  confirmar(`Se van a ignorar ${ordenes.length} pedido(s): no se mandan a Tango y no vuelven a ` +
+            `aparecer en las búsquedas de ${a.nombre}. Se puede deshacer en Configuración.`, async () => {
+    try {
+      const r = await api("vtex.orders.ignore", { canal: a.canal, ordenes });
+      toast(`${r.agregadas} pedido(s) ignorados (${r.total} en total)`, "ok");
+      buscarOrdenesVtex(a.canal);
+    } catch (e) { toast(e.message, "error"); }
   });
 }
 
@@ -1535,6 +1556,7 @@ const CONFIG_CAMPOS = [
     ["fvtex_precio_divisor", "Divisor de precios (VTEX manda centavos: 100)", "text"],
     ["fvtex_facturar_envio", "Sumar el costo de envío al total (apagado con Frávega Envíos)", "bool"],
     ["fvtex_sale_condition", "Condición de venta (vacío = la general)", "text"],
+    ["fvtex_ignorar", "Pedidos a ignorar siempre (separados por coma)", "text"],
   ]],
   ["Pedidos de OnCity (VTEX)", [
     ["oncity_sale_condition", "Condición de venta de Tango para OnCity", "text"],
@@ -1551,6 +1573,7 @@ const CONFIG_CAMPOS = [
     ["oncity_invoice_counterfoil", "Talonario de factura (vacío = el mismo que Frávega)", "text"],
     ["oncity_orders_warehouse", "Depósito de pedidos (vacío = el mismo que Frávega)", "text"],
     ["oncity_seller_code", "Vendedor (vacío = el mismo que Frávega)", "text"],
+    ["oncity_ignorar", "Pedidos a ignorar siempre (separados por coma)", "text"],
   ]],
   ["Facturas", [
     ["invoices_match_importe", "Usar también el importe para matchear facturas", "bool"],

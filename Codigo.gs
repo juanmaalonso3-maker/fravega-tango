@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-24.7';
+var APP_VERSION = '2026-08-24.8';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -157,6 +157,7 @@ var DEFAULT_CONFIG = [
   ['oncity_espera_min', '0', 'Minutos de antigüedad mínima del pedido (OnCity no lo necesita)'],
   ['oncity_id_field', 'auto', 'Nro de Orden: auto | orderId | marketplaceOrderId'],
   ['oncity_quitar_prefijo', '', 'Prefijo a sacarle al orderId (OnCity no necesita)'],
+  ['oncity_ignorar', '', 'Pedidos que no hay que traer nunca (separados por coma)'],
   ['oncity_sale_condition', '01', 'Condición de venta de Tango para OnCity'],
   ['oncity_counterfoil', '', 'Talonario de pedido para OnCity (vacío = el mismo que Frávega)'],
   ['oncity_invoice_counterfoil', '', 'Talonario de factura para OnCity (vacío = el mismo que Frávega)'],
@@ -174,6 +175,16 @@ var DEFAULT_CONFIG = [
   ['fvtex_espera_min', '90', 'Minutos de antigüedad mínima del pedido (Envío Pack necesita 90)'],
   ['fvtex_id_field', 'auto', 'Nro de Orden: auto | orderId | marketplaceOrderId'],
   ['fvtex_quitar_prefijo', 'FVG-', 'Prefijo a sacarle al orderId de VTEX para que coincida con el Nro de Orden del CSV'],
+  // Pedidos que VTEX sigue mostrando en "handling" pero que NO hay que mandar a
+  // Tango. Verificado contra el CSV del 24/08: cuatro figuran como Facturada y
+  // seis ni siquiera aparecen en el reporte de Frávega. Quedan trabados porque
+  // la factura se sube por planilla al seller center y eso no mueve el estado
+  // en VTEX. Sin esta lista reaparecen en cada búsqueda.
+  ['fvtex_ignorar',
+   'v92800253frvg-02,v92301597frvg-01,v92231043frvg-01,v91950395frvg-01,' +
+   'v92387730frvg-02,v92039990frvg-01,v92031720frvg-02,v91729694frvg-01,' +
+   'v91647562frvg-02,v90875662frvg-02',
+   'Pedidos que no hay que traer nunca (separados por coma)'],
   ['invoices_match_importe', '1', 'Usar también el importe para matchear facturas'],
   ['invoices_tolerancia_importe', '1', 'Diferencia máxima de importe aceptada (en pesos)'],
   ['invoices_origen', 'historial', 'De dónde salen las órdenes a facturar: historial | csv'],
@@ -365,6 +376,7 @@ function doPost(e) {
       case 'vtex.orders.preview': out = apiVtexOrdersPreview(user, p); break;
       case 'vtex.orders.send':    out = apiVtexOrdersSend(user, p); break;
       case 'vtex.test':           out = apiVtexTest(p.canal); break;
+      case 'vtex.orders.ignore':  out = apiVtexIgnorar(user, p); break;
       case 'oncity.invoices':     out = apiOncityInvoices(user, p); break;
       case 'skus.list':          out = apiSkusList(p.q || ''); break;
       case 'skus.save':          out = apiSkusSave(user, p); break;
@@ -1743,7 +1755,9 @@ function _cfgCanal(cfg, canal) {
     max_detalle: parseInt(_cfgCanalVal(cfg, canal, 'max_detalle', '120'), 10) || 120,
     espera_min: Math.max(0, parseInt(_cfgCanalVal(cfg, canal, 'espera_min', '0'), 10) || 0),
     id_field: _cfgCanalVal(cfg, canal, 'id_field', 'auto'),
-    quitar_prefijo: _cfgCanalVal(cfg, canal, 'quitar_prefijo', '')
+    quitar_prefijo: _cfgCanalVal(cfg, canal, 'quitar_prefijo', ''),
+    ignorar: String(_cfgCanalVal(cfg, canal, 'ignorar', ''))
+      .split(',').map(function (x) { return x.trim(); }).filter(String)
   };
 }
 
@@ -1984,6 +1998,9 @@ function apiVtexOrdersPreview(user, p) {
       saltadas = [], excluidas = [], fallidas = [];
   var detalles = 0, truncada = false, totalListados = 0, campoId = '';
   var porEstado = {};   // cuántos pedidos vinieron de cada estado
+  var ignorados = [];
+  var setIgnorar = {};
+  c.ignorar.forEach(function (x) { setIgnorar[x] = true; });
 
   for (var e = 0; e < c.estados.length && !truncada; e++) {
     var pagina = 1, paginas = 1;
@@ -2003,6 +2020,7 @@ function apiVtexOrdersPreview(user, p) {
           ? String(it.marketplaceOrderId || it.orderId || '')
           : _sinPrefijo(it.orderId || it.marketplaceOrderId || '', c.quitar_prefijo);
         if (!idOrden) continue;
+        if (setIgnorar[idOrden]) { ignorados.push(idOrden); continue; }
         if (sent[idOrden]) { saltadas.push(idOrden); continue; }
 
         if (detalles >= c.max_detalle || (Date.now() - t0) > 4.5 * 60 * 1000) {
@@ -2069,13 +2087,38 @@ function apiVtexOrdersPreview(user, p) {
     estados: c.estados, por_estado: porEstado,
     listados: totalListados, campo_id: campoId || c.id_field,
     orders: orders, registros: registros,
-    nuevas: nuevas, saltadas: saltadas,
+    nuevas: nuevas, saltadas: saltadas, ignorados: ignorados,
     excluidas: excluidas, fallidas: fallidas,
     truncada: truncada,
     condicion_venta: c.orders_sale_condition,
     talonario: c.orders_counterfoil,
     espera_min: c.espera_min
   };
+}
+
+/**
+ * Agrega pedidos a la lista de ignorados del canal.
+ * Sirve para sacarse de encima los que VTEX no mueve de estado: si no, vuelven
+ * a aparecer en cada búsqueda.
+ */
+function apiVtexIgnorar(user, p) {
+  p = p || {};
+  var canal = String(p.canal || 'oncity').toLowerCase();
+  var nuevas = (p.ordenes || []).map(function (x) { return String(x).trim(); }).filter(String);
+  if (!nuevas.length) return { ok: true, total: 0 };
+
+  var clave = _canal(canal).prefijo + 'ignorar';
+  var actual = String(getConfig(clave) || '')
+    .split(',').map(function (x) { return x.trim(); }).filter(String);
+  var set = {};
+  actual.forEach(function (x) { set[x] = true; });
+  var agregadas = 0;
+  nuevas.forEach(function (x) { if (!set[x]) { set[x] = true; actual.push(x); agregadas++; } });
+
+  setConfig(clave, actual.join(','));
+  log_(user.email, 'ordenes', 'Pedidos ignorados en ' + _canal(canal).nombre, 'warning',
+       'agregados=' + agregadas + ' total=' + actual.length + ' · ' + nuevas.join(','));
+  return { ok: true, agregadas: agregadas, total: actual.length };
 }
 
 /** Manda a Tango los pedidos ya armados de un canal. */
