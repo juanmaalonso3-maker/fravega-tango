@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-26.04";
+const APP_VERSION = "2026-08-26.05";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -1618,6 +1618,8 @@ async function viewAvtex() {
         <button onclick="correrAvtex()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
           📤 Informar las pendientes ahora</button>
         <button onclick="viewAvtex()" class="border px-4 py-2 rounded-lg text-sm">Actualizar</button>
+        <button onclick="verificarFravega()" class="border px-4 py-2 rounded-lg text-sm">
+          🔍 Verificar si Frávega las procesó</button>
         <button onclick="repararFravegaVtex()" class="border border-amber-300 bg-amber-50 text-amber-900 px-4 py-2 rounded-lg text-sm">
           🩹 Revisar las de Frávega mandadas a VTEX</button>
         <span class="text-sm text-gray-500 ml-auto">
@@ -2027,6 +2029,41 @@ async function repararFacturadas() {
       Ya podés volver a generar el archivo de facturas: estas órdenes van a entrar,
       con su número de factura y su URL.</div>` : ""}
     <div class="mt-4 text-right"><button onclick="closeModal(); viewPdfs();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
+}
+
+/**
+ * Frávega acepta y procesa después. Esto mira el estado del pedido en VTEX
+ * —que es su backend— para saber si la factura realmente se aplicó.
+ */
+async function verificarFravega() {
+  showModal(`<h3 class="font-bold text-lg mb-3">Verificando en Frávega…</h3>${spinner()}`);
+  let r;
+  try { r = await api("vtexinv.verificar"); }
+  catch (e) {
+    return showModal(`<h3 class="font-bold text-lg mb-3">Verificación</h3>
+      <p class="text-red-600 text-sm">${esc(e.message)}</p>
+      <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
+  }
+  showModal(`
+    <h3 class="font-bold text-lg mb-2">¿Frávega las procesó?</h3>
+    <div class="text-sm text-gray-600 mb-3">Seller Center contesta "recibido" y procesa después.
+      Esto mira el estado del pedido en VTEX, que es el backend de Frávega: cuando pasa a
+      <code>invoiced</code>, la factura se aplicó de verdad.</div>
+    <div class="text-sm space-y-1 mb-3">
+      <div>Facturas aceptadas pendientes de confirmar: <b>${r.revisadas || 0}</b></div>
+      <div class="text-green-700">Confirmadas ahora: <b>${r.confirmadas || 0}</b></div>
+      ${r.esperando ? `<div class="text-gray-600">Todavía procesando (es normal los primeros
+        minutos): <b>${r.esperando}</b></div>` : ""}
+      ${(r.perdidas || []).length ? `<div class="text-amber-700">Sin novedad hace rato:
+        <b>${r.perdidas.length}</b></div>` : ""}
+      ${!r.revisadas ? `<div class="text-gray-600">No hay ninguna esperando confirmación.</div>` : ""}
+    </div>
+    ${(r.perdidas || []).length ? `<div class="text-xs bg-amber-50 border border-amber-200 rounded p-2 mb-2 max-h-48 overflow-y-auto">
+      ${r.perdidas.map(esc).join("<br>")}
+      <div class="mt-2 text-gray-600">Conviene mirarlas en el panel de Seller Center.</div></div>` : ""}
+    ${(r.detalle || []).length ? `<div class="text-xs bg-gray-50 border rounded p-2 max-h-32 overflow-y-auto">
+      ${r.detalle.map(esc).join("<br>")}</div>` : ""}
+    <div class="mt-4 text-right"><button onclick="closeModal(); viewAvtex();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
 }
 
 /** Manda una sola orden y muestra el envío completo. */
@@ -2650,6 +2687,7 @@ const CONFIG_CAMPOS = [
     ["vtex_invoice_pausa_ms", "Pausa entre llamadas (ms)", "text"],
     ["fvg_invoice_formato", "Formato del nro de factura para Frávega: tango · guion · guion_letra", "text"],
     ["fvg_invoice_exigir_url", "Frávega: esperar a tener el PDF antes de informar (la pide obligatoria)", "bool"],
+    ["fvg_invoice_horas_alerta", "Frávega: horas a esperar la confirmación antes de avisar", "text"],
   ]],
   ["Facturas", [
     ["invoices_match_importe", "Usar también el importe para matchear facturas", "bool"],

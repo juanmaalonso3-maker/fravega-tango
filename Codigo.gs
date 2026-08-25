@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-26.04';
+var APP_VERSION = '2026-08-26.05';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -224,6 +224,7 @@ var DEFAULT_CONFIG = [
   ['vtex_invoice_al_vuelo', '1', 'Informar apenas llega el aviso de Tango (si no, solo en las corridas)'],
   ['fvg_invoice_formato', 'tango', 'Formato del nro de factura para Frávega: tango (B0000700002727) · guion (00007-00002727) · guion_letra'],
   ['fvg_invoice_exigir_url', '1', 'Frávega pide la URL del PDF: si falta, esperar en vez de mandar incompleta'],
+  ['fvg_invoice_horas_alerta', '6', 'Horas a esperar la confirmación de Frávega antes de avisar'],
   ['invoices_match_importe', '1', 'Usar también el importe para matchear facturas'],
   ['invoices_tolerancia_importe', '1', 'Diferencia máxima de importe aceptada (en pesos)'],
   ['invoices_origen', 'historial', 'De dónde salen las órdenes a facturar: historial | csv'],
@@ -516,6 +517,7 @@ function doPost(e) {
       case 'vtexinv.log':         out = apiVtexInvoicesLog(p); break;
       case 'vtexinv.pendientes':  out = apiVtexInvoicesPendientes(); break;
       case 'vtexinv.reparar':     out = apiRepararFravegaVtex(user, p); break;
+      case 'vtexinv.verificar':   out = apiVerificarFravega(user); break;
       case 'orders.autoRun':      out = apiOrdersAutoRun(user); break;
       case 'oncity.invoices':     out = apiOncityInvoices(user, p); break;
       case 'skus.list':          out = apiSkusList(p.q || ''); break;
@@ -2513,7 +2515,13 @@ function runOrdersImport(disparadaPor) {
         if (res.vtex_facturas.fallidas) {
           res.errores = res.errores.concat(res.vtex_facturas.errores);
         }
-      } catch (e3) { res.errores.push('Informar facturas a VTEX: ' + e3.message); }
+        // Frávega acepta y procesa después: acá confirmamos las que ya terminó.
+        res.fvg_verificadas = verificarFacturasFravega(disparadaPor,
+                                { deadline: t0 + 5.5 * 60 * 1000 });
+        if (res.fvg_verificadas.perdidas.length) {
+          res.errores = res.errores.concat(res.fvg_verificadas.perdidas);
+        }
+      } catch (e3) { res.errores.push('Informar facturas al marketplace: ' + e3.message); }
     }
 
     _avisarCorrida(cfg, res);
@@ -4590,13 +4598,20 @@ function _fvgNotificarFactura(orderId, factura, cfg) {
 
   if (res.http >= 200 && res.http < 300) {
     res.ok = true;
-    // OJO: 202 es "recibido", no "procesado". Frávega lo hace asincrónico.
-    res.estado = 'aceptada (202)';
-    var id = '';
-    try { id = String((JSON.parse(txt) || {}).id || ''); } catch (e2) { /* nada */ }
+    // El código real, no uno escrito a mano: la documentación dice 202 pero en
+    // la práctica contesta 200. Lo que importa es que sea 2xx.
+    res.estado = 'aceptada (' + res.http + ')';
+    var id = '', estadoFvg = '';
+    try {
+      var j = JSON.parse(txt) || {};
+      id = String(j.id || '');
+      estadoFvg = String(j.status || '');
+    } catch (e2) { /* nada */ }
+    res.transaccion = id;
+    res.estado_vtex = estadoFvg;      // en Frávega es el estado del procesamiento
     res.detalle = 'Frávega recibió la factura' + (id ? ' (transacción ' + id + ')' : '') +
-                  '. El procesamiento es asincrónico: se confirma en unos minutos. ' +
-                  txt.slice(0, 200);
+                  (estadoFvg ? ' · estado: ' + estadoFvg : '') +
+                  '. Es asincrónico: todavía no está confirmada. ' + txt.slice(0, 200);
     return res;
   }
 
@@ -4685,6 +4700,112 @@ function REPARAR_FRAVEGA_VTEX(soloVer) {
 function apiRepararFravegaVtex(user, p) {
   p = p || {};
   return REPARAR_FRAVEGA_VTEX(!(p.aplicar === true || p.aplicar === '1'));
+}
+
+/**
+ * VERIFICACIÓN — ¿Frávega terminó de procesar las facturas que aceptó?
+ *
+ * Seller Center contesta 2xx con status "processing": eso es "lo recibí", no
+ * "lo hice". La confirmación real llega cuando el pedido cambia de estado.
+ *
+ * Como Frávega usa VTEX de backend, podemos verlo sin depender de que bajes el
+ * CSV: si el pedido pasó a "invoiced" en VTEX, la factura se procesó de verdad.
+ * Ahí recién marcamos la orden como confirmada.
+ *
+ * Corre sola después de cada corrida automática y también desde el botón.
+ */
+function verificarFacturasFravega(quien, opciones) {
+  opciones = opciones || {};
+  var res = { revisadas: 0, confirmadas: 0, esperando: 0, perdidas: [], detalle: [] };
+
+  var sheet = _sheetAuto(SH.SENT, COLS_SENT);
+  var last = sheet.getLastRow();
+  if (last < 2) return res;
+
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+                  .map(function (h) { return String(h).trim(); });
+  var col = {}; headers.forEach(function (h, i) { col[h] = i; });
+  if (col.vtex_notificada === undefined) return res;
+
+  var ancho = sheet.getLastColumn();
+  var datos = sheet.getRange(2, 1, last - 1, ancho).getValues();
+  var cfg = _configMap();
+  var horas = parseFloat(_cfgVal(cfg, 'fvg_invoice_horas_alerta')) || 6;
+  var t0 = Date.now();
+  var limite = opciones.deadline || (t0 + 2.5 * 60 * 1000);
+  var hubo = false;
+
+  for (var i = 0; i < datos.length; i++) {
+    if (Date.now() > limite) { res.truncado = true; break; }
+    var fila = datos[i];
+    if (String(fila[col.canal] || '').toLowerCase() !== 'fravega') continue;
+    var marca = String(fila[col.vtex_notificada] || '');
+    if (marca.indexOf('aceptada') === -1) continue;      // nada que verificar
+    if (marca.indexOf('confirmada') !== -1) continue;    // ya está
+
+    var orden = String(fila[col.order_id] || '').trim();
+    if (!orden) continue;
+    res.revisadas++;
+
+    var det;
+    try {
+      det = vtexOrderDetail('fravega', _idVtex('fravega', orden, cfg));
+    } catch (e) {
+      res.detalle.push(orden + ': no se pudo leer en VTEX (' + e.message + ')');
+      continue;
+    }
+
+    var st = String(det.status || '');
+    if (st === 'invoiced' || st === 'handling-shipping' || st === 'shipped' ||
+        st === 'delivered' || st === 'complete') {
+      fila[col.vtex_notificada] = marca + ' · confirmada ' + _now() + ' (' + st + ')';
+      res.confirmadas++;
+      hubo = true;
+      continue;
+    }
+
+    // Sigue en handling: puede ser normal si recién se mandó.
+    var cuando = marca.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2})/);
+    var viejo = false;
+    if (cuando) {
+      var d = new Date(cuando[1].replace(' ', 'T') + ':00');
+      viejo = (Date.now() - d.getTime()) > horas * 3600 * 1000;
+    }
+    if (viejo) {
+      res.perdidas.push(orden + ' — aceptada hace más de ' + horas +
+                        ' h y el pedido sigue en "' + st + '"');
+    } else {
+      res.esperando++;
+    }
+  }
+
+  if (hubo) sheet.getRange(2, 1, datos.length, ancho).setValues(datos);
+
+  if (res.revisadas) {
+    log_(quien || 'automatico', 'facturas', 'Verificación de facturas en Frávega',
+         res.perdidas.length ? 'warning' : 'ok',
+         'revisadas=' + res.revisadas + ' confirmadas=' + res.confirmadas +
+         ' esperando=' + res.esperando + ' sin_novedad=' + res.perdidas.length,
+         Date.now() - t0);
+  }
+  return res;
+}
+
+/** Desde la pantalla. */
+function apiVerificarFravega(user) {
+  var r = verificarFacturasFravega(user.email);
+  if (r.perdidas.length) {
+    var para = getConfig('orders_auto_email');
+    if (para) {
+      try {
+        MailApp.sendEmail(para, 'Facturas aceptadas por Frávega que no se confirman',
+          'Frávega aceptó estas facturas pero los pedidos siguen sin pasar a facturado:\n\n' +
+          r.perdidas.join('\n') +
+          '\n\nConviene revisarlas en el panel de Seller Center.');
+      } catch (e) { /* queda en el log */ }
+    }
+  }
+  return r;
 }
 
 /* ── Orquestación: cola, reintentos y registro ─────────────────────────── */
