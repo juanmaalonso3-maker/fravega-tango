@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-25.20';
+var APP_VERSION = '2026-08-25.22';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -106,7 +106,7 @@ var SH = {
 var COLS_WEBHOOKS = ['fecha_hora', 'topic', 'resource', 'message',
                      'resultado', 'detalle', 'raw'];
 var COLS_PDFS = ['nro_factura', 'order_id', 'url', 'archivo_id',
-                 'fecha_hora', 'origen', 'detalle'];
+                 'fecha_hora', 'origen', 'detalle', 'vence'];
 
 /**
  * Columnas de OrdenesEnviadas. Antes eran solo [order_id, fecha_hora]; ahora
@@ -206,8 +206,10 @@ var DEFAULT_CONFIG = [
   ['pdf_folder_nombre', 'Facturas Marketplaces', 'Nombre de la carpeta de Drive'],
   ['pdf_publico', '1', 'Publicar los PDF como "cualquiera con el link"'],
   ['pdf_url_formato', 'download', 'Formato del link: download (sirve el PDF) o view (página de Drive)'],
-  ['pdf_usar_url_tango', 'auto', 'Usar la URL de Tango si es pública: auto | siempre | nunca'],
-  ['pdf_ruta_ok', '', 'Ruta de la API de Tango que sirve el PDF (se aprende sola)'],
+  ['pdf_destino', 'tango', 'Dónde vive el PDF: tango (la URL de Tango, que vence) o drive (copia propia)'],
+  ['pdf_dias_sync', '30', 'Días hacia atrás al sincronizar comprobantes'],
+  ['webhook_solo_nuestras', '1', 'Procesar solo los avisos de pedidos que mandó esta app'],
+  ['webhook_talonarios', '', 'Talonarios de Frávega/OnCity, separados por coma (vacío = todos). Ej: 00007,00008'],
   ['invoices_match_importe', '1', 'Usar también el importe para matchear facturas'],
   ['invoices_tolerancia_importe', '1', 'Diferencia máxima de importe aceptada (en pesos)'],
   ['invoices_origen', 'historial', 'De dónde salen las órdenes a facturar: historial | csv'],
@@ -490,6 +492,9 @@ function doPost(e) {
       case 'pdfs.list':           out = apiPdfsList(p.q); break;
       case 'pdfs.test':           out = apiPdfsTest(user); break;
       case 'pdfs.buscar':         out = apiPdfBuscar(user, p); break;
+      case 'pdfs.sync':           out = apiPdfsSync(user, p); break;
+      case 'facturas.buscar':     out = apiFacturasBuscar(p); break;
+      case 'pdfs.talonarios':     out = apiTalonariosSugeridos(p); break;
       case 'orders.autoRun':      out = apiOrdersAutoRun(user); break;
       case 'oncity.invoices':     out = apiOncityInvoices(user, p); break;
       case 'skus.list':          out = apiSkusList(p.q || ''); break;
@@ -2624,6 +2629,17 @@ function _procesarWebhook(req, e) {
     return { ok: false, error: 'no autorizado' };
   }
 
+  // Solo nos interesan los pedidos que mandó esta app (Frávega y OnCity).
+  // Los de otros orígenes ensucian la lista y no aportan nada.
+  if ((topic === 'InvoiceFile' || topic === 'OrderBilled') &&
+      getConfig('webhook_solo_nuestras') === '1' && resource) {
+    if (!_sentIds()[resource]) {
+      log_('tango', 'facturas', 'Aviso ignorado: el pedido no es de esta app', 'info',
+           topic + ' · ' + resource);
+      return { ok: true, ignorado: true };
+    }
+  }
+
   var resultado = 'recibido', detalle = '';
   try {
     if (topic === 'InvoiceFile') {
@@ -2663,218 +2679,174 @@ function _procesarWebhook(req, e) {
  * Intenta sacar el PDF del payload. Como no sabemos cómo lo manda Tango,
  * probamos las formas razonables y dejamos anotado cuál funcionó.
  */
-function _guardarPdfDeWebhook(req, resource, message) {
-  var nro = _buscarNroFactura(req);
-  var blob = null, via = '';
-  var url = _buscarUrlPdf(req);
-
-  // 1) Si el aviso trae una URL, lo PRIMERO es ver si sirve tal cual.
-  //    Los marketplaces necesitan una URL PÚBLICA: si la de Tango se puede
-  //    abrir sin credenciales, la usamos directo y no hace falta copiar nada
-  //    a Drive. Si pide autenticación (que es lo más probable, porque el resto
-  //    de la API de Tango la pide), la bajamos nosotros y la republicamos.
-  var modo = getConfig('pdf_usar_url_tango') || 'auto';
-  if (url && modo !== 'nunca') {
-    var publica = _urlEsPublica(url);
-    if (publica.ok || modo === 'siempre') {
-      _registrarFactura({ nro_factura: nro, order_id: resource, url: url,
-                          archivo_id: '', origen: 'url_tango',
-                          detalle: publica.ok
-                            ? 'URL pública de Tango, usada tal cual'
-                            : 'forzada por configuración (' + publica.detalle + ')' });
-      return { ok: true, detalle: 'URL de Tango usada directamente · ' + url };
-    }
-    via = 'la URL de Tango no es pública (' + publica.detalle + '), se copió a Drive';
-  }
-
-  // 2) No sirve tal cual: la bajamos con las credenciales de Tango
-  if (url) {
-    try {
-      var resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true,
-                                          headers: _tangoHeaders() });
-      if (resp.getResponseCode() === 200) {
-        blob = resp.getBlob();
-        if (!via) via = 'descargado de ' + url;
-      }
-    } catch (err) { /* seguimos probando */ }
-  }
-
-  // 2) Algún campo con el PDF en base64
-  if (!blob) {
-    var b64 = _buscarBase64(req);
-    if (b64) {
-      try {
-        blob = Utilities.newBlob(Utilities.base64Decode(b64), 'application/pdf');
-        via = 'base64 en el payload';
-      } catch (err) { /* seguimos */ }
-    }
-  }
-
-  // 3) El aviso no traía el archivo. Según la guía de Tango, "Resource" es el
-  //    OrderId: puede que el PDF haya que ir a buscarlo a un endpoint que la
-  //    documentación no detalla. Probamos los candidatos razonables y dejamos
-  //    anotado qué respondió cada uno, para no tener que adivinar dos veces.
-  if (!blob && resource) {
-    var sondeo = _buscarPdfEnApiTango(resource);
-    if (sondeo.blob) { blob = sondeo.blob; via = sondeo.via; }
-    else {
-      return { ok: false,
-               detalle: 'No se encontró el PDF. Sondeo de endpoints: ' + sondeo.diag };
-    }
-  }
-
-  if (!blob) {
-    return { ok: false,
-             detalle: 'No se encontró el PDF en el aviso. Revisá el crudo de esta fila ' +
-                      'para ver cómo lo manda Tango y lo ajusto.' };
-  }
-
-  var nombre = (nro || resource || 'factura') + '.pdf';
-  blob.setName(nombre);
-  var guardado = _guardarPdfEnDrive(blob, nombre);
-
-  _registrarFactura({ nro_factura: nro, order_id: resource, url: guardado.url,
-                      archivo_id: guardado.id, origen: 'InvoiceFile', detalle: via });
-
-  return { ok: true, detalle: via + ' · ' + guardado.url };
-}
-
 /**
- * Busca el PDF en la API de Tango a partir del OrderId.
- * La documentación no expone un endpoint para bajar el comprobante, así que
- * probamos las rutas más probables. Devuelve el blob si alguna funciona, y
- * SIEMPRE el detalle de qué contestó cada una: con eso se ajusta al primer
- * intento en vez de ir probando a ciegas.
+ * GET /api/Aperture/Invoices — la relación entre las órdenes y sus
+ * comprobantes electrónicos, CON la URL del PDF.
+ *
+ * Este es el "recurso habilitado para tal fin" que menciona la guía. Devuelve
+ * OrderId, OrderNumber, InvoiceType, InvoiceNumber, InvoiceFileUrl y
+ * InvoiceFileExpiration.
+ *
+ * OJO CON LA EXPIRACIÓN: la URL que da Tango apunta a un S3 y tiene fecha de
+ * vencimiento. No sirve para dársela a Frávega o a OnCity, porque en algún
+ * momento deja de funcionar y el link de la factura queda roto. Por eso el PDF
+ * se baja y se republica en Drive, que no vence.
  */
-function _buscarPdfEnApiTango(orderId) {
-  var id = encodeURIComponent(orderId);
+function tangoInvoices(filtros) {
+  filtros = filtros || {};
+  var out = [], page = 1;
+  while (page <= 50) {
+    var qs = '?pageSize=500&pageNumber=' + page;
+    if (filtros.orderId) qs += '&orderId=' + encodeURIComponent(filtros.orderId);
+    if (filtros.orderNumber) qs += '&orderNumber=' + encodeURIComponent(filtros.orderNumber);
+    if (filtros.fromDate) qs += '&fromDate=' + encodeURIComponent(filtros.fromDate);
+    if (filtros.toDate) qs += '&toDate=' + encodeURIComponent(filtros.toDate);
 
-  // Tango reintenta si el webhook tarda o falla, así que hay que contestar
-  // rápido. Sondear ocho rutas en cada aviso sería lento; por eso, apenas una
-  // funciona, la guardamos y de ahí en más probamos solo esa.
-  var guardada = getConfig('pdf_ruta_ok');
-  if (guardada) {
-    var rg = _intentarRutaPdf(guardada.replace('{id}', id));
-    if (rg.blob) return { blob: rg.blob, via: 'bajado de ' + guardada, diag: 'ruta cacheada' };
-    setConfig('pdf_ruta_ok', '');   // dejó de servir: volvemos a sondear
-  }
-
-  var rutas = [
-    '/order/' + id + '/invoice',
-    '/order/' + id + '/invoicefile',
-    '/order/' + id + '/file',
-    '/invoice/' + id,
-    '/InvoiceFile/' + id,
-    '/InvoiceFile?orderId=' + id,
-    '/order/invoice?orderId=' + id,
-    '/order/' + id
-  ];
-  var diag = [];
-  for (var i = 0; i < rutas.length; i++) {
-    try {
-      var r = UrlFetchApp.fetch(TANGO_BASE + rutas[i],
-                                { headers: _tangoHeaders(), muteHttpExceptions: true });
-      var plantilla = rutas[i].replace(id, '{id}');
-      var code = r.getResponseCode();
-      if (code === 200) {
-        var tipo = '';
-        try {
-          var hs = r.getAllHeaders();
-          Object.keys(hs).forEach(function (k) {
-            if (String(k).toLowerCase() === 'content-type') tipo = String(hs[k]).toLowerCase();
-          });
-        } catch (e) { /* seguimos */ }
-
-        if (tipo.indexOf('pdf') !== -1) {
-          setConfig('pdf_ruta_ok', plantilla);
-          return { blob: r.getBlob(), via: 'bajado de ' + rutas[i], diag: diag.join(' · ') };
-        }
-        var txt = '';
-        try { txt = r.getContentText(); } catch (e) { txt = ''; }
-        if (txt.indexOf('%PDF') === 0) {
-          setConfig('pdf_ruta_ok', plantilla);
-          return { blob: r.getBlob(), via: 'bajado de ' + rutas[i], diag: diag.join(' · ') };
-        }
-        // Respondió algo que no es un PDF: puede traer adentro la URL o el base64
-        try {
-          var obj = JSON.parse(txt);
-          var u = _buscarUrlPdf(obj);
-          if (u) {
-            var r2 = UrlFetchApp.fetch(u, { headers: _tangoHeaders(), muteHttpExceptions: true });
-            if (r2.getResponseCode() === 200) {
-              return { blob: r2.getBlob(), via: 'URL obtenida de ' + rutas[i],
-                       diag: diag.join(' · ') };
-            }
-          }
-          var b = _buscarBase64(obj);
-          if (b) {
-            return { blob: Utilities.newBlob(Utilities.base64Decode(b), 'application/pdf'),
-                     via: 'base64 obtenido de ' + rutas[i], diag: diag.join(' · ') };
-          }
-        } catch (e) { /* no era JSON */ }
-        diag.push(rutas[i] + '→200 (' + (tipo || 'sin tipo') + ', ' +
-                  txt.slice(0, 60).replace(/\s+/g, ' ') + ')');
-      } else {
-        diag.push(rutas[i] + '→' + code);
-      }
-    } catch (e) {
-      diag.push(rutas[i] + '→error');
-    }
-  }
-  return { blob: null, via: '', diag: diag.join(' · ') };
-}
-
-/** Un intento contra una ruta de Tango; devuelve el blob si es un PDF. */
-function _intentarRutaPdf(ruta) {
-  try {
-    var r = UrlFetchApp.fetch(TANGO_BASE + ruta,
+    var r = UrlFetchApp.fetch(TANGO_BASE + '/Invoices' + qs,
                               { headers: _tangoHeaders(), muteHttpExceptions: true });
-    if (r.getResponseCode() !== 200) return { blob: null };
-    var txt = '';
-    try { txt = r.getContentText().slice(0, 5); } catch (e) { txt = ''; }
-    if (txt.indexOf('%PDF') === 0) return { blob: r.getBlob() };
-    var tipo = '';
-    try {
-      var hs = r.getAllHeaders();
-      Object.keys(hs).forEach(function (k) {
-        if (String(k).toLowerCase() === 'content-type') tipo = String(hs[k]).toLowerCase();
-      });
-    } catch (e) { /* nada */ }
-    return tipo.indexOf('pdf') !== -1 ? { blob: r.getBlob() } : { blob: null };
-  } catch (e) { return { blob: null }; }
+    if (r.getResponseCode() !== 200) {
+      throw new Error('Tango /Invoices HTTP ' + r.getResponseCode() + ': ' +
+                      r.getContentText().slice(0, 250));
+    }
+    var b = JSON.parse(r.getContentText() || '{}');
+    out = out.concat(b.Data || []);
+    if (!b.Paging || !b.Paging.MoreData) break;
+    page++;
+  }
+  return out;
 }
 
 /**
- * ¿Esta URL la puede abrir cualquiera y devuelve un PDF?
- * Se prueba SIN mandar ninguna credencial, que es exactamente como la va a
- * pedir el marketplace. Si responde 200 con un PDF, no hace falta Drive.
+ * Baja el PDF de la URL que da Tango.
+ * Primero sin credenciales (las URL de S3 vienen firmadas y suelen abrir
+ * solas); si no, con el accesstoken.
  */
-function _urlEsPublica(url) {
-  try {
-    var r = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true });
-    var code = r.getResponseCode();
-    if (code !== 200) return { ok: false, detalle: 'HTTP ' + code };
-
-    var tipo = '';
+function _bajarPdfDeUrl(url) {
+  var intentos = [{}, { headers: _tangoHeaders() }];
+  for (var i = 0; i < intentos.length; i++) {
     try {
-      var hs = r.getAllHeaders();
-      Object.keys(hs).forEach(function (k) {
-        if (String(k).toLowerCase() === 'content-type') tipo = String(hs[k]).toLowerCase();
-      });
-    } catch (e) { /* sin headers, miramos el contenido */ }
-
-    if (tipo.indexOf('pdf') !== -1) return { ok: true, detalle: 'content-type ' + tipo };
-
-    // Sin content-type útil: un PDF siempre empieza con "%PDF"
-    var inicio = '';
-    try { inicio = r.getContentText().slice(0, 5); } catch (e) { inicio = ''; }
-    if (inicio.indexOf('%PDF') === 0) return { ok: true, detalle: 'el contenido es un PDF' };
-
-    return { ok: false, detalle: 'responde 200 pero no devuelve un PDF (' +
-                                 (tipo || 'sin content-type') + ')' };
-  } catch (e) {
-    return { ok: false, detalle: 'no se pudo abrir: ' + String(e.message).slice(0, 80) };
+      var o = intentos[i];
+      o.muteHttpExceptions = true;
+      o.followRedirects = true;
+      var r = UrlFetchApp.fetch(url, o);
+      if (r.getResponseCode() !== 200) continue;
+      var blob = r.getBlob();
+      var head = '';
+      try { head = r.getContentText().slice(0, 5); } catch (e) { head = '%PDF'; }
+      if (head.indexOf('%PDF') === 0 || String(blob.getContentType()).indexOf('pdf') !== -1) {
+        return blob;
+      }
+    } catch (e) { /* probamos el siguiente */ }
   }
+  return null;
+}
+
+/**
+ * Procesa un comprobante devuelto por /Invoices: baja el PDF, lo publica en
+ * Drive y lo registra. Si ya lo teníamos guardado, no lo vuelve a bajar.
+ */
+function _procesarComprobante(item, forzar) {
+  var nro = _normFactura(item.InvoiceNumber);
+  var oid = String(item.OrderNumber || item.OrderId || '').trim();
+  var url = String(item.InvoiceFileUrl || '').trim();
+
+  // Solo nos interesan los talonarios con los que facturamos los marketplaces.
+  // El resto de la facturación de la empresa pasa de largo y no ensucia la lista.
+  if (!forzar && !_talonarioNuestro(item)) {
+    return { estado: 'otro_talonario', nro: nro, orden: oid };
+  }
+
+  if (!url) return { estado: 'sin_url', nro: nro, orden: oid };
+
+  if (!forzar) {
+    var idx = _indicePdfs();
+    if ((nro && idx.porFactura[nro]) || (oid && idx.porOrden[oid])) {
+      return { estado: 'ya_estaba', nro: nro, orden: oid };
+    }
+  }
+
+  var vence = item.InvoiceFileExpiration
+    ? String(item.InvoiceFileExpiration).replace(/["“”]/g, '').slice(0, 10) : '';
+
+  // Por defecto se usa la URL que da Tango tal cual. Es más simple y no ocupa
+  // Drive, pero VENCE: pasada esa fecha el link que informaste al marketplace
+  // deja de funcionar. La columna "vence" queda a la vista para poder
+  // controlarlo, y con pdf_destino=drive se guarda una copia que no caduca.
+  if (getConfig('pdf_destino') !== 'drive') {
+    _registrarFactura({
+      nro_factura: nro, order_id: oid, url: url, archivo_id: '',
+      origen: 'Tango', vence: vence,
+      detalle: item.InvoiceType + ' ' + item.InvoiceNumber
+    });
+    return { estado: 'guardado', nro: nro, orden: oid, url: url, vence: vence };
+  }
+
+  var blob = _bajarPdfDeUrl(url);
+  if (!blob) return { estado: 'no_se_pudo_bajar', nro: nro, orden: oid, url: url };
+
+  var g = _guardarPdfEnDrive(blob, (nro || oid || 'factura') + '.pdf');
+  _registrarFactura({
+    nro_factura: nro, order_id: oid, url: g.url, archivo_id: g.id,
+    origen: 'Drive', vence: '',
+    detalle: item.InvoiceType + ' ' + item.InvoiceNumber +
+             (vence ? ' · la URL de Tango vencía el ' + vence : '')
+  });
+  return { estado: 'guardado', nro: nro, orden: oid, url: g.url };
+}
+
+/**
+ * ¿El comprobante salió de uno de los talonarios que usamos para Frávega y
+ * OnCity? Se compara contra `webhook_talonarios`, que se carga con el punto de
+ * venta del talonario (los 4 o 5 dígitos de la izquierda del número, por
+ * ejemplo 00007 en "B 00007-00002724"). Vacío = no filtramos nada.
+ */
+function _talonarioNuestro(item) {
+  var lista = String(getConfig('webhook_talonarios') || '').trim();
+  if (!lista) return true;
+
+  var nro = String(item.InvoiceNumber || '');
+  var pv = '';
+  var m = nro.match(/(\d{4,5})\s*-\s*\d+/);
+  if (m) pv = m[1];
+  else {
+    m = nro.replace(/\D/g, '');
+    if (m.length >= 12) pv = m.slice(0, m.length - 8);
+  }
+  if (!pv) return true;   // si no lo entendemos, mejor dejarlo pasar
+
+  var quiero = lista.split(/[,;\s]+/).filter(String);
+  for (var i = 0; i < quiero.length; i++) {
+    if (parseInt(quiero[i], 10) === parseInt(pv, 10)) return true;
+  }
+  return false;
+}
+
+/** El aviso InvoiceFile nos dice para qué orden hay comprobante: lo buscamos. */
+function _guardarPdfDeWebhook(req, resource, message) {
+  if (!resource) return { ok: false, detalle: 'El aviso no trae el identificador de la orden' };
+
+  var items = [];
+  try { items = tangoInvoices({ orderNumber: resource }); }
+  catch (e) { return { ok: false, detalle: 'Error consultando /Invoices: ' + e.message }; }
+
+  if (!items.length) {
+    try { items = tangoInvoices({ orderId: resource }); } catch (e) { /* seguimos */ }
+  }
+  if (!items.length) {
+    return { ok: false,
+             detalle: '/Invoices no devolvió comprobantes para ' + resource +
+                      '. Puede que todavía no esté publicado; el reintento de Tango o la ' +
+                      'sincronización manual lo van a levantar.' };
+  }
+
+  var hechos = [];
+  items.forEach(function (it) {
+    var r = _procesarComprobante(it, false);
+    hechos.push(r.nro + ': ' + r.estado);
+  });
+  var alguno = hechos.some(function (h) { return h.indexOf('guardado') !== -1 ||
+                                                 h.indexOf('ya_estaba') !== -1; });
+  return { ok: alguno, detalle: hechos.join(' · ') };
 }
 
 /** Guarda el PDF en la carpeta de Drive y lo deja accesible por link. */
@@ -2986,7 +2958,7 @@ function _registrarFactura(f) {
   var last = sheet.getLastRow();
 
   if (last > 1) {
-    var datos = sheet.getRange(2, 1, last - 1, 7).getValues();
+    var datos = sheet.getRange(2, 1, last - 1, COLS_PDFS.length).getValues();
     for (var i = 0; i < datos.length; i++) {
       var mismaFactura = nro && _normFactura(datos[i][0]) === nro;
       var mismaOrden = !nro && oid && String(datos[i][1]).trim() === oid;
@@ -2999,13 +2971,14 @@ function _registrarFactura(f) {
         fila[4] = _now();
         fila[5] = f.origen || fila[5];
         fila[6] = f.detalle || fila[6];
-        sheet.getRange(i + 2, 1, 1, 7).setValues([fila]);
+        if (f.vence) fila[7] = f.vence;
+        sheet.getRange(i + 2, 1, 1, COLS_PDFS.length).setValues([fila]);
         return;
       }
     }
   }
   sheet.appendRow([nro, oid, f.url || '', f.archivo_id || '', _now(),
-                   f.origen || '', f.detalle || '']);
+                   f.origen || '', f.detalle || '', f.vence || '']);
 }
 
 /** { nroFacturaNormalizado: url } y { orderId: url } para completar los archivos. */
@@ -3053,6 +3026,9 @@ function apiWebhookInfo() {
     carpeta: getConfig('pdf_folder_id')
       ? 'https://drive.google.com/drive/folders/' + getConfig('pdf_folder_id') : '',
     formato: getConfig('pdf_url_formato') || 'download',
+    destino: getConfig('pdf_destino') || 'tango',
+    solo_nuestras: String(getConfig('webhook_solo_nuestras') || '1') === '1',
+    talonarios: getConfig('webhook_talonarios') || '',
     total_facturas: pdfs.length,
     con_pdf: conUrl,
     sin_pdf: pdfs.length - conUrl,
@@ -3086,142 +3062,74 @@ function apiPdfBuscar(user, p) {
   var orden = String(p.orden || '').trim();
   if (!orden) throw new Error('Poné el Nro de Orden (por ejemplo v92893535frvg-01)');
 
-  // Identificadores posibles. No sabemos con cuál referencia Tango al
-  // comprobante publicado: el número de orden nuestro, el de factura, o el
-  // número de pedido interno de Tango (0046X0004000002848).
-  var ids = [orden];
-  var pref = getConfig('fvtex_quitar_prefijo');
-  if (pref) {
-    if (orden.toUpperCase().indexOf(pref.toUpperCase()) === 0) ids.push(orden.slice(pref.length));
-    else ids.push(pref + orden);
-  }
-  if (p.factura) { ids.push(String(p.factura).trim()); ids.push(_normFactura(p.factura)); }
-
-  // El número de pedido de Tango (0046X0004000002848) mezcla talonario, una
-  // letra y el número. No sabemos con qué parte lo referencia el endpoint, así
-  // que probamos el completo y sus partes.
-  if (p.pedido) {
-    var ped = String(p.pedido).trim();
-    ids.push(ped);
-    ids.push(ped.replace(/\D/g, ''));                       // solo los dígitos
-    var m = ped.match(/[A-Za-z](\d+)$/);
-    if (m) {
-      ids.push(m[1]);                                       // lo que sigue a la letra
-      ids.push(String(parseInt(m[1], 10)));                  // sin ceros a la izquierda
-    }
-    var m2 = ped.match(/^(\d{4})[A-Za-z](\d+)$/);
-    if (m2) ids.push(m2[1] + '-' + m2[2]);                   // talonario-numero
+  var items = [], via = '';
+  try { items = tangoInvoices({ orderNumber: orden }); via = 'orderNumber'; }
+  catch (e) { throw new Error('Error consultando /Invoices: ' + e.message); }
+  if (!items.length) {
+    try { items = tangoInvoices({ orderId: orden }); via = 'orderId'; } catch (e) { /* nada */ }
   }
 
-  var vistos = {}, unicos = [];
-  ids.forEach(function (x) { if (x && !vistos[x]) { vistos[x] = true; unicos.push(x); } });
-
-  var r = _sondeoExhaustivo(unicos);
-  if (r.blob) {
-    var nombre = (p.factura ? _normFactura(p.factura) : orden) + '.pdf';
-    var g = _guardarPdfEnDrive(r.blob, nombre);
-    _registrarFactura({ nro_factura: p.factura || '', order_id: orden, url: g.url,
-                        archivo_id: g.id, origen: 'búsqueda manual', detalle: r.via });
-    setConfig('pdf_ruta_ok', r.plantilla || '');
-    log_(user.email, 'facturas', 'PDF encontrado a mano para ' + orden, 'ok',
-         g.url + ' · ' + r.via);
-    return { ok: true, url: g.url, via: r.via, diagnostico: r.diag };
+  if (!items.length) {
+    return { ok: false,
+             sugerencia: 'Tango no tiene comprobantes publicados para la orden ' + orden + '. ' +
+               'Las causas habituales: (1) todavía no se facturó; (2) el talonario con el que ' +
+               'se facturó no tiene tildado "Publica comprobantes en Tango Tiendas" en la ' +
+               'solapa Documentos electrónicos; (3) la factura se emitió antes de ese cambio.',
+             diagnostico: 'GET /Invoices?orderNumber=' + orden + ' y ?orderId=' + orden +
+                          ' → 0 comprobantes' };
   }
 
-  log_(user.email, 'facturas', 'No se encontró el PDF de ' + orden, 'warning',
-       r.diag.slice(0, 1500));
-  return { ok: false, diagnostico: r.diag, probadas: r.total,
-           sugerencia: 'Probé ' + r.total + ' combinaciones y ninguna devolvió un PDF. ' +
-             'Las causas, en orden de probabilidad: ' +
-             '(1) falta tildar "Publica comprobantes en Tango Tiendas" en la solapa ' +
-             'Documentos electrónicos del talonario con el que facturaste — sin eso el ' +
-             'comprobante no se publica y no hay ruta que lo encuentre; ' +
-             '(2) la factura se emitió antes de ese cambio; ' +
-             '(3) el PDF se sirve desde otro lado. Si todo dio 404, lo que hay que ' +
-             'preguntarle a Axoft es concreto: "¿por qué recurso se consulta el ' +
-             'comprobante publicado cuando la tienda es API?".' };
+  var lineas = [], primera = '';
+  items.forEach(function (it) {
+    var r = _procesarComprobante(it, true);
+    lineas.push(it.InvoiceType + ' ' + it.InvoiceNumber + ' → ' + r.estado +
+                (r.url ? ' · ' + r.url : ''));
+    if (!primera && r.url) primera = r.url;
+  });
+
+  log_(user.email, 'facturas', 'Comprobantes buscados para ' + orden, 'ok', lineas.join(' | '));
+  return { ok: !!primera, url: primera, via: 'consultado por ' + via,
+           diagnostico: lineas.join('\n') };
 }
 
 /**
- * Sondeo amplio: prueba varias bases, rutas e identificadores.
- * Solo se usa en la búsqueda manual, donde el tiempo no importa. El webhook
- * usa la versión corta, que además cachea la ruta que funcionó.
+ * Trae de una todos los comprobantes de los últimos N días y guarda los PDF
+ * que falten. Sirve para ponerse al día con las facturas ya emitidas, sin
+ * esperar a que llegue un aviso por cada una.
  */
-function _sondeoExhaustivo(ids) {
-  var bases = ['https://tiendas.axoft.com/api/Aperture',
-               'https://tiendas.axoft.com/api'];
-  var rutas = ['/order/{id}/invoice', '/order/{id}/invoicefile', '/order/{id}/file',
-               '/order/{id}/document', '/invoice/{id}', '/invoice/{id}/file',
-               '/invoicefile/{id}', '/comprobante/{id}', '/voucher/{id}',
-               '/document/{id}', '/file/{id}',
-               '/invoice?orderId={id}', '/invoice?number={id}', '/InvoiceFile?resource={id}'];
+function apiPdfsSync(user, p) {
+  p = p || {};
+  var dias = parseInt(p.dias || '30', 10) || 30;
+  var hasta = new Date();
+  var desde = new Date(hasta.getTime() - dias * 86400000);
+  var f = function (d) { return Utilities.formatDate(d, TZ_AR, 'yyyy-MM-dd'); };
 
-  var lineas = [], total = 0, resumen = {};
-  for (var b = 0; b < bases.length; b++) {
-    for (var i = 0; i < ids.length; i++) {
-      for (var r = 0; r < rutas.length; r++) {
-        var path = rutas[r].replace('{id}', encodeURIComponent(ids[i]));
-        var url = bases[b] + path;
-        total++;
-        var res = _probarUrlPdf(url);
-        resumen[res.code] = (resumen[res.code] || 0) + 1;
-        if (res.blob) {
-          lineas.push('✅ ' + url + ' → PDF');
-          return { blob: res.blob, via: 'bajado de ' + url,
-                   plantilla: url.replace(encodeURIComponent(ids[i]), '{id}'),
-                   diag: lineas.join('\n'), total: total };
-        }
-        // Solo listamos lo que NO es 404: un 404 es "acá no está" y no aporta.
-        if (String(res.code) !== '404') {
-          lineas.push('· ' + url + ' → ' + res.code +
-                      (res.muestra ? ' · ' + res.muestra : ''));
-        }
-      }
+  var items = tangoInvoices({ fromDate: f(desde), toDate: f(hasta) });
+
+  var res = { total: items.length, guardados: 0, ya_estaban: 0, sin_url: 0,
+              otro_talonario: 0, talonarios: getConfig('webhook_talonarios') || '',
+              fallidos: [], desde: f(desde), hasta: f(hasta) };
+  var t0 = Date.now();
+  for (var i = 0; i < items.length; i++) {
+    if (Date.now() - t0 > 4.5 * 60 * 1000) {
+      res.truncado = true;
+      res.mensaje = 'Se cortó por tiempo en ' + i + ' de ' + items.length +
+                    '. Volvé a correrlo para seguir.';
+      break;
     }
+    var r = _procesarComprobante(items[i], false);
+    if (r.estado === 'guardado') res.guardados++;
+    else if (r.estado === 'ya_estaba') res.ya_estaban++;
+    else if (r.estado === 'sin_url') res.sin_url++;
+    else if (r.estado === 'otro_talonario') res.otro_talonario++;
+    else res.fallidos.push((r.nro || r.orden) + ': ' + r.estado);
   }
-  var conteo = Object.keys(resumen).map(function (k) { return k + ': ' + resumen[k]; }).join(' · ');
-  lineas.unshift('Respuestas: ' + conteo + '  (los 404 no se listan uno por uno)');
-  return { blob: null, via: '', diag: lineas.join('\n'), total: total };
-}
 
-/** Un intento suelto contra una URL completa. */
-function _probarUrlPdf(url) {
-  try {
-    var r = UrlFetchApp.fetch(url, { headers: _tangoHeaders(), muteHttpExceptions: true });
-    var code = r.getResponseCode();
-    if (code !== 200) return { code: code, blob: null };
-
-    var tipo = '';
-    try {
-      var hs = r.getAllHeaders();
-      Object.keys(hs).forEach(function (k) {
-        if (String(k).toLowerCase() === 'content-type') tipo = String(hs[k]).toLowerCase();
-      });
-    } catch (e) { /* nada */ }
-    if (tipo.indexOf('pdf') !== -1) return { code: 200, blob: r.getBlob() };
-
-    var txt = '';
-    try { txt = r.getContentText(); } catch (e) { txt = ''; }
-    if (txt.indexOf('%PDF') === 0) return { code: 200, blob: r.getBlob() };
-
-    // Respondió algo: puede traer la URL o el base64 adentro
-    try {
-      var obj = JSON.parse(txt);
-      var u = _buscarUrlPdf(obj);
-      if (u) {
-        var r2 = UrlFetchApp.fetch(u, { headers: _tangoHeaders(), muteHttpExceptions: true });
-        if (r2.getResponseCode() === 200) return { code: 200, blob: r2.getBlob() };
-      }
-      var b = _buscarBase64(obj);
-      if (b) return { code: 200,
-                      blob: Utilities.newBlob(Utilities.base64Decode(b), 'application/pdf') };
-    } catch (e) { /* no era JSON */ }
-
-    return { code: 200, blob: null,
-             muestra: (tipo || 'sin tipo') + ' · ' + txt.slice(0, 80).replace(/\s+/g, ' ') };
-  } catch (e) {
-    return { code: 'error', blob: null, muestra: String(e.message).slice(0, 60) };
-  }
+  log_(user.email, 'facturas', 'Sincronización de comprobantes', 'ok',
+       'dias=' + dias + ' total=' + res.total + ' guardados=' + res.guardados +
+       ' ya_estaban=' + res.ya_estaban + ' sin_url=' + res.sin_url,
+       Date.now() - t0);
+  return res;
 }
 
 /**
@@ -3239,6 +3147,223 @@ function apiPdfsTest(user) {
            mensaje: 'Se guardó un archivo de prueba. Abrí el link en una ventana de ' +
                     'incógnito: si se ve sin pedir permiso, los marketplaces también ' +
                     'van a poder abrirlo. Después borralo de la carpeta.' };
+}
+
+/**
+ * Mira los comprobantes de los últimos N días de las órdenes que mandó esta
+ * app y devuelve qué puntos de venta aparecen. Es para poder completar
+ * `webhook_talonarios` sin tener que ir a buscarlo a Tango.
+ */
+function apiTalonariosSugeridos(p) {
+  p = p || {};
+  var dias = parseInt(p.dias || '60', 10) || 60;
+  var hasta = new Date();
+  var desde = new Date(hasta.getTime() - dias * 86400000);
+  var f = function (d) { return Utilities.formatDate(d, TZ_AR, 'yyyy-MM-dd'); };
+
+  var items = tangoInvoices({ fromDate: f(desde), toDate: f(hasta) });
+  var sent = _sentIds();
+  var acum = {};
+
+  items.forEach(function (it) {
+    var nro = String(it.InvoiceNumber || '');
+    var m = nro.match(/(\d{4,5})\s*-\s*\d+/);
+    var pv = m ? m[1] : '';
+    if (!pv) return;
+    var oid = String(it.OrderNumber || it.OrderId || '').trim();
+    var nuestro = !!sent[oid] || !!sent[_sinPrefijo(oid, 'FVG-')];
+    if (!acum[pv]) acum[pv] = { punto_venta: pv, total: 0, nuestros: 0, ejemplo: nro };
+    acum[pv].total++;
+    if (nuestro) acum[pv].nuestros++;
+  });
+
+  var out = [];
+  for (var k in acum) if (acum.hasOwnProperty(k)) out.push(acum[k]);
+  out.sort(function (a, b) { return b.nuestros - a.nuestros || b.total - a.total; });
+
+  return {
+    dias: dias, desde: f(desde), hasta: f(hasta), comprobantes: items.length,
+    talonarios: out,
+    sugerencia: out.filter(function (o) { return o.nuestros > 0; })
+                   .map(function (o) { return o.punto_venta; }).join(','),
+    actual: getConfig('webhook_talonarios') || ''
+  };
+}
+
+/* ── Buscador de Facturas ──────────────────────────────────────────────── */
+
+/** Saca acentos y símbolos para poder comparar sin que moleste la tilde. */
+function _plano(s) {
+  s = String(s === null || s === undefined ? '' : s).toUpperCase();
+  s = s.replace(/[ÁÀÂÄ]/g, 'A').replace(/[ÉÈÊË]/g, 'E').replace(/[ÍÌÎÏ]/g, 'I')
+       .replace(/[ÓÒÔÖ]/g, 'O').replace(/[ÚÙÛÜ]/g, 'U').replace(/Ñ/g, 'N');
+  return s.replace(/[^A-Z0-9]/g, '');
+}
+
+/** Fecha (celda, texto o ISO) a 'yyyy-MM-dd'. Devuelve '' si no se entiende. */
+function _soloFecha(v) {
+  if (!v) return '';
+  if (v instanceof Date) return Utilities.formatDate(v, TZ_AR, 'yyyy-MM-dd');
+  var s = String(v).trim();
+  var m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return m[1] + '-' + m[2] + '-' + m[3];
+  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+  if (m) {
+    var a = m[3].length === 2 ? '20' + m[3] : m[3];
+    return a + '-' + ('0' + m[2]).slice(-2) + '-' + ('0' + m[1]).slice(-2);
+  }
+  return '';
+}
+
+/**
+ * Buscador de Facturas.
+ *
+ * Une lo que mandamos a Tango (OrdenesEnviadas) con los comprobantes que
+ * tenemos registrados (FacturasPDF) y busca por lo que uno tiene a mano:
+ * número de orden, número de factura, DNI/CUIT, nombre del cliente o fecha.
+ *
+ * `q` es texto libre: se compara "en plano" (sin acentos, sin guiones, sin
+ * espacios) contra orden, suborden, factura, documento, CUIL y cliente. Si
+ * son varias palabras, tienen que estar todas (en cualquier orden), así
+ * "perez juan" encuentra a "JUAN PEREZ".
+ *
+ * `desde` / `hasta` (yyyy-MM-dd) filtran por fecha de compra o de factura:
+ * alcanza con que una de las dos caiga dentro del rango.
+ */
+function apiFacturasBuscar(p) {
+  p = p || {};
+  var q = String(p.q || '').trim();
+  var desde = _soloFecha(p.desde);
+  var hasta = _soloFecha(p.hasta);
+  var soloSinPdf = p.solo_sin_pdf === true || p.solo_sin_pdf === '1';
+  var soloFacturadas = p.solo_facturadas === true || p.solo_facturadas === '1';
+  var canal = String(p.canal || '').trim();
+
+  if (!q && !desde && !hasta && !soloSinPdf && !soloFacturadas && !canal) {
+    throw new Error('Escribí algo para buscar: número de orden, número de factura, ' +
+                    'DNI, nombre del cliente o un rango de fechas.');
+  }
+
+  // Las palabras del texto libre, cada una en plano.
+  var partes = q ? q.split(/\s+/).map(_plano).filter(String) : [];
+
+  _sheetPdfs();
+  var idx = _indicePdfs();
+  var pdfs = {};   // nro normalizado -> fila de FacturasPDF
+  var pdfsOrden = {};
+  _readRows(SH.PDFS, 5000).forEach(function (r) {
+    var n = _normFactura(r.nro_factura);
+    if (n) pdfs[n] = r;
+    var o = String(r.order_id || '').trim();
+    if (o) pdfsOrden[o] = r;
+  });
+
+  var filas = _readRows(SH.SENT, 20000);
+  var vistos = {}, out = [];
+
+  for (var i = filas.length - 1; i >= 0; i--) {
+    var r = filas[i];
+    var oid = String(r.order_id || '').trim();
+    var nro = _normFactura(r.nro_factura);
+    var pdf = (nro && pdfs[nro]) || pdfsOrden[oid] || null;
+    var url = (nro && idx.porFactura[nro]) || idx.porOrden[oid] || (pdf ? String(pdf.url || '') : '');
+
+    if (canal && String(r.canal || '') !== canal) continue;
+    if (soloFacturadas && !nro) continue;
+    if (soloSinPdf && url) continue;
+
+    var fCompra = _soloFecha(r.fecha_compra) || _soloFecha(r.fecha_hora);
+    var fFactura = _soloFecha(r.fecha_factura);
+    if (desde || hasta) {
+      var ok = false;
+      [fCompra, fFactura].forEach(function (f) {
+        if (!f) return;
+        if (desde && f < desde) return;
+        if (hasta && f > hasta) return;
+        ok = true;
+      });
+      if (!ok) continue;
+    }
+
+    if (partes.length) {
+      var heno = _plano([oid, r.suborder_id, r.nro_factura, r.documento, r.cuil,
+                         r.cliente, r.email, fCompra, fFactura].join(' '));
+      var todas = true;
+      for (var k = 0; k < partes.length; k++) {
+        if (heno.indexOf(partes[k]) === -1) { todas = false; break; }
+      }
+      if (!todas) continue;
+    }
+
+    var clave = oid + '|' + nro;
+    if (vistos[clave]) continue;
+    vistos[clave] = true;
+
+    out.push({
+      order_id: oid,
+      suborder_id: String(r.suborder_id || ''),
+      canal: String(r.canal || ''),
+      cliente: String(r.cliente || ''),
+      documento: String(r.documento || r.cuil || ''),
+      total: r.total,
+      fecha_compra: fCompra,
+      nro_factura: String(r.nro_factura || ''),
+      fecha_factura: fFactura,
+      estado: String(r.estado_facturacion || ''),
+      url: url,
+      vence: pdf ? String(pdf.vence || '') : '',
+      origen_pdf: pdf ? String(pdf.origen || '') : ''
+    });
+    if (out.length >= 300) break;
+  }
+
+  // Comprobantes que están en FacturasPDF pero no en OrdenesEnviadas (por
+  // ejemplo los que trajo la sincronización): también los mostramos.
+  if (!soloSinPdf) {
+    _readRows(SH.PDFS, 5000).reverse().forEach(function (r) {
+      if (out.length >= 300) return;
+      var nro = _normFactura(r.nro_factura);
+      var oid = String(r.order_id || '').trim();
+      if (vistos[oid + '|' + nro]) return;
+      var yaEsta = out.some(function (o) {
+        return (nro && _normFactura(o.nro_factura) === nro) || (oid && o.order_id === oid);
+      });
+      if (yaEsta) return;
+
+      var f = _soloFecha(r.fecha_hora);
+      if (desde && f && f < desde) return;
+      if (hasta && f && f > hasta) return;
+      if (canal) return;   // FacturasPDF no guarda canal
+
+      if (partes.length) {
+        var heno = _plano([nro, oid, r.detalle].join(' '));
+        for (var k = 0; k < partes.length; k++) {
+          if (heno.indexOf(partes[k]) === -1) return;
+        }
+      }
+      out.push({
+        order_id: oid, suborder_id: '', canal: '', cliente: '', documento: '',
+        total: '', fecha_compra: '', nro_factura: String(r.nro_factura || ''),
+        fecha_factura: f, estado: 'solo_pdf', url: String(r.url || ''),
+        vence: String(r.vence || ''), origen_pdf: String(r.origen || '')
+      });
+    });
+  }
+
+  // Lo más nuevo primero, sin importar en qué orden esté la planilla.
+  out.sort(function (a, b) {
+    var fa = a.fecha_factura || a.fecha_compra || '';
+    var fb = b.fecha_factura || b.fecha_compra || '';
+    if (fa === fb) return 0;
+    return fa < fb ? 1 : -1;
+  });
+
+  return {
+    total: out.length,
+    con_pdf: out.filter(function (o) { return !!o.url; }).length,
+    sin_pdf: out.filter(function (o) { return !o.url; }).length,
+    filas: out
+  };
 }
 
 /* ═══════════════ MÓDULO FACTURAS ═══════════════ */
@@ -4503,6 +4628,14 @@ function _sheetAuto(name, cols) {
     s.getRange(1, 1, 1, cols.length).setValues([cols]).setFontWeight('bold');
     s.setFrozenRows(1);
     log_('sistema', 'sistema', 'Pestaña creada: ' + name, 'ok', '');
+    return s;
+  }
+  // La hoja existe pero puede ser de una versión anterior: completamos las
+  // columnas que falten al final, sin tocar los datos que ya están.
+  var heads = s.getRange(1, 1, 1, Math.max(s.getLastColumn(), 1)).getValues()[0]
+               .map(function (h) { return String(h).trim(); });
+  for (var i = 0; i < cols.length; i++) {
+    if (heads[i] !== cols[i]) s.getRange(1, i + 1).setValue(cols[i]).setFontWeight('bold');
   }
   return s;
 }

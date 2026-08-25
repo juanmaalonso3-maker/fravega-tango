@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-25.20";
+const APP_VERSION = "2026-08-25.22";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -1390,12 +1390,75 @@ async function viewPdfs() {
   const a = i;
   setMain(H("PDF de Facturas") + `
     ${card(`
-      <div class="text-sm text-gray-600 mb-3">
-        Tango avisa por <b>webhook</b> cuando hay un comprobante en PDF. Si el link que manda
-        es público se usa tal cual; si pide credenciales, la app lo guarda en Drive y publica
-        uno propio. Después esa URL se completa sola en la columna
-        <b>"Url de la factura"</b> de los archivos de Frávega y OnCity.
+      <div class="flex items-center gap-2 mb-1">
+        <span class="text-lg">🔎</span>
+        <div class="font-bold">Buscador de Facturas</div>
       </div>
+      <div class="text-sm text-gray-600 mb-3">
+        Poné lo que tengas a mano: <b>número de orden</b>, <b>número de factura</b>,
+        <b>DNI o CUIT</b>, <b>nombre del cliente</b> o un <b>rango de fechas</b>.
+        Se puede escribir más de una palabra y no importa el orden ni los acentos.
+      </div>
+      <div class="flex gap-2 flex-wrap items-end">
+        <div class="flex-1 min-w-[16rem]">
+          <label class="text-xs text-gray-500 uppercase">Buscar</label>
+          <input id="fb-q" placeholder="perez juan · 30123456 · 00007-00002724 · v92893535frvg-01"
+            class="border rounded-lg px-3 py-2 text-sm w-full"
+            onkeydown="if(event.key==='Enter')buscarFacturas()">
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 uppercase">Desde</label>
+          <input id="fb-desde" type="date" class="border rounded-lg px-3 py-2 text-sm">
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 uppercase">Hasta</label>
+          <input id="fb-hasta" type="date" class="border rounded-lg px-3 py-2 text-sm">
+        </div>
+        <div>
+          <label class="text-xs text-gray-500 uppercase">Canal</label>
+          <select id="fb-canal" class="border rounded-lg px-3 py-2 text-sm">
+            <option value="">Todos</option>
+            <option value="fravega">Frávega</option>
+            <option value="oncity">OnCity</option>
+            <option value="csv">CSV</option>
+          </select>
+        </div>
+        <button onclick="buscarFacturas()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
+          Buscar</button>
+      </div>
+      <div class="flex gap-4 flex-wrap mt-2 text-xs text-gray-600">
+        <label class="flex items-center gap-1.5">
+          <input type="checkbox" id="fb-facturadas" class="w-4 h-4"> Solo las que ya tienen factura</label>
+        <label class="flex items-center gap-1.5">
+          <input type="checkbox" id="fb-sinpdf" class="w-4 h-4"> Solo las que <b>no</b> tienen PDF</label>
+        <a class="text-violet-700 underline cursor-pointer" onclick="limpiarBusqueda()">Limpiar</a>
+      </div>
+      <div id="fb-res" class="mt-3"></div>`, "mb-4")}
+
+    ${card(`
+      <div class="text-sm text-gray-600 mb-3">
+        Cuando facturás, Tango avisa por <b>webhook</b> y la app le pide el comprobante al
+        endpoint <code>/Invoices</code>, que devuelve la URL del PDF. Esa URL es la que se
+        completa sola en la columna <b>"Url de la factura"</b> de los archivos de Frávega y
+        OnCity.
+        ${i.destino === "drive"
+          ? `<b>Modo Drive:</b> el PDF además se copia a una carpeta propia y se informa ese
+             link, que no caduca.`
+          : `<b>Ojo:</b> la URL de Tango <b>tiene fecha de vencimiento</b> (columna
+             <b>Vence</b> de la tabla de abajo). Si algún marketplace te reclama un link
+             caído, poné <code>pdf_destino = drive</code> en Configuración y la app va a
+             publicar una copia que no vence.`}
+      </div>
+      ${i.solo_nuestras || i.talonarios ? `<div class="text-xs bg-gray-50 border rounded-lg px-3 py-2 mb-2 text-gray-600">
+        🎯 Filtro activo:
+        ${i.solo_nuestras ? "solo se procesan los avisos de <b>pedidos que mandó esta app</b>" : ""}
+        ${i.solo_nuestras && i.talonarios ? " · " : ""}
+        ${i.talonarios ? `solo los talonarios <b>${esc(i.talonarios)}</b>` : ""}.
+        El resto de la facturación de la empresa no entra acá.
+      </div>` : `<div class="text-xs bg-amber-50 border border-amber-200 text-amber-900 rounded-lg px-3 py-2 mb-2">
+        Sin filtro de talonarios: van a entrar <b>todas</b> las facturas de la empresa.
+        Tocá <b>¿Qué talonarios uso?</b> abajo para acotarlo a Frávega y OnCity.
+      </div>`}
       <div class="text-xs text-gray-500 uppercase mb-1">Pegá esta URL en Tango</div>
       <div class="text-xs bg-amber-50 border border-amber-200 text-amber-900 rounded-lg px-3 py-2 mb-2">
         ⚠️ <b>No es la dirección de esta página.</b> Es la del Apps Script: empieza con
@@ -1429,8 +1492,11 @@ async function viewPdfs() {
       </div>
       <div class="flex gap-3 flex-wrap items-center">
         <button onclick="viewPdfs()" class="border px-4 py-2 rounded-lg text-sm">Actualizar</button>
-        <button onclick="probarCarpeta()" class="border px-4 py-2 rounded-lg text-sm">🧪 Probar la carpeta de Drive</button>
-        ${i.carpeta ? `<a href="${esc(i.carpeta)}" target="_blank" class="text-violet-700 underline text-sm">Abrir la carpeta</a>` : ""}
+        <button onclick="sincronizarPdfs()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
+          ⬇️ Traer comprobantes de los últimos 30 días</button>
+        <button onclick="verTalonarios()" class="border px-4 py-2 rounded-lg text-sm">🎯 ¿Qué talonarios uso?</button>
+        ${i.destino === "drive" ? `<button onclick="probarCarpeta()" class="border px-4 py-2 rounded-lg text-sm">🧪 Probar la carpeta de Drive</button>` : ""}
+        ${i.destino === "drive" && i.carpeta ? `<a href="${esc(i.carpeta)}" target="_blank" class="text-violet-700 underline text-sm">Abrir la carpeta</a>` : ""}
         <span class="text-sm text-gray-500 ml-auto">
           ${i.total_facturas} factura(s) registradas · <b class="text-green-700">${i.con_pdf}</b> con PDF ·
           <b class="${i.sin_pdf ? "text-amber-700" : ""}">${i.sin_pdf}</b> sin PDF</span>
@@ -1456,6 +1522,151 @@ async function viewPdfs() {
       </div>
       <div id="pdf-tabla">${spinner()}</div>`)}`);
   cargarPdfs();
+}
+
+/* ── Buscador de Facturas ─────────────────────────────────────────────── */
+
+/** Muestra la fecha de vencimiento del link de Tango, avisando si está cerca. */
+function badgeVence(v) {
+  v = String(v || "").trim();
+  if (!v) return '<span class="text-gray-400">—</span>';
+  const hoy = new Date().toISOString().slice(0, 10);
+  if (v < hoy) return `<span class="text-red-700 font-bold" title="El link de Tango ya venció">⛔ ${esc(v)}</span>`;
+  const en7 = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
+  if (v <= en7) return `<span class="text-amber-700 font-bold" title="El link vence en menos de una semana">⚠️ ${esc(v)}</span>`;
+  return `<span class="text-gray-600">${esc(v)}</span>`;
+}
+
+function limpiarBusqueda() {
+  ["fb-q", "fb-desde", "fb-hasta"].forEach((id) => { if ($(id)) $(id).value = ""; });
+  if ($("fb-canal")) $("fb-canal").value = "";
+  ["fb-facturadas", "fb-sinpdf"].forEach((id) => { if ($(id)) $(id).checked = false; });
+  if ($("fb-res")) $("fb-res").innerHTML = "";
+}
+
+async function buscarFacturas() {
+  const box = $("fb-res");
+  if (!box) return;
+  const p = {
+    q: ($("fb-q") || {}).value || "",
+    desde: ($("fb-desde") || {}).value || "",
+    hasta: ($("fb-hasta") || {}).value || "",
+    canal: ($("fb-canal") || {}).value || "",
+    solo_facturadas: ($("fb-facturadas") || {}).checked ? "1" : "",
+    solo_sin_pdf: ($("fb-sinpdf") || {}).checked ? "1" : "",
+  };
+  if (!p.q.trim() && !p.desde && !p.hasta && !p.canal && !p.solo_facturadas && !p.solo_sin_pdf) {
+    return toast("Escribí algo para buscar o elegí un rango de fechas", "warning");
+  }
+
+  box.innerHTML = spinner("Buscando...");
+  let r;
+  try { r = await api("facturas.buscar", p); }
+  catch (e) { box.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
+  if (!$("fb-res")) return;
+
+  if (!r.total) {
+    box.innerHTML = `<div class="border border-amber-200 bg-amber-50 rounded-lg p-3 text-sm text-amber-900">
+      No se encontró nada con eso. Probá con menos palabras, o solo con el DNI o el número de orden.
+      Acordate de que solo se busca entre los pedidos que esta app mandó a Tango.</div>`;
+    return;
+  }
+
+  window._FB = r.filas;
+  box.innerHTML = `
+    <div class="text-xs text-gray-600 mb-2">
+      <b>${r.total}</b> resultado(s) · <b class="text-green-700">${r.con_pdf}</b> con PDF ·
+      <b class="${r.sin_pdf ? "text-amber-700" : ""}">${r.sin_pdf}</b> sin PDF
+    </div>
+    <div class="overflow-x-auto">
+    <table class="data w-full"><thead><tr>
+      <th>Orden</th><th>Canal</th><th>Cliente</th><th>DNI / CUIT</th><th>Fecha</th>
+      <th>Total</th><th>Factura</th><th>PDF</th><th>Vence</th><th></th>
+    </tr></thead><tbody>
+    ${r.filas.map((f, n) => `<tr>
+      <td class="font-mono text-xs whitespace-nowrap">${esc(f.order_id)}</td>
+      <td class="text-xs">${esc(f.canal)}</td>
+      <td class="text-xs max-w-[14rem] truncate" title="${esc(f.cliente)}">${esc(f.cliente)}</td>
+      <td class="font-mono text-xs">${esc(f.documento)}</td>
+      <td class="text-xs text-gray-500 whitespace-nowrap">${esc(f.fecha_factura || f.fecha_compra)}</td>
+      <td class="text-xs text-right">${f.total === "" || f.total === null || f.total === undefined ? "" : esc(f.total)}</td>
+      <td class="font-mono text-xs whitespace-nowrap">${f.nro_factura
+        ? esc(f.nro_factura)
+        : '<span class="text-gray-400">sin facturar</span>'}</td>
+      <td>${f.url
+        ? `<a href="${esc(f.url)}" target="_blank" class="text-violet-700 underline text-xs">abrir</a>`
+        : '<span class="text-amber-700 text-xs">falta</span>'}</td>
+      <td class="text-xs whitespace-nowrap">${badgeVence(f.vence)}</td>
+      <td class="whitespace-nowrap">
+        ${f.url ? `<button onclick="copiarUrlFactura(${n})" class="text-xs border rounded px-2 py-1">Copiar link</button>`
+                : `<button onclick="traerPdfDe(${n})" class="text-xs bg-violet-700 text-white rounded px-2 py-1">Traer PDF</button>`}
+      </td>
+    </tr>`).join("")}
+    </tbody></table></div>`;
+}
+
+function copiarUrlFactura(n) {
+  const f = (window._FB || [])[n];
+  if (!f || !f.url) return;
+  const ta = document.createElement("textarea");
+  ta.value = f.url; document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); toast("Link copiado", "ok"); }
+  catch (e) { toast("Copialo a mano desde la columna PDF", "warning"); }
+  ta.remove();
+}
+
+/** Le pide a Tango el comprobante de esa orden puntual y refresca la búsqueda. */
+async function traerPdfDe(n) {
+  const f = (window._FB || [])[n];
+  if (!f) return;
+  const orden = f.order_id;
+  if (!orden) return toast("Esa fila no tiene número de orden", "warning");
+  toast("Consultando a Tango...", "info");
+  let r;
+  try { r = await api("pdfs.buscar", { orden, factura: f.nro_factura || "" }); }
+  catch (e) { return toast(e.message, "error"); }
+  if (r.ok) { toast("PDF encontrado", "ok"); buscarFacturas(); cargarPdfs(); }
+  else {
+    showModal(`<h3 class="font-bold text-lg mb-2">No se encontró el PDF de ${esc(orden)}</h3>
+      <div class="text-sm text-gray-700 mb-3">${esc(r.sugerencia || "")}</div>
+      <pre class="text-xs bg-gray-50 border rounded p-2 whitespace-pre-wrap break-all">${esc(r.diagnostico || "")}</pre>
+      <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
+  }
+}
+
+/** Descubre con qué talonarios se facturaron nuestros pedidos. */
+async function verTalonarios() {
+  showModal(`<h3 class="font-bold text-lg mb-3">Buscando los talonarios…</h3>${spinner()}`);
+  let r;
+  try { r = await api("pdfs.talonarios", { dias: 60 }); }
+  catch (e) {
+    return showModal(`<h3 class="font-bold text-lg mb-3">Talonarios</h3>
+      <p class="text-red-600 text-sm">${esc(e.message)}</p>
+      <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
+  }
+  showModal(`
+    <h3 class="font-bold text-lg mb-1">Talonarios de los últimos ${r.dias} días</h3>
+    <div class="text-xs text-gray-500 mb-3">${esc(r.desde)} a ${esc(r.hasta)} ·
+      ${r.comprobantes} comprobante(s) en Tango</div>
+    ${r.talonarios.length ? `<table class="data w-full mb-3"><thead><tr>
+        <th>Punto de venta</th><th>Comprobantes</th><th>De pedidos de esta app</th><th>Ejemplo</th>
+      </tr></thead><tbody>
+      ${r.talonarios.map((t) => `<tr class="${t.nuestros ? "bg-green-50" : ""}">
+        <td class="font-mono">${esc(t.punto_venta)}</td>
+        <td>${t.total}</td>
+        <td class="${t.nuestros ? "text-green-700 font-bold" : "text-gray-400"}">${t.nuestros}</td>
+        <td class="font-mono text-xs">${esc(t.ejemplo)}</td>
+      </tr>`).join("")}</tbody></table>`
+      : `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 mb-3">
+           Tango no devolvió comprobantes en ese período.</div>`}
+    ${r.sugerencia ? `<div class="text-sm bg-gray-50 border rounded-lg p-3">
+        Los pedidos de Frávega y OnCity se facturaron con el/los punto(s) de venta
+        <b class="font-mono">${esc(r.sugerencia)}</b>.<br>
+        Copiá ese valor en <b>Configuración → PDF de facturas → Talonarios de Frávega/OnCity</b>
+        y el resto de la facturación de la empresa deja de entrar acá.
+      </div>` : `<div class="text-sm text-gray-600">Ninguno de esos comprobantes corresponde a
+        pedidos que haya mandado esta app, así que todavía no puedo sugerirte un talonario.</div>`}
+    <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
 }
 
 function verEvento(n) {
@@ -1505,17 +1716,18 @@ async function cargarPdfs() {
   catch (e) { cont.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
   if (!$("pdf-tabla")) return;
   cont.innerHTML = `<table class="data w-full"><thead><tr>
-      <th>Nro de factura</th><th>Orden</th><th>PDF</th><th>Origen</th><th>Fecha</th><th>Detalle</th>
+      <th>Nro de factura</th><th>Orden</th><th>PDF</th><th>Vence</th><th>Origen</th><th>Fecha</th><th>Detalle</th>
     </tr></thead><tbody>
     ${rows.map((r) => `<tr>
       <td class="font-mono text-xs">${esc(r.nro_factura)}</td>
       <td class="font-mono text-xs">${esc(r.order_id)}</td>
       <td>${r.url ? `<a href="${esc(r.url)}" target="_blank" class="text-violet-700 underline text-xs">abrir</a>`
         : '<span class="text-amber-700 text-xs">sin PDF</span>'}</td>
+      <td class="text-xs whitespace-nowrap">${badgeVence(r.vence)}</td>
       <td class="text-xs">${esc(r.origen)}</td>
       <td class="text-xs text-gray-500">${esc(r.fecha_hora)}</td>
       <td class="text-xs text-gray-500 max-w-xs truncate" title="${esc(r.detalle)}">${esc(r.detalle)}</td>
-    </tr>`).join("") || '<tr><td colspan="6" class="text-gray-400 p-4">Sin registros</td></tr>'}
+    </tr>`).join("") || '<tr><td colspan="7" class="text-gray-400 p-4">Sin registros</td></tr>'}
     </tbody></table>`;
 }
 
@@ -1546,6 +1758,38 @@ async function buscarPdf() {
          <div class="text-xs text-gray-500 mt-2">Pasame este detalle y ajusto la ruta.</div>
        </div>`;
   cargarPdfs();
+}
+
+async function sincronizarPdfs() {
+  confirmar("Se van a traer de Tango todos los comprobantes electrónicos de los últimos 30 días " +
+            "y se van a guardar los PDF que falten. Puede tardar varios minutos.", async () => {
+    const cont = $("pdf-tabla");
+    cont.innerHTML = spinner("Consultando los comprobantes en Tango y bajando los PDF...");
+    let r;
+    try { r = await api("pdfs.sync", { dias: 30 }); }
+    catch (e) {
+      cont.innerHTML = `<div class="border border-red-200 bg-red-50 rounded-lg p-3 text-sm text-red-700">${esc(e.message)}</div>`;
+      return;
+    }
+    showModal(`
+      <h3 class="font-bold text-lg mb-3">Comprobantes sincronizados</h3>
+      <div class="text-sm space-y-1 mb-3">
+        <div>Período: <b>${esc(r.desde)}</b> a <b>${esc(r.hasta)}</b></div>
+        <div>Comprobantes encontrados en Tango: <b>${r.total}</b></div>
+        <div class="text-green-700">PDF guardados ahora: <b>${r.guardados}</b></div>
+        <div class="text-gray-600">Ya los teníamos: <b>${r.ya_estaban}</b></div>
+        ${r.sin_url ? `<div class="text-amber-700">Sin archivo publicado: <b>${r.sin_url}</b></div>` : ""}
+        ${r.truncado ? `<div class="text-amber-700">${esc(r.mensaje)}</div>` : ""}
+      </div>
+      ${r.fallidos && r.fallidos.length ? `<div class="text-sm text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-2">
+        No se pudieron bajar: ${r.fallidos.slice(0, 15).map(esc).join(", ")}</div>` : ""}
+      ${r.total === 0 ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2">
+        Tango no devolvió ningún comprobante en ese período. Revisá que el talonario tenga
+        tildado <b>"Publica comprobantes en Tango Tiendas"</b> en la solapa Documentos
+        electrónicos: solo se publican los comprobantes emitidos después de ese cambio.</div>` : ""}
+      <div class="mt-4 text-right"><button onclick="closeModal(); viewPdfs();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
+    toast(`${r.guardados} PDF guardados`, r.guardados ? "ok" : "warning");
+  });
 }
 
 async function probarCarpeta() {
@@ -1887,10 +2131,13 @@ const CONFIG_CAMPOS = [
     ["oncity_ignorar", "Pedidos a ignorar siempre (separados por coma)", "text"],
   ]],
   ["PDF de facturas", [
-    ["pdf_usar_url_tango", "Usar la URL de Tango si es pública: auto · siempre · nunca", "text"],
+    ["pdf_destino", "Dónde vive el PDF: tango (la URL de Tango, vence) · drive (copia propia)", "text"],
+    ["webhook_solo_nuestras", "Procesar solo los avisos de pedidos que mandó esta app", "bool"],
+    ["webhook_talonarios", "Talonarios de Frávega/OnCity (puntos de venta, con coma). Vacío = todos", "text"],
+    ["pdf_dias_sync", "Días hacia atrás al sincronizar comprobantes", "text"],
     ["pdf_url_formato", "Formato del link de Drive: download · view", "text"],
     ["pdf_publico", "Publicar los PDF como \"cualquiera con el link\"", "bool"],
-    ["pdf_folder_nombre", "Nombre de la carpeta de Drive", "text"],
+    ["pdf_folder_nombre", "Nombre de la carpeta de Drive (solo si pdf_destino = drive)", "text"],
     ["pdf_folder_id", "ID de la carpeta (se completa solo)", "text"],
   ]],
   ["Facturas", [
