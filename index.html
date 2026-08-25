@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-26.05";
+const APP_VERSION = "2026-08-26.09";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -1654,6 +1654,28 @@ async function viewAvtex() {
         ⚠️ La simulación está destildada: esta prueba <b>manda la factura de verdad</b>.</div>`}
       <div id="av-prueba" class="mt-3"></div>`, "mb-4")}
 
+    ${card(`
+      <div class="flex items-center gap-2 mb-1">
+        <span class="text-lg">⚖️</span><div class="font-bold">Conciliar con Frávega</div>
+      </div>
+      <div class="text-sm text-gray-600 mb-3">
+        Subí el <b>CSV de órdenes que baja Frávega</b> y te digo, de las que ellos dan por
+        facturadas, cuáles llegaron por Seller Center, cuáles por VTEX y cuáles no informamos
+        nunca. Es la única forma de atribuir con certeza: el CSV es la palabra de ellos y el
+        registro es la nuestra.
+        <div class="text-xs mt-1">Lo que más importa es la última categoría: órdenes que
+          informamos y que Frávega sigue mostrando pendientes. Ese es el fallo que de otro
+          modo no se nota.</div>
+      </div>
+      <div class="flex gap-2 flex-wrap items-center">
+        <input type="file" id="av-csv" accept=".csv,.xlsx"
+          class="text-sm file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0
+                 file:bg-violet-50 file:text-violet-700 file:text-sm">
+        <button onclick="conciliarFravega()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
+          Conciliar</button>
+      </div>
+      <div id="av-conc" class="mt-3"></div>`, "mb-4")}
+
     ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Facturas esperando</div>
       ${(p.filas || []).length ? `<table class="data w-full"><thead><tr>
           <th>Orden</th><th>Canal</th><th>Cliente</th><th>Factura</th><th>Fecha</th><th>PDF</th>
@@ -2056,8 +2078,13 @@ async function verificarFravega() {
         minutos): <b>${r.esperando}</b></div>` : ""}
       ${(r.perdidas || []).length ? `<div class="text-amber-700">Sin novedad hace rato:
         <b>${r.perdidas.length}</b></div>` : ""}
+      ${(r.sin_verificar || []).length ? `<div class="text-blue-800">No verificables por acá:
+        <b>${r.sin_verificar.length}</b></div>` : ""}
       ${!r.revisadas ? `<div class="text-gray-600">No hay ninguna esperando confirmación.</div>` : ""}
     </div>
+    ${(r.sin_verificar || []).length ? `<div class="text-xs bg-blue-50 border border-blue-200 rounded p-2 mb-2 max-h-56 overflow-y-auto">
+      <div class="font-bold text-blue-900 mb-1">No se pueden verificar automáticamente</div>
+      ${r.sin_verificar.map((x) => `<div class="mb-1">${esc(x)}</div>`).join("")}</div>` : ""}
     ${(r.perdidas || []).length ? `<div class="text-xs bg-amber-50 border border-amber-200 rounded p-2 mb-2 max-h-48 overflow-y-auto">
       ${r.perdidas.map(esc).join("<br>")}
       <div class="mt-2 text-gray-600">Conviene mirarlas en el panel de Seller Center.</div></div>` : ""}
@@ -2066,17 +2093,103 @@ async function verificarFravega() {
     <div class="mt-4 text-right"><button onclick="closeModal(); viewAvtex();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
 }
 
+/** Cruza el CSV de Frávega contra nuestro registro de envíos. */
+async function conciliarFravega() {
+  const f = $("av-csv");
+  if (!f || !f.files.length) return toast("Subí el CSV de órdenes de Frávega", "warning");
+  const box = $("av-conc");
+  box.innerHTML = spinner("Cruzando el CSV contra el registro...");
+
+  let r;
+  try {
+    const ordenes = await parseFile(f.files[0]);
+    r = await api("vtexinv.conciliar", { ordenes });
+  } catch (e) { box.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
+  if (!$("av-conc")) return;
+
+  const s = r.resumen || {};
+  const lista = (t, arr, clase, nota) => !arr || !arr.length ? "" : `
+    <details class="text-xs mt-2">
+      <summary class="cursor-pointer ${clase}">${t} (${arr.length})</summary>
+      ${nota ? `<div class="text-gray-600 mt-1 mb-1">${nota}</div>` : ""}
+      <div class="font-mono max-h-48 overflow-y-auto mt-1">
+        ${arr.slice(0, 200).map((x) => `<div>${esc(typeof x === "string" ? x
+          : `${x.orden}${x.nro ? " — " + x.nro : ""}${x.vias ? " — por " + x.vias : ""}${x.cuando ? " — " + x.cuando : ""}`)}</div>`).join("")}
+      </div>
+    </details>`;
+
+  box.innerHTML = `
+    <div class="border rounded-lg p-3 text-sm">
+      <div class="text-gray-600 mb-2">
+        Órdenes en el CSV: <b>${r.total_csv}</b> ·
+        facturadas según Frávega: <b class="text-green-700">${r.facturadas}</b> ·
+        pendientes: <b class="${r.pendientes ? "text-amber-700" : ""}">${r.pendientes}</b>
+      </div>
+      <div class="border-t pt-2">
+        <div class="text-xs text-gray-500 uppercase mb-1">De las facturadas, ¿por dónde llegaron?</div>
+        <div class="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+          <div>✅ Por <b>Seller Center</b></div><div class="font-bold text-green-700">${s.seller_center || 0}</div>
+          <div>Por VTEX (camino viejo)</div><div class="font-bold">${s.vtex || 0}</div>
+          <div>Por las dos (no se puede atribuir)</div><div class="font-bold text-blue-700">${s.ambas || 0}</div>
+          <div>Sin registro nuestro (archivo o a mano)</div><div class="font-bold text-gray-500">${s.no_informadas || 0}</div>
+        </div>
+      </div>
+      ${s.informadas_sin_efecto ? `
+        <div class="border-t mt-2 pt-2 bg-red-50 -mx-3 -mb-3 px-3 pb-3 rounded-b-lg">
+          <div class="font-bold text-red-800">⚠️ Informadas pero Frávega las sigue mostrando pendientes: ${s.informadas_sin_efecto}</div>
+          <div class="text-xs text-gray-700 mt-1">Estas son las que hay que mirar: nosotros las
+            mandamos y del otro lado no se aplicaron.</div>
+          ${lista("Ver cuáles", r.informadas_sin_efecto, "text-red-700 font-bold")}
+        </div>` : `<div class="border-t mt-2 pt-2 text-sm text-green-700">
+          ✅ No hay ninguna que hayamos informado y siga pendiente.</div>`}
+      ${lista("Facturadas por Seller Center", r.por_seller_center, "text-green-700")}
+      ${lista("Facturadas por las dos vías", r.por_ambas, "text-blue-700",
+        "A estas les mandamos la factura por VTEX y por Seller Center, así que no se puede saber cuál la aplicó.")}
+      ${lista("Facturadas solo por VTEX", r.por_vtex, "text-gray-700")}
+      ${lista("Pendientes que nunca informamos", r.pendientes_sin_informar, "text-amber-700",
+        "Normalmente son las que todavía no facturaste en Tango.")}
+    </div>`;
+}
+
 /** Manda una sola orden y muestra el envío completo. */
-async function probarAvtex() {
+async function probarAvtex(igual) {
   const orden = (($("av-orden") || {}).value || "").trim();
   const box = $("av-prueba");
   if (!orden) return toast("Poné el número de orden", "warning");
   box.innerHTML = spinner("Enviando solo esa orden...");
 
   let r;
-  try { r = await api("vtexinv.run", { orden, forzar: "1", reenviar: "1" }); }
+  try {
+    r = await api("vtexinv.run",
+      { orden, forzar: "1", reenviar: "1", igual: igual ? "1" : "" });
+  }
   catch (e) { box.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
   if (!$("av-prueba")) return;
+
+  // Ya se mandó hace poco: preguntamos antes de crear otra transacción.
+  if (r.confirmar) {
+    const p = r.previo || {};
+    box.innerHTML = `
+      <div class="border border-amber-300 bg-amber-50 rounded-lg p-3 text-sm">
+        <div class="font-bold text-amber-900 mb-1">⚠️ Esta factura ya se mandó</div>
+        <div class="text-xs text-gray-700 mb-2">
+          Último envío: <b>${esc(p.fecha_hora)}</b> (hace ${p.hace_min} min) ·
+          resultado <b>${esc(p.estado)}</b>
+          ${p.transaccion ? `· transacción <code>${esc(p.transaccion)}</code>` : ""}
+        </div>
+        <div class="text-xs text-gray-700 mb-3">
+          Cada envío crea una transacción nueva del lado del marketplace. Si ya la aceptó,
+          lo que corresponde es <b>esperar y verificar</b>, no volver a mandarla.
+        </div>
+        <div class="flex gap-2">
+          <button onclick="verificarFravega()" class="bg-violet-700 text-white px-3 py-1.5 rounded-lg text-xs">
+            🔍 Verificar si ya la procesó</button>
+          <button onclick="probarAvtex(true)" class="border border-amber-400 px-3 py-1.5 rounded-lg text-xs">
+            Mandarla igual</button>
+        </div>
+      </div>`;
+    return;
+  }
 
   if (r.aviso) {
     box.innerHTML = `<div class="border border-amber-300 bg-amber-50 rounded-lg p-3 text-sm text-amber-900">${esc(r.aviso)}</div>`;
@@ -2688,6 +2801,8 @@ const CONFIG_CAMPOS = [
     ["fvg_invoice_formato", "Formato del nro de factura para Frávega: tango · guion · guion_letra", "text"],
     ["fvg_invoice_exigir_url", "Frávega: esperar a tener el PDF antes de informar (la pide obligatoria)", "bool"],
     ["fvg_invoice_horas_alerta", "Frávega: horas a esperar la confirmación antes de avisar", "text"],
+    ["invoice_reenvio_minutos", "Minutos dentro de los cuales avisar antes de reenviar la misma factura", "text"],
+    ["orders_alerta_minimo", "Pedidos nuevos mínimos para que salte la alerta de duplicados", "text"],
   ]],
   ["Facturas", [
     ["invoices_match_importe", "Usar también el importe para matchear facturas", "bool"],
