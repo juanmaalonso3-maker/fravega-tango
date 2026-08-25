@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-26.14';
+var APP_VERSION = '2026-08-26.15';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -222,7 +222,11 @@ var DEFAULT_CONFIG = [
   ['vtex_invoice_pausa_ms', '400', 'Pausa entre llamadas a VTEX (ms)'],
   ['vtex_invoice_valor', 'orden', 'Importe informado: orden (el total de VTEX) o tango (el de la factura)'],
   ['vtex_invoice_al_vuelo', '1', 'Informar apenas llega el aviso de Tango (si no, solo en las corridas)'],
-  ['fvg_invoice_via', 'seller-center', 'Por dónde informar a Frávega: seller-center · vtex · ambos'],
+  // Probado el 25/08/2026: Seller Center acepta (200) pero NO aplica la factura
+  // —dos envíos, tres horas, cero efecto—. VTEX la aplica en el mismo llamado:
+  // el pedido pasa de "handling" a "invoiced" al instante. Por eso vtex es el
+  // valor de fábrica.
+  ['fvg_invoice_via', 'vtex', 'Por dónde informar a Frávega: seller-center · vtex · ambos'],
   ['fvg_invoice_formato', 'tango', 'Formato del nro de factura para Frávega: tango (B0000700002727) · guion (00007-00002727) · guion_letra'],
   ['fvg_invoice_exigir_url', '1', 'Frávega pide la URL del PDF: si falta, esperar en vez de mandar incompleta'],
   ['fvg_invoice_horas_alerta', '6', 'Horas a esperar la confirmación de Frávega antes de avisar'],
@@ -4380,7 +4384,9 @@ function _vtexNotificarFactura(canal, orderId, factura, cfg) {
   var status = String(det.status || '');
   res.estado_vtex = status;
 
-  if (status === 'invoiced') {
+  // VTEX usa "invoiced" en unos lados y "invoice" en otros. Aceptamos las dos:
+  // si solo miráramos una, la orden quedaría reintentándose para siempre.
+  if (status === 'invoiced' || status === 'invoice') {
     res.ok = true; res.estado = 'ya_facturada';
     res.detalle = 'VTEX ya la tiene facturada. No hace falta hacer nada.';
     return res;
@@ -4827,8 +4833,9 @@ function verificarFacturasFravega(quien, opciones) {
     }
 
     var st = String(det.status || '');
-    var yaFacturadoEnVtex = (st === 'invoiced' || st === 'handling-shipping' ||
-                             st === 'shipped' || st === 'delivered' || st === 'complete');
+    var yaFacturadoEnVtex = (st === 'invoiced' || st === 'invoice' ||
+                             st === 'handling-shipping' || st === 'shipped' ||
+                             st === 'delivered' || st === 'complete');
 
     if (yaFacturadoEnVtex && contaminadas[orden.toUpperCase()]) {
       // El "invoiced" de VTEX puede ser obra nuestra, no de Frávega.

@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-26.14";
+const APP_VERSION = "2026-08-26.15";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -3017,11 +3017,12 @@ async function viewConfig() {
         ${CONFIG_CAMPOS.map(([titulo, campos]) => card(
           `<div class="text-xs text-gray-500 uppercase font-bold mb-2">${titulo}</div>
            ${campos.map(campo).join("")}`)).join("")}
-        <button onclick="guardarConfig()"
+        <button id="cfg-guardar" onclick="guardarConfig()"
           class="bg-violet-700 text-white px-5 py-2.5 rounded-lg font-medium">💾 Guardar cambios</button>
         <button onclick="probarOncity()" class="border px-4 py-2.5 rounded-lg font-medium ml-2">🔌 Probar OnCity</button>
         <span class="text-sm text-gray-500 ml-3">Próxima sincronización:
           <b>${cfg.proxima_sincronizacion ? esc(cfg.proxima_sincronizacion) : "—"}</b></span>
+        <div id="cfg-estado" class="text-sm mt-2 min-h-[1.25rem]"></div>
       </div>
       <div>
         ${card(`<div class="text-xs text-gray-500 uppercase font-bold mb-2">Credenciales</div>
@@ -3082,21 +3083,48 @@ async function probarOncity() {
 }
 
 async function guardarConfig() {
+  const btn = $("cfg-guardar");
+  const est = $("cfg-estado");
   const valores = {};
   document.querySelectorAll(".cfg-input").forEach((el) => {
     valores[el.dataset.key] = el.type === "checkbox" ? (el.checked ? "1" : "0") : el.value.trim();
   });
+
+  // Guardar tarda unos segundos porque además reagenda los disparadores. Sin
+  // señal en pantalla parece que el botón no hizo nada y uno vuelve a tocarlo.
+  const original = btn ? btn.innerHTML : "";
+  if (btn) {
+    btn.disabled = true;
+    btn.classList.add("opacity-60", "cursor-not-allowed");
+    btn.innerHTML = `<span class="inline-block animate-spin">◌</span> Guardando…`;
+  }
+  if (est) est.innerHTML = `<span class="text-gray-500">Guardando y reagendando los horarios…</span>`;
+
   try {
     const r = await api("settings.set", { valores });
     const ag = r.agendados || {};
+    const partes = [];
+    if (r.proxima_sincronizacion) partes.push(`stock: próxima ${esc(r.proxima_sincronizacion)} (${ag.stock || 0} horario/s)`);
+    if (r.proxima_ordenes) partes.push(`órdenes: próxima ${esc(r.proxima_ordenes)} (${ag.ordenes || 0} horario/s)`);
+    else partes.push("órdenes: automático apagado");
+
+    if (est) est.innerHTML = `<span class="text-green-700 font-medium">✅ Guardado</span>
+      <span class="text-gray-500"> · ${partes.join(" · ")}</span>
+      ${r.ignoradas && r.ignoradas.length
+        ? `<div class="text-amber-700 mt-1">Se ignoraron claves desconocidas:
+             ${esc(r.ignoradas.join(", "))}</div>` : ""}`;
     toast("Configuración guardada", "ok");
-    if (r.ignoradas && r.ignoradas.length) {
-      toast(`Se ignoraron claves desconocidas: ${r.ignoradas.join(", ")}`, "warning");
+  } catch (e) {
+    if (est) est.innerHTML = `<span class="text-red-700 font-medium">❌ No se guardó</span>
+      <span class="text-gray-700"> · ${esc(e.message)}</span>`;
+    toast(e.message, "error");
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.classList.remove("opacity-60", "cursor-not-allowed");
+      btn.innerHTML = original;
     }
-    if (r.proxima_sincronizacion) toast(`Stock: próxima ${r.proxima_sincronizacion} · ${ag.stock || 0} horario(s)`, "info");
-    if (r.proxima_ordenes) toast(`Órdenes: próxima ${r.proxima_ordenes} · ${ag.ordenes || 0} horario(s) agendados`, "info");
-    else toast(`Órdenes: automático apagado`, "info");
-  } catch (e) { toast(e.message, "error"); }
+  }
 }
 
 /* ══════════════ Arranque ══════════════ */
