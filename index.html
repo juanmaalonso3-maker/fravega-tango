@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-24.9";
+const APP_VERSION = "2026-08-24.11";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -546,7 +546,12 @@ async function cargarPanelAuto() {
          <div><span class="text-green-700 font-bold">● Automático activado</span>
            <span class="text-gray-600">— ${esc(a.canales.join(" y "))} a las ${esc(a.horas)} hs</span></div>
          <div class="text-gray-600">Próxima: <b>${a.proxima ? esc(a.proxima) : "—"}</b></div>
+         <div class="${a.agendados > 0 ? "text-gray-600" : "text-red-600 font-bold"}">
+           ${a.agendados > 0 ? `✔️ ${a.agendados} horario(s) agendados en Google`
+             : a.agendados === 0 ? "⚠️ NINGÚN horario agendado — volvé a guardar Configuración"
+             : "no se pudo verificar el agendado"}</div>
          <div class="text-gray-600">Última: ${ultimaTxt}</div>
+         ${a.email ? "" : '<div class="text-amber-700">⚠️ sin email de aviso</div>'}
          <button onclick="correrAuto()" class="ml-auto border border-green-600 text-green-800 px-3 py-1.5 rounded-lg text-xs">
            ▶️ Correr ahora</button>
          <a href="#config" class="text-violet-700 underline text-xs">Configurar</a>

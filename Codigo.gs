@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-24.9';
+var APP_VERSION = '2026-08-24.11';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -281,13 +281,12 @@ function configurarTriggers() {
     if (f === 'syncProgramada' || f === 'ordenesProgramadas') ScriptApp.deleteTrigger(t);
   });
 
-  _crearTriggersHorarios('syncProgramada', getConfig('scheduler_hours') || '7,19');
+  _crearTriggersHorarios('syncProgramada', getConfig('scheduler_hours'));
 
   // Las órdenes solo se agendan si la automatización está prendida: así no
   // quedan triggers corriendo mientras se prueba la integración.
   if (getConfig('orders_auto_enabled') === '1') {
-    _crearTriggersHorarios('ordenesProgramadas',
-                           getConfig('orders_auto_hours') || '8,11,14,17,20');
+    _crearTriggersHorarios('ordenesProgramadas', getConfig('orders_auto_hours'));
   }
 }
 
@@ -357,6 +356,65 @@ function ACTUALIZAR_ESTADOS_VTEX() {
   log_('sistema', 'configuracion',
        'Estados de Frávega actualizados: ready-for-handling + handling', 'ok', '');
   return 'Listo: Frávega ahora trae ready-for-handling y handling, con ventana de 90 días.';
+}
+
+/**
+ * EJECUTAR DESDE EL EDITOR para dejar la automatización de órdenes escrita y
+ * agendada, sin depender de la pantalla de Configuración.
+ *
+ * Cambiá los valores de acá abajo si querés otros horarios o canales, guardá,
+ * y ejecutá la función. Al terminar deja en el registro cuántos horarios
+ * quedaron realmente agendados en Google, que es la prueba de que está armado.
+ */
+function CONFIGURAR_AUTOMATICO() {
+  var VALORES = {
+    orders_auto_enabled: '1',                    // '0' para apagarlo
+    orders_auto_hours: '8,11,14,17,20',           // horas del día
+    orders_auto_canales: 'fravega,oncity',        // canales que entran
+    orders_auto_max: '80',                        // tope de seguridad por corrida
+    orders_auto_email: 'juan.alonso@bitek.com.ar',
+    orders_auto_email_siempre: '0'                // '1' = resumen en cada corrida
+  };
+
+  Object.keys(VALORES).forEach(function (k) { setConfig(k, VALORES[k]); });
+  configurarTriggers();
+
+  var agendados = [];
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    agendados.push(t.getHandlerFunction());
+  });
+  var ordenes = agendados.filter(function (f) { return f === 'ordenesProgramadas'; }).length;
+  var stock = agendados.filter(function (f) { return f === 'syncProgramada'; }).length;
+
+  Logger.log('── Configuración escrita en la hoja ──');
+  Object.keys(VALORES).forEach(function (k) {
+    Logger.log('   %s = %s', k, getConfig(k));
+  });
+  Logger.log('');
+  Logger.log('── Horarios agendados en Google ──');
+  Logger.log('   órdenes (ordenesProgramadas): %s', ordenes);
+  Logger.log('   stock   (syncProgramada)    : %s', stock);
+  Logger.log('');
+  Logger.log(ordenes > 0
+    ? '✅ Listo: las órdenes se van a traer solas a las ' + VALORES.orders_auto_hours + ' hs.'
+    : '⚠️ No quedó ningún horario agendado. Revisá que orders_auto_enabled sea 1.');
+
+  log_('sistema', 'configuracion', 'Automatización de órdenes configurada', 'ok',
+       'horas=' + VALORES.orders_auto_hours + ' canales=' + VALORES.orders_auto_canales +
+       ' triggers=' + ordenes);
+
+  return { horarios_ordenes: ordenes, horarios_stock: stock, valores: VALORES };
+}
+
+/**
+ * Apaga la automatización de órdenes y borra sus horarios.
+ * El stock sigue sincronizándose como siempre.
+ */
+function APAGAR_AUTOMATICO() {
+  setConfig('orders_auto_enabled', '0');
+  configurarTriggers();
+  Logger.log('Automatización de órdenes apagada. El stock sigue andando.');
+  return 'Apagado.';
 }
 
 /* ═══════════════ API HTTP (doPost) ═══════════════ */
@@ -2281,9 +2339,9 @@ function runOrdersImport(disparadaPor) {
   var t0 = Date.now();
   var inicio = _now();
   var cfg = _configMap();
-  var canales = String(cfg.orders_auto_canales || 'fravega,oncity')
+  var canales = String(_cfgVal(cfg, 'orders_auto_canales'))
     .split(',').map(function (x) { return x.trim().toLowerCase(); }).filter(String);
-  var maxAuto = parseInt(cfg.orders_auto_max || '80', 10) || 80;
+  var maxAuto = parseInt(_cfgVal(cfg, 'orders_auto_max'), 10) || 80;
 
   var res = {
     resultado: 'ok', inicio: inicio, por_canal: {},
@@ -2409,12 +2467,12 @@ function runOrdersImport(disparadaPor) {
  * un mail diario que dice "todo bien" se deja de leer a la semana.
  */
 function _avisarCorrida(cfg, res) {
-  var destino = String(cfg.orders_auto_email || '').trim();
+  var destino = String(_cfgVal(cfg, 'orders_auto_email')).trim();
   if (!destino) return;
 
   var hayQueMirar = res.rechazadas.length || res.excluidas.length ||
                     res.errores.length || res.frenada || res.resultado === 'falló';
-  if (!hayQueMirar && cfg.orders_auto_email_siempre !== '1') return;
+  if (!hayQueMirar && _cfgVal(cfg, 'orders_auto_email_siempre') !== '1') return;
 
   var l = [];
   l.push('Corrida automática de órdenes — ' + res.inicio);
@@ -2466,15 +2524,26 @@ function apiOrdersAutoStatus() {
   var hist = _readRows(SH.ORDERS, 100).filter(function (r) {
     return String(r.archivo || '').indexOf('Automático') === 0;
   });
+  var habilitada = _cfgVal(cfg, 'orders_auto_enabled') === '1';
+  var horas = _cfgVal(cfg, 'orders_auto_hours');
+
+  // Contamos los triggers reales: es la única prueba de que quedó agendado.
+  var agendados = 0;
+  try {
+    ScriptApp.getProjectTriggers().forEach(function (t) {
+      if (t.getHandlerFunction() === 'ordenesProgramadas') agendados++;
+    });
+  } catch (e) { agendados = -1; }
+
   return {
-    habilitada: cfg.orders_auto_enabled === '1',
-    horas: cfg.orders_auto_hours || '',
-    canales: String(cfg.orders_auto_canales || '').split(',')
+    habilitada: habilitada,
+    horas: horas,
+    canales: String(_cfgVal(cfg, 'orders_auto_canales')).split(',')
       .map(function (x) { return x.trim(); }).filter(String),
-    tope: cfg.orders_auto_max || '',
-    email: cfg.orders_auto_email || '',
-    proxima: cfg.orders_auto_enabled === '1'
-      ? _proximaCorrida(cfg.orders_auto_hours || '8,11,14,17,20') : null,
+    tope: _cfgVal(cfg, 'orders_auto_max'),
+    email: _cfgVal(cfg, 'orders_auto_email'),
+    agendados: agendados,
+    proxima: habilitada ? _proximaCorrida(horas) : null,
     ultima: hist.length ? hist[hist.length - 1] : null
   };
 }
@@ -3093,7 +3162,21 @@ function _configMap() {
   return out;
 }
 
-function getConfig(key) { return _configMap()[key] || ''; }
+function getConfig(key) { return _cfgVal(_configMap(), key); }
+
+/**
+ * Valor de configuración con respaldo en DEFAULT_CONFIG.
+ * Una clave nueva no está en la hoja hasta que se corre la migración, y si la
+ * pantalla de Configuración la guarda vacía queda vacía para siempre. Con este
+ * respaldo, una clave sin valor usa el default del código en vez de quedar en
+ * blanco y desactivar una función sin decir nada.
+ */
+function _cfgVal(cfg, key) {
+  var v = (cfg || {})[key];
+  if (v !== undefined && String(v).trim() !== '') return String(v);
+  var d = _defaultConfig(key);
+  return d === undefined ? '' : String(d);
+}
 
 function setConfig(key, value) {
   var sheet = _sheet(SH.CONFIG);
@@ -3104,8 +3187,17 @@ function setConfig(key, value) {
 
 function apiSettingsGet() {
   var props = PropertiesService.getScriptProperties();
+  // Completamos con los defaults del código las claves que la hoja no tiene o
+  // tiene vacías: así el formulario muestra el valor real que está usando la
+  // app, y al guardar queda escrito en la hoja en vez de perderse.
+  var valores = _configMap();
+  DEFAULT_CONFIG.forEach(function (r) {
+    if (valores[r[0]] === undefined || String(valores[r[0]]).trim() === '') {
+      valores[r[0]] = r[1];
+    }
+  });
   return {
-    valores: _configMap(),
+    valores: valores,
     credenciales: {
       tango_token: !!props.getProperty('TANGO_ACCESS_TOKEN'),
       fravega_seller_id: !!props.getProperty('FRAVEGA_SELLER_ID'),
