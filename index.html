@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-24.12";
+const APP_VERSION = "2026-08-25.15";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -82,6 +82,7 @@ const VIEWS = [
   { id: "stock", label: "🔄 Sincronización de Stock" },
   { id: "ordenes", label: "📦 Ingreso de Órdenes" },
   { id: "facturas", label: "🧾 Exportación de Facturas" },
+  { id: "pdfs", label: "📄 PDF de Facturas" },
   { id: "skus", label: "🔗 Relación de SKUs" },
   { id: "pendientes", label: "⚠️ SKU Pendientes" },
   { id: "logs", label: "📜 Logs" },
@@ -322,8 +323,9 @@ function route() {
   document.querySelectorAll(".nav-item").forEach((el) =>
     el.classList.toggle("active", el.dataset.view === view));
   const fn = { dashboard: viewDashboard, stock: viewStock, ordenes: viewOrdenes,
-               facturas: viewFacturas, skus: viewSkus, pendientes: viewPendientes,
-               logs: viewLogs, config: viewConfig }[view] || viewDashboard;
+               facturas: viewFacturas, pdfs: viewPdfs, skus: viewSkus,
+               pendientes: viewPendientes, logs: viewLogs, config: viewConfig
+             }[view] || viewDashboard;
   // Sin este try/catch, si una vista falla ANTES de dibujar, la pantalla se
   // queda con lo que había antes y parece que no pasó nada. Preferimos mostrar
   // el error: es la diferencia entre "no anda" y "esto es lo que se rompió".
@@ -1224,6 +1226,14 @@ async function generarFacturasOncity() {
             documento: ${esc(r.columna_documento)} · importe: ${esc(r.columna_importe)}</div>
           ${r.ya_tenian ? `<div class="text-xs text-gray-500">${r.ya_tenian} fila(s) ya traían número de factura y se dejaron como estaban.</div>` : ""}
         </div>
+        <div class="text-sm mb-2 ${r.sin_url && r.sin_url.length ? "text-red-800 bg-red-50 border border-red-200 rounded p-2" : "text-gray-600"}">
+          📄 URL de factura: <b>${r.con_url || 0}</b> completadas
+          ${r.sin_url && r.sin_url.length ? `· <b>${r.sin_url.length} SIN PDF</b>
+            <div class="text-xs mt-1">En OnCity esta columna es <b>obligatoria</b>: esas filas
+              van a ser rechazadas en la importación.</div>
+            <div class="text-xs mt-1">${r.sin_url.slice(0, 20).map((s) => `<div>· ${esc(s.orden)} — factura ${esc(s.factura)}</div>`).join("")}
+            ${r.sin_url.length > 20 ? `<div>…y ${r.sin_url.length - 20} más</div>` : ""}</div>` : ""}
+        </div>
         ${r.sin_match.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 mb-2">
           ⚠️ ${r.sin_match.length} pedido(s) de la plantilla sin factura asignada:
           ${r.sin_match.slice(0, 30).map((o) => `<div>· ${esc(o)}</div>`).join("")}
@@ -1276,6 +1286,14 @@ async function generarFacturasHistorial() {
           solo nombre <b>${(r.conteo || {}).nombre || 0}</b>
           <div class="text-xs text-gray-500">Columnas usadas del reporte de Tango —
             documento: ${esc(r.columna_documento)} · importe: ${esc(r.columna_importe)}</div>
+        </div>
+        <div class="text-sm mb-2 ${r.sin_url && r.sin_url.length ? "text-amber-800 bg-amber-50 border border-amber-200 rounded p-2" : "text-gray-600"}">
+          📄 URL de factura: <b>${r.con_url || 0}</b> completadas
+          ${r.sin_url && r.sin_url.length ? `· <b>${r.sin_url.length} sin PDF</b>
+            <div class="text-xs mt-1">${r.sin_url.slice(0, 20).map((s) => `<div>· ${esc(s.orden)} — factura ${esc(s.factura)}</div>`).join("")}
+            ${r.sin_url.length > 20 ? `<div>…y ${r.sin_url.length - 20} más</div>` : ""}</div>
+            <div class="text-xs mt-1">Para Frávega la columna no es obligatoria en la carga, pero sí lo es
+              para vos. Revisá en <a href="#pdfs" class="underline">PDF de Facturas</a> si llegaron los avisos de Tango.</div>` : ""}
         </div>
         ${r.sin_factura.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 mb-2">
           ⚠️ ${r.sin_factura.length} orden(es) enviadas a Tango sin factura en el reporte:
@@ -1346,6 +1364,115 @@ async function generarFacturas() {
     toast("Archivo de facturas generado", "ok");
   } catch (e) {
     $("fac-resultado").innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`;
+  }
+}
+
+/* ══════════════ PDF DE FACTURAS ══════════════ */
+async function viewPdfs() {
+  setMain(H("PDF de Facturas") + spinner("Consultando..."));
+  let i;
+  try { i = await api("pdfs.info"); }
+  catch (e) { if (!stillOn("pdfs")) return; return setMain(H("PDF de Facturas") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
+  if (!stillOn("pdfs")) return;
+
+  const ev = (i.eventos || []).map((e) => `<tr>
+    <td class="text-xs whitespace-nowrap">${esc(e.fecha_hora)}</td>
+    <td class="text-xs">${esc(e.topic)}</td>
+    <td class="font-mono text-xs">${esc(e.resource)}</td>
+    <td>${resultadoBadge(String(e.resultado).indexOf("error") !== -1 || String(e.resultado) === "rechazado"
+      ? "error" : String(e.resultado).indexOf("sin") === 0 ? "warning" : "ok")}
+      <span class="text-xs text-gray-600">${esc(e.resultado)}</span></td>
+    <td class="text-xs text-gray-600 max-w-md truncate" title="${esc(e.detalle)}">${esc(e.detalle)}</td>
+  </tr>`).join("");
+
+  setMain(H("PDF de Facturas") + `
+    ${card(`
+      <div class="text-sm text-gray-600 mb-3">
+        Tango avisa por <b>webhook</b> cuando hay un comprobante en PDF. Si el link que manda
+        es público se usa tal cual; si pide credenciales, la app lo guarda en Drive y publica
+        uno propio. Después esa URL se completa sola en la columna
+        <b>"Url de la factura"</b> de los archivos de Frávega y OnCity.
+      </div>
+      <div class="text-xs text-gray-500 uppercase mb-1">Pegá esta URL en Tango</div>
+      <div class="flex gap-2 items-center mb-2">
+        <input id="wh-url" readonly value="${esc(i.url)}"
+          class="border rounded-lg px-3 py-2 w-full text-xs font-mono bg-gray-50">
+        <button onclick="copiarWebhook()" class="border px-3 py-2 rounded-lg text-sm whitespace-nowrap">Copiar</button>
+      </div>
+      <p class="text-xs text-gray-500 mb-3">En Tango Tiendas: configuración de la API →
+        tildar notificaciones → pegar esta URL. El <code>?wh=</code> del final es un secreto:
+        sin él las notificaciones se rechazan, así nadie puede inyectar facturas falsas.</p>
+      <div class="flex gap-3 flex-wrap items-center">
+        <button onclick="viewPdfs()" class="border px-4 py-2 rounded-lg text-sm">Actualizar</button>
+        <button onclick="probarCarpeta()" class="border px-4 py-2 rounded-lg text-sm">🧪 Probar la carpeta de Drive</button>
+        ${i.carpeta ? `<a href="${esc(i.carpeta)}" target="_blank" class="text-violet-700 underline text-sm">Abrir la carpeta</a>` : ""}
+        <span class="text-sm text-gray-500 ml-auto">
+          ${i.total_facturas} factura(s) registradas · <b class="text-green-700">${i.con_pdf}</b> con PDF ·
+          <b class="${i.sin_pdf ? "text-amber-700" : ""}">${i.sin_pdf}</b> sin PDF</span>
+      </div>`, "mb-4")}
+
+    ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Últimos avisos de Tango</div>
+      ${ev ? `<table class="data w-full"><thead><tr>
+        <th>Fecha</th><th>Tópico</th><th>Recurso</th><th>Resultado</th><th>Detalle</th>
+      </tr></thead><tbody>${ev}</tbody></table>`
+        : `<div class="text-sm text-gray-500">Todavía no llegó ningún aviso. Cuando configures la
+             URL en Tango y se facture un pedido, acá van a aparecer los eventos. El cuerpo
+             completo de cada uno queda en la pestaña <b>Webhooks</b> de la planilla, que es lo
+             que necesito para ajustar si Tango manda el PDF de una forma distinta.</div>`}`, "mb-4")}
+
+    ${card(`<div class="flex items-center gap-3 mb-2">
+        <div class="text-xs text-gray-500 uppercase">Facturas registradas</div>
+        <input id="pdf-q" placeholder="Buscar por factura u orden..."
+          class="border rounded-lg px-3 py-1.5 text-sm w-64"
+          onkeydown="if(event.key==='Enter')cargarPdfs()">
+        <button onclick="cargarPdfs()" class="border px-3 py-1.5 rounded-lg text-sm">Buscar</button>
+      </div>
+      <div id="pdf-tabla">${spinner()}</div>`)}`);
+  cargarPdfs();
+}
+
+function copiarWebhook() {
+  const el = $("wh-url");
+  el.select();
+  try { document.execCommand("copy"); toast("URL copiada", "ok"); }
+  catch (e) { toast("Copiala a mano desde el campo", "warning"); }
+}
+
+async function cargarPdfs() {
+  const cont = $("pdf-tabla");
+  if (!cont) return;
+  let rows;
+  try { rows = await api("pdfs.list", { q: ($("pdf-q") || {}).value || "" }); }
+  catch (e) { cont.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
+  if (!$("pdf-tabla")) return;
+  cont.innerHTML = `<table class="data w-full"><thead><tr>
+      <th>Nro de factura</th><th>Orden</th><th>PDF</th><th>Origen</th><th>Fecha</th><th>Detalle</th>
+    </tr></thead><tbody>
+    ${rows.map((r) => `<tr>
+      <td class="font-mono text-xs">${esc(r.nro_factura)}</td>
+      <td class="font-mono text-xs">${esc(r.order_id)}</td>
+      <td>${r.url ? `<a href="${esc(r.url)}" target="_blank" class="text-violet-700 underline text-xs">abrir</a>`
+        : '<span class="text-amber-700 text-xs">sin PDF</span>'}</td>
+      <td class="text-xs">${esc(r.origen)}</td>
+      <td class="text-xs text-gray-500">${esc(r.fecha_hora)}</td>
+      <td class="text-xs text-gray-500 max-w-xs truncate" title="${esc(r.detalle)}">${esc(r.detalle)}</td>
+    </tr>`).join("") || '<tr><td colspan="6" class="text-gray-400 p-4">Sin registros</td></tr>'}
+    </tbody></table>`;
+}
+
+async function probarCarpeta() {
+  showModal(`<h3 class="font-bold text-lg mb-3">Probando la carpeta…</h3>${spinner()}`);
+  try {
+    const r = await api("pdfs.test");
+    showModal(`<h3 class="font-bold text-lg mb-3">Prueba de la carpeta de Drive</h3>
+      <p class="text-sm text-gray-600 mb-3">${esc(r.mensaje)}</p>
+      <div class="text-xs font-mono bg-gray-50 border rounded p-2 break-all mb-3">${esc(r.url)}</div>
+      <a href="${esc(r.url)}" target="_blank" class="text-violet-700 underline text-sm">Abrir el archivo de prueba</a>
+      <div class="mt-4 text-right"><button onclick="closeModal(); viewPdfs();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
+  } catch (e) {
+    showModal(`<h3 class="font-bold text-lg mb-3">Prueba de la carpeta</h3>
+      <p class="text-red-600 text-sm">${esc(e.message)}</p>
+      <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
   }
 }
 
@@ -1670,6 +1797,13 @@ const CONFIG_CAMPOS = [
     ["oncity_orders_warehouse", "Depósito de pedidos (vacío = el mismo que Frávega)", "text"],
     ["oncity_seller_code", "Vendedor (vacío = el mismo que Frávega)", "text"],
     ["oncity_ignorar", "Pedidos a ignorar siempre (separados por coma)", "text"],
+  ]],
+  ["PDF de facturas", [
+    ["pdf_usar_url_tango", "Usar la URL de Tango si es pública: auto · siempre · nunca", "text"],
+    ["pdf_url_formato", "Formato del link de Drive: download · view", "text"],
+    ["pdf_publico", "Publicar los PDF como \"cualquiera con el link\"", "bool"],
+    ["pdf_folder_nombre", "Nombre de la carpeta de Drive", "text"],
+    ["pdf_folder_id", "ID de la carpeta (se completa solo)", "text"],
   ]],
   ["Facturas", [
     ["invoices_match_importe", "Usar también el importe para matchear facturas", "bool"],
