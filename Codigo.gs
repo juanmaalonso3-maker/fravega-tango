@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-25.16';
+var APP_VERSION = '2026-08-25.20';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -489,6 +489,7 @@ function doPost(e) {
       case 'pdfs.info':           out = apiWebhookInfo(); break;
       case 'pdfs.list':           out = apiPdfsList(p.q); break;
       case 'pdfs.test':           out = apiPdfsTest(user); break;
+      case 'pdfs.buscar':         out = apiPdfBuscar(user, p); break;
       case 'orders.autoRun':      out = apiOrdersAutoRun(user); break;
       case 'oncity.invoices':     out = apiOncityInvoices(user, p); break;
       case 'skus.list':          out = apiSkusList(p.q || ''); break;
@@ -2640,6 +2641,9 @@ function _procesarWebhook(req, e) {
         detalle = 'orden ' + resource + ' facturada, sin número reconocible en el aviso';
       }
       resultado = 'ok';
+    } else if (topic.toLowerCase().indexOf('validation') !== -1) {
+      resultado = 'ok';
+      detalle = 'Tango validó la URL del webhook. La conexión funciona.';
     } else {
       resultado = 'ignorado';
       detalle = 'tópico sin uso en esta app';
@@ -3067,6 +3071,157 @@ function apiPdfsList(q) {
     });
   }
   return rows.slice(0, 300);
+}
+
+/**
+ * Busca a mano el PDF de una factura ya emitida, sin esperar al webhook.
+ *
+ * Sirve para dos cosas: confirmar que Tango publica el comprobante (o sea, que
+ * el tilde del talonario está bien puesto) y descubrir POR QUÉ ruta se baja.
+ * Devuelve siempre el detalle de qué contestó cada endpoint, así se ve dónde
+ * está el problema en vez de quedarse con "no anda".
+ */
+function apiPdfBuscar(user, p) {
+  p = p || {};
+  var orden = String(p.orden || '').trim();
+  if (!orden) throw new Error('Poné el Nro de Orden (por ejemplo v92893535frvg-01)');
+
+  // Identificadores posibles. No sabemos con cuál referencia Tango al
+  // comprobante publicado: el número de orden nuestro, el de factura, o el
+  // número de pedido interno de Tango (0046X0004000002848).
+  var ids = [orden];
+  var pref = getConfig('fvtex_quitar_prefijo');
+  if (pref) {
+    if (orden.toUpperCase().indexOf(pref.toUpperCase()) === 0) ids.push(orden.slice(pref.length));
+    else ids.push(pref + orden);
+  }
+  if (p.factura) { ids.push(String(p.factura).trim()); ids.push(_normFactura(p.factura)); }
+
+  // El número de pedido de Tango (0046X0004000002848) mezcla talonario, una
+  // letra y el número. No sabemos con qué parte lo referencia el endpoint, así
+  // que probamos el completo y sus partes.
+  if (p.pedido) {
+    var ped = String(p.pedido).trim();
+    ids.push(ped);
+    ids.push(ped.replace(/\D/g, ''));                       // solo los dígitos
+    var m = ped.match(/[A-Za-z](\d+)$/);
+    if (m) {
+      ids.push(m[1]);                                       // lo que sigue a la letra
+      ids.push(String(parseInt(m[1], 10)));                  // sin ceros a la izquierda
+    }
+    var m2 = ped.match(/^(\d{4})[A-Za-z](\d+)$/);
+    if (m2) ids.push(m2[1] + '-' + m2[2]);                   // talonario-numero
+  }
+
+  var vistos = {}, unicos = [];
+  ids.forEach(function (x) { if (x && !vistos[x]) { vistos[x] = true; unicos.push(x); } });
+
+  var r = _sondeoExhaustivo(unicos);
+  if (r.blob) {
+    var nombre = (p.factura ? _normFactura(p.factura) : orden) + '.pdf';
+    var g = _guardarPdfEnDrive(r.blob, nombre);
+    _registrarFactura({ nro_factura: p.factura || '', order_id: orden, url: g.url,
+                        archivo_id: g.id, origen: 'búsqueda manual', detalle: r.via });
+    setConfig('pdf_ruta_ok', r.plantilla || '');
+    log_(user.email, 'facturas', 'PDF encontrado a mano para ' + orden, 'ok',
+         g.url + ' · ' + r.via);
+    return { ok: true, url: g.url, via: r.via, diagnostico: r.diag };
+  }
+
+  log_(user.email, 'facturas', 'No se encontró el PDF de ' + orden, 'warning',
+       r.diag.slice(0, 1500));
+  return { ok: false, diagnostico: r.diag, probadas: r.total,
+           sugerencia: 'Probé ' + r.total + ' combinaciones y ninguna devolvió un PDF. ' +
+             'Las causas, en orden de probabilidad: ' +
+             '(1) falta tildar "Publica comprobantes en Tango Tiendas" en la solapa ' +
+             'Documentos electrónicos del talonario con el que facturaste — sin eso el ' +
+             'comprobante no se publica y no hay ruta que lo encuentre; ' +
+             '(2) la factura se emitió antes de ese cambio; ' +
+             '(3) el PDF se sirve desde otro lado. Si todo dio 404, lo que hay que ' +
+             'preguntarle a Axoft es concreto: "¿por qué recurso se consulta el ' +
+             'comprobante publicado cuando la tienda es API?".' };
+}
+
+/**
+ * Sondeo amplio: prueba varias bases, rutas e identificadores.
+ * Solo se usa en la búsqueda manual, donde el tiempo no importa. El webhook
+ * usa la versión corta, que además cachea la ruta que funcionó.
+ */
+function _sondeoExhaustivo(ids) {
+  var bases = ['https://tiendas.axoft.com/api/Aperture',
+               'https://tiendas.axoft.com/api'];
+  var rutas = ['/order/{id}/invoice', '/order/{id}/invoicefile', '/order/{id}/file',
+               '/order/{id}/document', '/invoice/{id}', '/invoice/{id}/file',
+               '/invoicefile/{id}', '/comprobante/{id}', '/voucher/{id}',
+               '/document/{id}', '/file/{id}',
+               '/invoice?orderId={id}', '/invoice?number={id}', '/InvoiceFile?resource={id}'];
+
+  var lineas = [], total = 0, resumen = {};
+  for (var b = 0; b < bases.length; b++) {
+    for (var i = 0; i < ids.length; i++) {
+      for (var r = 0; r < rutas.length; r++) {
+        var path = rutas[r].replace('{id}', encodeURIComponent(ids[i]));
+        var url = bases[b] + path;
+        total++;
+        var res = _probarUrlPdf(url);
+        resumen[res.code] = (resumen[res.code] || 0) + 1;
+        if (res.blob) {
+          lineas.push('✅ ' + url + ' → PDF');
+          return { blob: res.blob, via: 'bajado de ' + url,
+                   plantilla: url.replace(encodeURIComponent(ids[i]), '{id}'),
+                   diag: lineas.join('\n'), total: total };
+        }
+        // Solo listamos lo que NO es 404: un 404 es "acá no está" y no aporta.
+        if (String(res.code) !== '404') {
+          lineas.push('· ' + url + ' → ' + res.code +
+                      (res.muestra ? ' · ' + res.muestra : ''));
+        }
+      }
+    }
+  }
+  var conteo = Object.keys(resumen).map(function (k) { return k + ': ' + resumen[k]; }).join(' · ');
+  lineas.unshift('Respuestas: ' + conteo + '  (los 404 no se listan uno por uno)');
+  return { blob: null, via: '', diag: lineas.join('\n'), total: total };
+}
+
+/** Un intento suelto contra una URL completa. */
+function _probarUrlPdf(url) {
+  try {
+    var r = UrlFetchApp.fetch(url, { headers: _tangoHeaders(), muteHttpExceptions: true });
+    var code = r.getResponseCode();
+    if (code !== 200) return { code: code, blob: null };
+
+    var tipo = '';
+    try {
+      var hs = r.getAllHeaders();
+      Object.keys(hs).forEach(function (k) {
+        if (String(k).toLowerCase() === 'content-type') tipo = String(hs[k]).toLowerCase();
+      });
+    } catch (e) { /* nada */ }
+    if (tipo.indexOf('pdf') !== -1) return { code: 200, blob: r.getBlob() };
+
+    var txt = '';
+    try { txt = r.getContentText(); } catch (e) { txt = ''; }
+    if (txt.indexOf('%PDF') === 0) return { code: 200, blob: r.getBlob() };
+
+    // Respondió algo: puede traer la URL o el base64 adentro
+    try {
+      var obj = JSON.parse(txt);
+      var u = _buscarUrlPdf(obj);
+      if (u) {
+        var r2 = UrlFetchApp.fetch(u, { headers: _tangoHeaders(), muteHttpExceptions: true });
+        if (r2.getResponseCode() === 200) return { code: 200, blob: r2.getBlob() };
+      }
+      var b = _buscarBase64(obj);
+      if (b) return { code: 200,
+                      blob: Utilities.newBlob(Utilities.base64Decode(b), 'application/pdf') };
+    } catch (e) { /* no era JSON */ }
+
+    return { code: 200, blob: null,
+             muestra: (tipo || 'sin tipo') + ' · ' + txt.slice(0, 80).replace(/\s+/g, ' ') };
+  } catch (e) {
+    return { code: 'error', blob: null, muestra: String(e.message).slice(0, 60) };
+  }
 }
 
 /**

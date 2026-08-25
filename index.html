@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-25.16";
+const APP_VERSION = "2026-08-25.20";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -1375,7 +1375,8 @@ async function viewPdfs() {
   catch (e) { if (!stillOn("pdfs")) return; return setMain(H("PDF de Facturas") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
   if (!stillOn("pdfs")) return;
 
-  const ev = (i.eventos || []).map((e) => `<tr>
+  window._EVENTOS = i.eventos || [];
+  const ev = (i.eventos || []).map((e, n) => `<tr class="cursor-pointer" onclick="verEvento(${n})">
     <td class="text-xs whitespace-nowrap">${esc(e.fecha_hora)}</td>
     <td class="text-xs">${esc(e.topic)}</td>
     <td class="font-mono text-xs">${esc(e.resource)}</td>
@@ -1383,6 +1384,7 @@ async function viewPdfs() {
       ? "error" : String(e.resultado).indexOf("sin") === 0 ? "warning" : "ok")}
       <span class="text-xs text-gray-600">${esc(e.resultado)}</span></td>
     <td class="text-xs text-gray-600 max-w-md truncate" title="${esc(e.detalle)}">${esc(e.detalle)}</td>
+    <td class="text-xs text-violet-700 underline whitespace-nowrap">ver detalle</td>
   </tr>`).join("");
 
   const a = i;
@@ -1409,6 +1411,22 @@ async function viewPdfs() {
       <p class="text-xs text-gray-500 mb-3">En Tango Tiendas: configuración de la API →
         tildar notificaciones → pegar esta URL. El <code>?wh=</code> del final es un secreto:
         sin él las notificaciones se rechazan, así nadie puede inyectar facturas falsas.</p>
+      <div class="border-t pt-3 mt-3 mb-3">
+        <div class="text-xs text-gray-500 uppercase mb-1">Buscar el PDF de una factura ya emitida</div>
+        <div class="text-xs text-gray-500 mb-2">Sirve para probar sin esperar al webhook: confirma
+          si Tango está publicando el comprobante y por qué ruta se baja.</div>
+        <div class="flex gap-2 flex-wrap items-center">
+          <input id="pdf-orden" placeholder="Nro de Orden (v92893535frvg-01)"
+            class="border rounded-lg px-3 py-2 text-sm w-72">
+          <input id="pdf-factura" placeholder="Nro de factura (opcional)"
+            class="border rounded-lg px-3 py-2 text-sm w-56">
+          <input id="pdf-pedido" placeholder="Nro de pedido de Tango (opcional)"
+            class="border rounded-lg px-3 py-2 text-sm w-64">
+          <button onclick="buscarPdf()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
+            🔍 Buscar en Tango</button>
+        </div>
+        <div id="pdf-buscar-res" class="mt-2"></div>
+      </div>
       <div class="flex gap-3 flex-wrap items-center">
         <button onclick="viewPdfs()" class="border px-4 py-2 rounded-lg text-sm">Actualizar</button>
         <button onclick="probarCarpeta()" class="border px-4 py-2 rounded-lg text-sm">🧪 Probar la carpeta de Drive</button>
@@ -1419,8 +1437,10 @@ async function viewPdfs() {
       </div>`, "mb-4")}
 
     ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Últimos avisos de Tango</div>
-      ${ev ? `<table class="data w-full"><thead><tr>
-        <th>Fecha</th><th>Tópico</th><th>Recurso</th><th>Resultado</th><th>Detalle</th>
+      ${ev ? `<div class="text-xs text-gray-500 mb-2">Tocá una fila para ver el contenido completo
+          del aviso: eso es lo que me permite ajustar cómo se busca el PDF.</div>
+        <table class="data w-full"><thead><tr>
+        <th>Fecha</th><th>Tópico</th><th>Recurso</th><th>Resultado</th><th>Detalle</th><th></th>
       </tr></thead><tbody>${ev}</tbody></table>`
         : `<div class="text-sm text-gray-500">Todavía no llegó ningún aviso. Cuando configures la
              URL en Tango y se facture un pedido, acá van a aparecer los eventos. El cuerpo
@@ -1436,6 +1456,38 @@ async function viewPdfs() {
       </div>
       <div id="pdf-tabla">${spinner()}</div>`)}`);
   cargarPdfs();
+}
+
+function verEvento(n) {
+  const e = (window._EVENTOS || [])[n];
+  if (!e) return;
+  showModal(`
+    <h3 class="font-bold text-lg mb-1">${esc(e.topic)}</h3>
+    <div class="text-xs text-gray-500 mb-3">${esc(e.fecha_hora)} · recurso <code>${esc(e.resource)}</code>
+      · ${esc(e.resultado)}</div>
+
+    <div class="text-xs text-gray-500 uppercase mb-1">Detalle</div>
+    <pre class="text-xs bg-gray-50 border rounded p-2 whitespace-pre-wrap break-all mb-3">${esc(e.detalle || "(vacío)")}</pre>
+
+    <div class="text-xs text-gray-500 uppercase mb-1">Cuerpo completo del aviso</div>
+    <pre id="ev-raw" class="text-xs bg-gray-50 border rounded p-2 whitespace-pre-wrap break-all max-h-72 overflow-y-auto">${esc(e.raw || "(vacío)")}</pre>
+
+    <div class="flex gap-2 justify-end mt-4">
+      <button onclick="copiarEvento(${n})" class="px-4 py-2 border rounded-lg text-sm">Copiar todo</button>
+      <button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button>
+    </div>`);
+}
+
+function copiarEvento(n) {
+  const e = (window._EVENTOS || [])[n];
+  if (!e) return;
+  const txt = `TOPICO: ${e.topic}\nRECURSO: ${e.resource}\nRESULTADO: ${e.resultado}\n` +
+              `DETALLE: ${e.detalle}\nCRUDO: ${e.raw}`;
+  const ta = document.createElement("textarea");
+  ta.value = txt; document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); toast("Copiado", "ok"); }
+  catch (err) { toast("Copialo a mano del recuadro", "warning"); }
+  ta.remove();
 }
 
 function copiarWebhook() {
@@ -1465,6 +1517,35 @@ async function cargarPdfs() {
       <td class="text-xs text-gray-500 max-w-xs truncate" title="${esc(r.detalle)}">${esc(r.detalle)}</td>
     </tr>`).join("") || '<tr><td colspan="6" class="text-gray-400 p-4">Sin registros</td></tr>'}
     </tbody></table>`;
+}
+
+async function buscarPdf() {
+  const orden = ($("pdf-orden") || {}).value || "";
+  const factura = ($("pdf-factura") || {}).value || "";
+  const box = $("pdf-buscar-res");
+  if (!orden.trim()) return toast("Poné el Nro de Orden", "warning");
+  box.innerHTML = spinner("Buscando el PDF en Tango...");
+  let r;
+  try { r = await api("pdfs.buscar", { orden, factura, pedido: ($("pdf-pedido") || {}).value || "" }); }
+  catch (e) { box.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
+
+  box.innerHTML = r.ok
+    ? `<div class="border border-green-300 bg-green-50 rounded-lg p-3 text-sm">
+         <div class="font-bold text-green-800 mb-1">✅ PDF encontrado</div>
+         <div class="text-xs text-gray-600 mb-2">${esc(r.via)}</div>
+         <a href="${esc(r.url)}" target="_blank" class="text-violet-700 underline break-all">${esc(r.url)}</a>
+         <div class="text-xs text-gray-500 mt-2">Ya quedó registrado: volvé a generar el archivo
+           de exportación y la URL se va a completar sola.</div>
+       </div>`
+    : `<div class="border border-amber-300 bg-amber-50 rounded-lg p-3 text-sm">
+         <div class="font-bold text-amber-900 mb-1">No se encontró el PDF</div>
+         <div class="text-xs text-gray-700 mb-2">${esc(r.sugerencia)}</div>
+         <div class="text-xs text-gray-500 uppercase mb-1">Qué contestó cada ruta
+           ${r.probadas ? `(${r.probadas} combinaciones)` : ""}</div>
+         <pre class="text-xs bg-white border rounded p-2 whitespace-pre-wrap break-all">${esc(r.diagnostico)}</pre>
+         <div class="text-xs text-gray-500 mt-2">Pasame este detalle y ajusto la ruta.</div>
+       </div>`;
+  cargarPdfs();
 }
 
 async function probarCarpeta() {
