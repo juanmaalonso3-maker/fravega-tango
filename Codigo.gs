@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-26.10';
+var APP_VERSION = '2026-08-26.13';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -222,6 +222,7 @@ var DEFAULT_CONFIG = [
   ['vtex_invoice_pausa_ms', '400', 'Pausa entre llamadas a VTEX (ms)'],
   ['vtex_invoice_valor', 'orden', 'Importe informado: orden (el total de VTEX) o tango (el de la factura)'],
   ['vtex_invoice_al_vuelo', '1', 'Informar apenas llega el aviso de Tango (si no, solo en las corridas)'],
+  ['fvg_invoice_via', 'seller-center', 'Por dónde informar a Frávega: seller-center · vtex · ambos'],
   ['fvg_invoice_formato', 'tango', 'Formato del nro de factura para Frávega: tango (B0000700002727) · guion (00007-00002727) · guion_letra'],
   ['fvg_invoice_exigir_url', '1', 'Frávega pide la URL del PDF: si falta, esperar en vez de mandar incompleta'],
   ['fvg_invoice_horas_alerta', '6', 'Horas a esperar la confirmación de Frávega antes de avisar'],
@@ -522,6 +523,7 @@ function doPost(e) {
       case 'vtexinv.verificar':   out = apiVerificarFravega(user); break;
       case 'vtexinv.conciliar':   out = apiConciliarFravega(user, p); break;
       case 'orden.diagnostico':   out = apiDiagnosticoOrden(p); break;
+      case 'orden.forense':       out = apiForenseFactura(p); break;
       case 'orders.autoRun':      out = apiOrdersAutoRun(user); break;
       case 'oncity.invoices':     out = apiOncityInvoices(user, p); break;
       case 'skus.list':          out = apiSkusList(p.q || ''); break;
@@ -4650,12 +4652,49 @@ function _fvgNotificarFactura(orderId, factura, cfg) {
  * distintos y confundirlos fue el error original.
  */
 function _notificarFacturaCanal(canal, orderId, factura, cfg) {
-  if (String(canal).toLowerCase() === 'fravega') {
-    return _fvgNotificarFactura(orderId, factura, cfg);
+  cfg = cfg || _configMap();
+
+  if (String(canal).toLowerCase() !== 'fravega') {
+    var ro = _vtexNotificarFactura(canal, orderId, factura, cfg);
+    ro.via = 'vtex';
+    return ro;
   }
-  var r = _vtexNotificarFactura(canal, orderId, factura, cfg);
-  r.via = 'vtex';
-  return r;
+
+  // ── Frávega: cuál es la vía buena, todavía no está zanjado ─────────────
+  // Frávega documenta DOS caminos y no dice cuál aplica a cada seller:
+  //   · Su API de Seller Center (POST /api/v1/invoice).
+  //   · La de VTEX (POST /api/oms/pvt/orders/{id}/invoice), que su propia
+  //     guía menciona para pedidos que viven en VTEX.
+  // Como nuestros pedidos SE LEEN de VTEX, las dos son plausibles. Por eso es
+  // configurable en vez de estar decidido a dedo por mí.
+  var via = String(_cfgVal(cfg, 'fvg_invoice_via') || 'seller-center');
+
+  if (via === 'vtex') {
+    var rv = _vtexNotificarFactura('fravega', orderId, factura, cfg);
+    rv.via = 'vtex';
+    return rv;
+  }
+
+  if (via === 'ambos') {
+    // Primero Seller Center, que es el que deja registro del comprobante, y
+    // después VTEX, que es el que mueve el estado del pedido. Se informa como
+    // un solo intento con el detalle de los dos.
+    var a = _fvgNotificarFactura(orderId, factura, cfg);
+    var b = _vtexNotificarFactura('fravega', orderId, factura, cfg);
+    return {
+      canal: 'fravega', via: 'ambos', orden: orderId, orden_vtex: b.orden_vtex || a.orden_vtex,
+      nro_factura: factura.nro_factura,
+      ok: a.ok || b.ok,
+      estado: (a.ok ? 'SC:' + a.estado : 'SC:' + (a.estado || 'falló')) + ' · ' +
+              (b.ok ? 'VTEX:' + b.estado : 'VTEX:' + (b.estado || 'falló')),
+      estado_vtex: b.estado_vtex || '',
+      http: b.http || a.http,
+      detalle: 'SELLER CENTER → ' + a.detalle + '\n\nVTEX → ' + b.detalle,
+      enviado: { seller_center: a.enviado || null, vtex: b.enviado || null }
+    };
+  }
+
+  return _fvgNotificarFactura(orderId, factura, cfg);
 }
 
 /**
@@ -5140,6 +5179,157 @@ function apiDiagnosticoOrden(p) {
   return d;
 }
 
+/**
+ * ¿QUIÉN PUSO LA FACTURA EN VTEX?
+ *
+ * Cuando un pedido de Frávega aparece como "invoiced" hay dos autores posibles:
+ * nuestro propio llamado a VTEX, o Frávega procesando el aviso de Seller
+ * Center. Saber cuál fue es lo que decide qué camino sirve.
+ *
+ * El método: VTEX guarda la factura aplicada en packageAttachment.packages,
+ * con la fecha, el importe y los items tal como se los cargaron. Nosotros
+ * guardamos en NotifVtex el cuerpo EXACTO que enviamos. Si coinciden campo por
+ * campo, la factura la puso nuestro llamado. Si difieren —otra fecha, otro
+ * importe, otro formato— la generó Frávega, y entonces Seller Center funcionó.
+ *
+ * La huella más clara es issuanceDate: nosotros mandamos a VTEX un ISO con la
+ * hora exacta del envío; Frávega, procesando la fecha "25-08-2026" de Seller
+ * Center, difícilmente reproduzca ese mismo segundo.
+ */
+function apiForenseFactura(p) {
+  p = p || {};
+  var orden = String(p.orden || '').trim();
+  if (!orden) throw new Error('Poné el número de orden');
+  var canal = String(p.canal || 'fravega').toLowerCase();
+  var cfg = _configMap();
+
+  var out = { orden: orden, canal: canal, paquetes: [], enviamos: {}, veredicto: '', porque: [] };
+
+  /* ── Lo que dice VTEX ────────────────────────────────────────────────── */
+  var det;
+  try {
+    det = vtexOrderDetail(canal, _idVtex(canal, orden, cfg));
+  } catch (e) {
+    out.veredicto = 'No se pudo leer el pedido en VTEX: ' + e.message;
+    return out;
+  }
+  out.estado_vtex = String(det.status || '');
+
+  var paquetes = [];
+  try {
+    paquetes = (det.packageAttachment && det.packageAttachment.packages) || [];
+  } catch (e) { paquetes = []; }
+
+  paquetes.forEach(function (pk) {
+    out.paquetes.push({
+      invoiceNumber: String(pk.invoiceNumber || ''),
+      invoiceValue: pk.invoiceValue,
+      issuanceDate: String(pk.issuanceDate || ''),
+      invoiceUrl: String(pk.invoiceUrl || ''),
+      invoiceKey: String(pk.invoiceKey || ''),
+      courier: String(pk.courier || ''),
+      trackingNumber: String(pk.trackingNumber || ''),
+      items: (pk.items || []).length,
+      type: String(pk.type || ''),
+      crudo: JSON.stringify(pk).slice(0, 1500)
+    });
+  });
+
+  /* ── Lo que mandamos nosotros ────────────────────────────────────────── */
+  var envVtex = null, envSC = null;
+  try {
+    _sheetAuto(SH.NOTIF, COLS_NOTIF);
+    var filas = _readRows(SH.NOTIF, 1500);
+    var buscado = orden.toUpperCase();
+    for (var i = filas.length - 1; i >= 0; i--) {
+      var r = filas[i];
+      var id = String(r.order_id || '').trim().toUpperCase();
+      var idv = String(r.order_id_vtex || '').trim().toUpperCase();
+      if (id !== buscado && idv !== buscado) continue;
+      var via = String(r.via || '');
+      var cuerpo = null;
+      try { cuerpo = JSON.parse(r.enviado || 'null'); } catch (e) { cuerpo = null; }
+      if (!envVtex && (via === 'vtex' || via === 'ambos')) {
+        envVtex = { fecha: r.fecha_hora, estado: r.estado,
+                    cuerpo: via === 'ambos' && cuerpo ? cuerpo.vtex : cuerpo };
+      }
+      if (!envSC && (via === 'seller-center' || via === 'ambos')) {
+        envSC = { fecha: r.fecha_hora, estado: r.estado,
+                  cuerpo: via === 'ambos' && cuerpo ? cuerpo.seller_center : cuerpo };
+      }
+      if (envVtex && envSC) break;
+    }
+  } catch (e) { /* seguimos con lo que haya */ }
+
+  out.enviamos = {
+    vtex: envVtex ? { fecha: envVtex.fecha, estado: envVtex.estado,
+                      cuerpo: JSON.stringify(envVtex.cuerpo).slice(0, 1200) } : null,
+    seller_center: envSC ? { fecha: envSC.fecha, estado: envSC.estado,
+                             cuerpo: JSON.stringify(envSC.cuerpo).slice(0, 1200) } : null
+  };
+
+  /* ── El veredicto ────────────────────────────────────────────────────── */
+  if (!paquetes.length) {
+    out.veredicto = 'sin_factura';
+    out.porque.push('VTEX no tiene ninguna factura aplicada a este pedido' +
+                    (out.estado_vtex ? ' (está en "' + out.estado_vtex + '")' : '') + '.');
+    if (envSC) {
+      out.porque.push('Le mandamos el aviso por Seller Center el ' + envSC.fecha +
+                      ' y Frávega todavía no lo aplicó.');
+    }
+    return out;
+  }
+
+  var nuestro = envVtex && envVtex.cuerpo ? envVtex.cuerpo : null;
+  var pk = out.paquetes[0];
+
+  if (!nuestro) {
+    out.veredicto = 'fravega';
+    out.porque.push('VTEX tiene la factura ' + pk.invoiceNumber + ' aplicada, y nosotros ' +
+                    'NUNCA le hablamos a VTEX por este pedido.');
+    out.porque.push('La única vía que usamos fue Seller Center' +
+                    (envSC ? ' (el ' + envSC.fecha + ')' : '') +
+                    ', así que la factura la aplicó Frávega. Seller Center FUNCIONA.');
+    return out;
+  }
+
+  // Comparamos campo por campo contra lo que enviamos por VTEX.
+  var iguales = [], distintos = [];
+  function comparar(nombre, nuestroVal, deVtex) {
+    var a = String(nuestroVal === null || nuestroVal === undefined ? '' : nuestroVal);
+    var b = String(deVtex === null || deVtex === undefined ? '' : deVtex);
+    if (a === b) iguales.push(nombre + ' = ' + a);
+    else distintos.push(nombre + ': nosotros mandamos "' + a + '", VTEX tiene "' + b + '"');
+  }
+  comparar('invoiceNumber', nuestro.invoiceNumber, pk.invoiceNumber);
+  comparar('issuanceDate', nuestro.issuanceDate, pk.issuanceDate);
+  comparar('invoiceValue', nuestro.invoiceValue, pk.invoiceValue);
+  comparar('invoiceUrl', nuestro.invoiceUrl, pk.invoiceUrl);
+
+  out.iguales = iguales;
+  out.distintos = distintos;
+
+  var fechaIgual = String(nuestro.issuanceDate || '') === String(pk.issuanceDate || '');
+  if (fechaIgual && !distintos.length) {
+    out.veredicto = 'nuestro_vtex';
+    out.porque.push('La factura que tiene VTEX coincide EXACTAMENTE con lo que le mandamos ' +
+                    'nosotros por VTEX el ' + envVtex.fecha + ', incluida la marca de tiempo ' +
+                    'al segundo (' + pk.issuanceDate + ').');
+    out.porque.push('Esa coincidencia no puede ser casual: la puso nuestro llamado a VTEX, ' +
+                    'no Frávega.');
+  } else if (!fechaIgual) {
+    out.veredicto = 'fravega';
+    out.porque.push('La fecha que tiene VTEX (' + pk.issuanceDate + ') NO es la que le ' +
+                    'mandamos nosotros (' + nuestro.issuanceDate + ').');
+    out.porque.push('Si la hubiera puesto nuestro llamado, el valor sería idéntico. Que ' +
+                    'difiera indica que la aplicó Frávega procesando el aviso de Seller Center.');
+  } else {
+    out.veredicto = 'dudoso';
+    out.porque.push('La fecha coincide pero hay otros campos distintos. Mirá el detalle.');
+  }
+  return out;
+}
+
 /* ── Orquestación: cola, reintentos y registro ─────────────────────────── */
 
 /**
@@ -5326,11 +5516,30 @@ function apiVtexInvoicesRun(user, p) {
     }
   }
 
+  // Para una prueba puntual guardamos el estado del pedido en VTEX ANTES y
+  // DESPUÉS. Es lo que convierte el envío en un experimento con resultado:
+  // si el pedido pasa de "handling" a "invoiced" en el momento del llamado,
+  // fue ese llamado y no otra cosa.
+  var antes = null;
+  if (orden && (p.medir === true || p.medir === '1')) {
+    antes = _estadoEnVtex(String(p.canal || 'fravega').toLowerCase(), orden);
+  }
+
   var r = notificarFacturasAVtex(user.email, {
     forzar: p.forzar === true || p.forzar === '1',
     canal: String(p.canal || '').toLowerCase() || null,
     orden: orden || null
   });
+
+  if (antes) {
+    Utilities.sleep(3000);   // le damos un momento a VTEX
+    var despues = _estadoEnVtex(String(p.canal || 'fravega').toLowerCase(), orden);
+    r.medicion = {
+      antes: antes.status, despues: despues.status,
+      facturas_antes: antes.facturas, facturas_despues: despues.facturas,
+      cambio: antes.status !== despues.status || antes.facturas !== despues.facturas
+    };
+  }
 
   // En una prueba de una sola orden devolvemos el último intento completo,
   // con el cuerpo enviado y la respuesta, que es lo que uno quiere ver.
@@ -5346,6 +5555,18 @@ function apiVtexInvoicesRun(user, p) {
 
   if (r.fallidas) _avisarFallosVtex(r);
   return r;
+}
+
+/** Estado del pedido en VTEX y cuántas facturas tiene aplicadas. */
+function _estadoEnVtex(canal, orden) {
+  try {
+    var det = vtexOrderDetail(canal, _idVtex(canal, orden, _configMap()));
+    var pk = (det.packageAttachment && det.packageAttachment.packages) || [];
+    return { status: String(det.status || ''), facturas: pk.length,
+             numeros: pk.map(function (x) { return String(x.invoiceNumber || ''); }).join(',') };
+  } catch (e) {
+    return { status: '(no se pudo leer: ' + e.message + ')', facturas: -1, numeros: '' };
+  }
 }
 
 /** El último envío registrado para una orden, con cuántos minutos hace. */
@@ -5441,7 +5662,8 @@ function apiVtexInvoicesPendientes() {
   var out = { total: 0, por_canal: {}, filas: [],
               activo: String(_cfgVal(cfg, 'vtex_invoice_enabled')) === '1',
               dry_run: String(_cfgVal(cfg, 'vtex_invoice_dry_run')) === '1',
-              canales: _cfgVal(cfg, 'vtex_invoice_canales') };
+              canales: _cfgVal(cfg, 'vtex_invoice_canales'),
+              fvg_via: _cfgVal(cfg, 'fvg_invoice_via') || 'seller-center' };
   if (last < 2) return out;
 
   var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]

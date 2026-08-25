@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-26.10";
+const APP_VERSION = "2026-08-26.13";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -1603,15 +1603,19 @@ async function viewAvtex() {
         trabajo manual es facturar.
       </div>
       <div class="text-xs bg-gray-50 border rounded-lg p-3 mb-3 text-gray-600">
-        <b>Cada marketplace tiene su camino</b> — los dos usan VTEX para los pedidos,
-        pero la facturación va por lugares distintos:
-        <div class="mt-1">· <b>Frávega</b> → su API de Seller Center,
-          <code>POST /api/v1/invoice</code>. Contesta <b>202</b>: quiere decir "lo recibí",
-          no "lo hice". Frávega lo procesa después, así que conviene verificarlo más tarde.
-          Pide la URL del PDF de forma obligatoria.</div>
-        <div>· <b>OnCity</b> → VTEX,
+        <b>Cada marketplace tiene su camino:</b>
+        <div class="mt-1">· <b>OnCity</b> → VTEX,
           <code>POST /api/oms/pvt/orders/{orden}/invoice</code>. Contesta 200 y queda hecho
-          en el momento.</div>
+          en el momento. Sin dudas acá.</div>
+        <div class="mt-1">· <b>Frávega</b> → configurable en
+          <code>fvg_invoice_via</code>, hoy en <b>${esc(p.fvg_via || "seller-center")}</b>.
+          Frávega documenta <b>dos</b> caminos y no aclara cuál aplica a cada seller:
+          su API de Seller Center (<code>POST /api/v1/invoice</code>, asincrónica, contesta
+          "recibido" y procesa después) y la de VTEX, que su propia guía menciona para
+          pedidos que viven en VTEX. Como nuestros pedidos se leen de VTEX, las dos son
+          plausibles.</div>
+        <div class="mt-1 text-gray-500">Si Seller Center acepta pero el pedido no pasa a
+          facturado, probá <code>ambos</code>: manda por las dos y registra ambas respuestas.</div>
       </div>
       ${estadoCartel}
       <div class="flex gap-3 flex-wrap items-center">
@@ -1675,6 +1679,28 @@ async function viewAvtex() {
           Conciliar</button>
       </div>
       <div id="av-conc" class="mt-3"></div>`, "mb-4")}
+
+    ${card(`
+      <div class="flex items-center gap-2 mb-1">
+        <span class="text-lg">🔬</span>
+        <div class="font-bold">¿Quién puso la factura en VTEX?</div>
+      </div>
+      <div class="text-sm text-gray-600 mb-3">
+        Compara la factura que quedó aplicada en VTEX contra el cuerpo exacto que mandamos
+        nosotros. Si coincide campo por campo —incluida la hora al segundo— la puso nuestro
+        llamado a VTEX. Si difiere, la aplicó Frávega procesando el aviso de Seller Center.
+        <b>Es la forma de saber cuál de los dos caminos sirve.</b>
+      </div>
+      <div class="flex gap-2 flex-wrap items-end">
+        <div class="flex-1 min-w-[18rem]">
+          <input id="fx-orden" placeholder="v92904656frvg-01"
+            class="border rounded-lg px-3 py-2 text-sm w-full font-mono"
+            onkeydown="if(event.key==='Enter')forenseFactura()">
+        </div>
+        <button onclick="forenseFactura()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
+          Averiguar</button>
+      </div>
+      <div id="fx-res" class="mt-3"></div>`, "mb-4")}
 
     ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Facturas esperando</div>
       ${(p.filas || []).length ? `<table class="data w-full"><thead><tr>
@@ -2145,6 +2171,54 @@ async function verificarFravega() {
     <div class="mt-4 text-right"><button onclick="closeModal(); viewAvtex();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
 }
 
+/** Averigua quién aplicó la factura que VTEX tiene cargada. */
+async function forenseFactura() {
+  const orden = (($("fx-orden") || {}).value || "").trim();
+  const box = $("fx-res");
+  if (!orden) return toast("Poné el número de orden", "warning");
+  box.innerHTML = spinner("Comparando lo que tiene VTEX con lo que mandamos...");
+
+  let r;
+  try { r = await api("orden.forense", { orden }); }
+  catch (e) { box.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
+  if (!$("fx-res")) return;
+
+  const V = {
+    nuestro_vtex: { t: "La puso NUESTRO llamado a VTEX", c: "border-amber-300 bg-amber-50", x: "text-amber-900",
+      n: "O sea: para este pedido, el camino que tuvo efecto fue el de VTEX. No prueba que Seller Center falle, pero acá no fue el que la aplicó." },
+    fravega: { t: "La puso FRÁVEGA", c: "border-green-300 bg-green-50", x: "text-green-800",
+      n: "O sea: Seller Center funciona. Frávega procesó el aviso y aplicó la factura por su cuenta." },
+    sin_factura: { t: "VTEX todavía no tiene ninguna factura aplicada", c: "border-gray-300 bg-gray-50", x: "text-gray-800",
+      n: "Nadie la aplicó todavía. Si ya pasó más de una hora del aviso a Seller Center, es señal de que no la está procesando." },
+    dudoso: { t: "No es concluyente", c: "border-blue-300 bg-blue-50", x: "text-blue-900", n: "" }
+  }[r.veredicto] || { t: esc(r.veredicto || "Sin resultado"), c: "border-gray-300 bg-gray-50", x: "", n: "" };
+
+  box.innerHTML = `
+    <div class="border ${V.c} rounded-lg p-3 text-sm">
+      <div class="font-bold ${V.x} mb-1">${V.t}</div>
+      ${V.n ? `<div class="text-xs text-gray-700 mb-2">${V.n}</div>` : ""}
+      <div class="text-xs text-gray-600 mb-2">Estado del pedido en VTEX:
+        <code>${esc(r.estado_vtex || "?")}</code></div>
+      ${(r.porque || []).length ? `<div class="text-xs text-gray-700 mb-2">
+        ${r.porque.map((x) => `<div class="mb-1">· ${esc(x)}</div>`).join("")}</div>` : ""}
+      ${(r.distintos || []).length ? `<div class="text-xs mb-2">
+        <div class="text-gray-500 uppercase mb-1">Campos que NO coinciden</div>
+        <pre class="bg-white border rounded p-2 whitespace-pre-wrap break-all">${r.distintos.map(esc).join("\n")}</pre></div>` : ""}
+      ${(r.iguales || []).length ? `<details class="text-xs mb-2">
+        <summary class="cursor-pointer text-gray-500">Campos que coinciden (${r.iguales.length})</summary>
+        <pre class="bg-white border rounded p-2 mt-1 whitespace-pre-wrap break-all">${r.iguales.map(esc).join("\n")}</pre></details>` : ""}
+      ${(r.paquetes || []).length ? `<details class="text-xs mb-1">
+        <summary class="cursor-pointer text-gray-500">La factura tal como la tiene VTEX</summary>
+        <pre class="bg-white border rounded p-2 mt-1 whitespace-pre-wrap break-all max-h-56 overflow-y-auto">${esc(r.paquetes[0].crudo)}</pre></details>` : ""}
+      ${r.enviamos && r.enviamos.vtex ? `<details class="text-xs mb-1">
+        <summary class="cursor-pointer text-gray-500">Lo que mandamos por VTEX (${esc(r.enviamos.vtex.fecha)})</summary>
+        <pre class="bg-white border rounded p-2 mt-1 whitespace-pre-wrap break-all">${esc(r.enviamos.vtex.cuerpo)}</pre></details>` : ""}
+      ${r.enviamos && r.enviamos.seller_center ? `<details class="text-xs">
+        <summary class="cursor-pointer text-gray-500">Lo que mandamos por Seller Center (${esc(r.enviamos.seller_center.fecha)})</summary>
+        <pre class="bg-white border rounded p-2 mt-1 whitespace-pre-wrap break-all">${esc(r.enviamos.seller_center.cuerpo)}</pre></details>` : ""}
+    </div>`;
+}
+
 /** Cruza el CSV de Frávega contra nuestro registro de envíos. */
 async function conciliarFravega() {
   const f = $("av-csv");
@@ -2213,7 +2287,7 @@ async function probarAvtex(igual) {
   let r;
   try {
     r = await api("vtexinv.run",
-      { orden, forzar: "1", reenviar: "1", igual: igual ? "1" : "" });
+      { orden, forzar: "1", reenviar: "1", medir: "1", igual: igual ? "1" : "" });
   }
   catch (e) { box.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
   if (!$("av-prueba")) return;
@@ -2261,9 +2335,28 @@ async function probarAvtex(igual) {
     : espera ? "⏳ Todavía no se puede informar"
     : "❌ No se pudo informar";
 
+  // La medición antes/después es la evidencia: si el pedido cambió justo con
+  // este llamado, fue este llamado.
+  const m = r.medicion;
+  const medicion = !m ? "" : `
+    <div class="border ${m.cambio ? "border-green-300 bg-green-50" : "border-gray-300 bg-gray-50"}
+                rounded-lg p-2 mb-2 text-xs">
+      <div class="font-bold ${m.cambio ? "text-green-800" : "text-gray-700"} mb-1">
+        ${m.cambio ? "🎯 El pedido cambió con este llamado" : "El pedido no cambió"}</div>
+      <div class="font-mono">
+        antes:   estado <b>${esc(m.antes)}</b> · ${m.facturas_antes} factura(s)<br>
+        después: estado <b>${esc(m.despues)}</b> · ${m.facturas_despues} factura(s)
+      </div>
+      ${m.cambio ? `<div class="text-gray-700 mt-1">Pasó justo al hacer el envío: la
+        atribución es de este camino, no de otro.</div>`
+      : `<div class="text-gray-600 mt-1">Si más tarde aparece facturado, no habrá sido
+        este llamado el que lo hizo en el momento.</div>`}
+    </div>`;
+
   box.innerHTML = `
     <div class="border ${caja} rounded-lg p-3 text-sm">
       <div class="font-bold ${tinta} mb-1">${titulo}</div>
+      ${medicion}
       <div class="text-xs text-gray-700 mb-2">
         ${it.via ? `Por <b>${esc(it.via === "seller-center" ? "Seller Center de Frávega" : "VTEX")}</b> · ` : ""}
         ${it.estado ? `resultado <b>${esc(it.estado)}</b>` : ""}
@@ -2850,6 +2943,7 @@ const CONFIG_CAMPOS = [
     ["vtex_invoice_valor", "Importe informado: orden · tango", "text"],
     ["vtex_invoice_max", "Máximo de facturas por corrida", "text"],
     ["vtex_invoice_pausa_ms", "Pausa entre llamadas (ms)", "text"],
+    ["fvg_invoice_via", "Frávega, por dónde informar: seller-center · vtex · ambos", "text"],
     ["fvg_invoice_formato", "Formato del nro de factura para Frávega: tango · guion · guion_letra", "text"],
     ["fvg_invoice_exigir_url", "Frávega: esperar a tener el PDF antes de informar (la pide obligatoria)", "bool"],
     ["fvg_invoice_horas_alerta", "Frávega: horas a esperar la confirmación antes de avisar", "text"],
