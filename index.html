@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-26.15";
+const APP_VERSION = "2026-08-26.16";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -82,7 +82,6 @@ const VIEWS = [
   { id: "stock", label: "🔄 Sincronización de Stock" },
   { id: "ordenes", label: "📦 Ingreso de Órdenes" },
   { id: "facturas", label: "🧾 Exportación de Facturas" },
-  { id: "pdfs", label: "📄 PDF de Facturas" },
   { id: "avtex", label: "📤 Aviso al Marketplace" },
   { id: "buscar", label: "🔎 Buscador de Pedidos" },
   { id: "skus", label: "🔗 Relación de SKUs" },
@@ -325,7 +324,7 @@ function route() {
   document.querySelectorAll(".nav-item").forEach((el) =>
     el.classList.toggle("active", el.dataset.view === view));
   const fn = { dashboard: viewDashboard, stock: viewStock, ordenes: viewOrdenes,
-               facturas: viewFacturas, pdfs: viewPdfs, avtex: viewAvtex,
+               facturas: viewFacturas, avtex: viewAvtex,
                buscar: viewBuscar, skus: viewSkus,
                pendientes: viewPendientes, logs: viewLogs, config: viewConfig
              }[view] || viewDashboard;
@@ -1169,570 +1168,9 @@ function bloqueFacturasOncity() {
     <div id="fac-resultado" class="mt-4"></div>`, "mb-4");
 }
 
-/**
- * Lee la plantilla de OnCity SIN convertir tipos: la fecha viene como texto
- * ("21/08/2026 10:17:45") y el valor como número. Si dejáramos que la librería
- * los interprete, al reescribir el archivo cambiarían de formato y OnCity lo
- * rechazaría. Por eso raw:true y cellDates:false.
- */
-function leerPlantillaOncity(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error("No se pudo leer la plantilla"));
-    reader.onload = (e) => {
-      try {
-        // Guardamos el LIBRO COMPLETO, no solo la primera hoja. La plantilla de
-        // OnCity puede traer hojas auxiliares (ocultas o no) y hay que
-        // devolverlas intactas: si armáramos un libro nuevo, se perderían.
-        const wb = XLSX.read(e.target.result, {
-          type: "array", cellDates: false, cellStyles: true, bookVBA: true,
-        });
-        const ws = wb.Sheets[wb.SheetNames[0]];
-        resolve({
-          wb,
-          hoja: wb.SheetNames[0],
-          hojas: wb.SheetNames.slice(),
-          filas: XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: "" }),
-        });
-      } catch (err) { reject(err); }
-    };
-    reader.readAsArrayBuffer(file);
-  });
-}
 
-async function generarFacturasOncity() {
-  const fp = $("onc-plantilla"), fl = $("onc-libro");
-  if (!fp.files.length || !fl.files.length) return toast("Subí los dos archivos", "warning");
-  $("fac-resultado").innerHTML = spinner("Cruzando el reporte contra los pedidos de OnCity...");
-  try {
-    const [plantilla, facturasRows] = await Promise.all(
-      [leerPlantillaOncity(fp.files[0]), parseFile(fl.files[0])]);
 
-    const cab = (plantilla.filas[0] || []).map((h) => String(h).toLowerCase());
-    if (!cab.length || cab[0].indexOf("orden") === -1) {
-      throw new Error('La primera columna de la plantilla no parece ser "Nro. de orden". ' +
-                      "¿Subiste el archivo exportado de OnCity?");
-    }
 
-    const r = await api("oncity.invoices", { plantilla: plantilla.filas, facturas: facturasRows });
-
-    // Reescribimos SOBRE la plantilla que subiste: se tocan únicamente las
-    // celdas que cambiaron. Así se conservan las demás hojas, cuáles estaban
-    // ocultas, los desplegables y el formato de todo lo que no completamos.
-    const wb = plantilla.wb;
-    const ws = wb.Sheets[plantilla.hoja];
-
-    // El backend descarta las filas sin número de orden, así que sus índices NO
-    // coinciden con los de la plantilla. Emparejamos por número de orden, que es
-    // lo único estable, y solo ahí escribimos.
-    const filaDeOrden = new Map();
-    plantilla.filas.forEach((fila, i) => {
-      const orden = String((fila || [])[0] ?? "").trim();
-      if (i > 0 && orden && !filaDeOrden.has(orden)) filaDeOrden.set(orden, i);
-    });
-
-    let tocadas = 0, sinUbicar = [];
-    r.filas.forEach((fila, i) => {
-      if (i === 0) return;                                  // encabezados: no se tocan
-      const orden = String((fila || [])[0] ?? "").trim();
-      if (!orden) return;
-      const destino = filaDeOrden.get(orden);
-      if (destino === undefined) { sinUbicar.push(orden); return; }
-
-      (fila || []).forEach((valor, j) => {
-        const antes = ((plantilla.filas[destino] || [])[j] ?? "");
-        if (String(antes) === String(valor ?? "")) return;   // no cambió: no se toca
-        ws[XLSX.utils.encode_cell({ r: destino, c: j })] = { t: "s", v: String(valor ?? "") };
-        tocadas++;
-      });
-    });
-
-    if (sinUbicar.length) {
-      toast(`${sinUbicar.length} orden(es) no se pudieron ubicar en la plantilla`, "warning");
-    }
-    XLSX.writeFile(wb, r.archivo);
-    console.log(`[OnCity] celdas modificadas: ${tocadas} · hojas conservadas: ` +
-                `${(plantilla.hojas || []).join(", ")}` +
-                (sinUbicar.length ? ` · sin ubicar: ${sinUbicar.join(", ")}` : ""));
-
-    const c = r.conteo || {};
-    $("fac-resultado").innerHTML = `
-      <div class="border rounded-lg p-4 bg-green-50">
-        <div class="font-bold mb-2">✅ Plantilla completada y descargada — ${r.completadas} factura(s) cargada(s)</div>
-        <div class="text-sm mb-2">${esc(r.archivo)}</div>
-        <div class="text-xs text-gray-600 mb-2">
-          Se escribió sobre tu propia plantilla: ${tocadas} celda(s) modificada(s).
-          Hojas conservadas tal cual: <b>${esc((plantilla.hojas || []).join(" · "))}</b>.
-          ${sinUbicar.length ? `<span class="text-amber-700">No se pudieron ubicar en la
-            plantilla: ${esc(sinUbicar.join(", "))}.</span>` : ""}
-        </div>
-        <div class="text-sm text-gray-600 mb-2">
-          Cruce: <b class="text-green-700">exacto (Tango) ${c.tango || 0}</b> ·
-          por documento+importe <b>${c.doc_importe || 0}</b> ·
-          solo documento <b>${c.doc || 0}</b> ·
-          nombre+importe <b>${c.nombre_importe || 0}</b> ·
-          solo nombre <b>${c.nombre || 0}</b>
-          ${(r.reexportadas || []).length ? `<div class="text-xs bg-blue-50 border border-blue-200 text-blue-900 rounded p-2 my-2">
-          ℹ️ ${(r.reexportadas || []).length} orden(es) ya figuraban como exportadas, pero su
-          factura está en este reporte y Tango confirma que les corresponde, así que entraron
-          igual: ${esc((r.reexportadas || []).join(", "))}</div>` : ""}
-        <div class="text-xs text-gray-500">Columnas usadas del reporte de Tango —
-            documento: ${esc(r.columna_documento)} · importe: ${esc(r.columna_importe)}</div>
-          ${r.ya_tenian ? `<div class="text-xs text-gray-500">${r.ya_tenian} fila(s) ya traían número de factura y se dejaron como estaban.</div>` : ""}
-        </div>
-        <div class="text-sm mb-2 ${r.sin_url && r.sin_url.length ? "text-red-800 bg-red-50 border border-red-200 rounded p-2" : "text-gray-600"}">
-          📄 URL de factura: <b>${r.con_url || 0}</b> completadas
-          ${r.sin_url && r.sin_url.length ? `· <b>${r.sin_url.length} SIN PDF</b>
-            <div class="text-xs mt-1">En OnCity esta columna es <b>obligatoria</b>: esas filas
-              van a ser rechazadas en la importación.</div>
-            <div class="text-xs mt-1">${r.sin_url.slice(0, 20).map((s) => `<div>· ${esc(s.orden)} — factura ${esc(s.factura)}</div>`).join("")}
-            ${r.sin_url.length > 20 ? `<div>…y ${r.sin_url.length - 20} más</div>` : ""}</div>` : ""}
-        </div>
-        ${r.sin_match.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 mb-2">
-          ⚠️ ${r.sin_match.length} pedido(s) de la plantilla sin factura asignada:
-          ${r.sin_match.slice(0, 30).map((o) => `<div>· ${esc(o)}</div>`).join("")}
-          ${r.sin_match.length > 30 ? `<div class="text-xs mt-1">…y ${r.sin_match.length - 30} más</div>` : ""}
-          <div class="text-xs mt-1">Puede ser que todavía no los hayas facturado en Tango, o que
-            el pedido no se haya cargado por esta app.</div></div>` : ""}
-        ${r.sobrantes.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2">
-          ⚠️ ${r.sobrantes.length} factura(s) del reporte que no se asignaron a ningún pedido de OnCity:
-          ${r.sobrantes.slice(0, 30).map((s) => `<div>· ${esc(s.cliente)} — ${esc(s.factura)}${s.importe !== "" ? " ($ " + esc(s.importe) + ")" : ""}</div>`).join("")}
-          ${r.sobrantes.length > 30 ? `<div class="text-xs mt-1">…y ${r.sobrantes.length - 30} más</div>` : ""}
-          <div class="text-xs mt-1">Es esperable si el reporte también trae facturas de Frávega.</div></div>` : ""}
-      </div>`;
-    toast("Plantilla de OnCity completada", "ok");
-    cargarHistorialFacturas();
-    cargarPendientesFacturar("oncity");
-  } catch (e) {
-    $("fac-resultado").innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`;
-  }
-}
-
-/** Descarga el .xlsx que devuelve el backend en base64. */
-function descargarXlsx(base64, nombre) {
-  const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
-  const blob = new Blob([bytes],
-    { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = nombre;
-  a.click();
-  URL.revokeObjectURL(a.href);
-}
-
-async function generarFacturasHistorial() {
-  const fl = $("fac-libro-h");
-  if (!fl || !fl.files.length) return toast("Subí el reporte de facturación de Tango", "warning");
-  $("fac-resultado").innerHTML = spinner("Cruzando el reporte contra las órdenes enviadas...");
-  try {
-    const facturasRows = await parseFile(fl.files[0]);
-    const r = await api("invoices.fromHistory", { facturas: facturasRows });
-    descargarXlsx(r.base64, r.archivo);
-
-    $("fac-resultado").innerHTML = `
-      <div class="border rounded-lg p-4 bg-green-50">
-        <div class="font-bold mb-2">✅ Archivo generado y descargado — ${r.cargadas} orden(es) cargada(s)</div>
-        <div class="text-sm mb-2">${esc(r.archivo)}</div>
-        <div class="text-sm text-gray-600 mb-2">
-          Cruce: <b class="text-green-700">exacto (Tango) ${(r.conteo || {}).tango || 0}</b> ·
-          por documento+importe <b>${(r.conteo || {}).doc_importe || 0}</b> ·
-          solo documento <b>${(r.conteo || {}).doc || 0}</b> ·
-          nombre+importe <b>${(r.conteo || {}).nombre_importe || 0}</b> ·
-          solo nombre <b>${(r.conteo || {}).nombre || 0}</b>
-          ${(r.reexportadas || []).length ? `<div class="text-xs bg-blue-50 border border-blue-200 text-blue-900 rounded p-2 my-2">
-          ℹ️ ${(r.reexportadas || []).length} orden(es) ya figuraban como exportadas, pero su
-          factura está en este reporte y Tango confirma que les corresponde, así que entraron
-          igual: ${esc((r.reexportadas || []).join(", "))}</div>` : ""}
-        <div class="text-xs text-gray-500">Columnas usadas del reporte de Tango —
-            documento: ${esc(r.columna_documento)} · importe: ${esc(r.columna_importe)}</div>
-        </div>
-        <div class="text-sm mb-2 text-gray-600">
-          📄 URL de factura: <b>${r.con_url || 0}</b> completadas
-          ${r.sin_url && r.sin_url.length ? `· <b>${r.sin_url.length}</b> sin link
-            <div class="text-xs mt-1 text-gray-500">No es un problema: la factura se informa
-              igual, solo va sin el PDF adjunto. Suele pasar cuando el comprobante se emitió
-              antes de activar la publicación en el talonario.</div>
-            <details class="text-xs mt-1"><summary class="cursor-pointer text-gray-500">Ver cuáles</summary>
-              ${r.sin_url.slice(0, 20).map((s) => `<div>· ${esc(s.orden)} — factura ${esc(s.factura)}</div>`).join("")}
-              ${r.sin_url.length > 20 ? `<div>…y ${r.sin_url.length - 20} más</div>` : ""}</details>` : ""}
-        </div>
-        ${r.sin_factura.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 mb-2">
-          ⚠️ ${r.sin_factura.length} orden(es) enviadas a Tango sin factura en el reporte:
-          ${r.sin_factura.slice(0, 30).map((s) => `<div>· ${esc(s.orden)} — ${esc(s.cliente)}${s.documento ? " (doc " + esc(s.documento) + ")" : ""}</div>`).join("")}
-          ${r.sin_factura.length > 30 ? `<div class="text-xs mt-1">…y ${r.sin_factura.length - 30} más</div>` : ""}
-          <div class="text-xs mt-1">Quedan pendientes: entran solas en la próxima exportación.</div></div>` : ""}
-        ${r.sobrantes.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2">
-          ⚠️ ${r.sobrantes.length} factura(s) del reporte sin orden pendiente que las reclame:
-          ${r.sobrantes.slice(0, 30).map((s) => `<div>· ${esc(s.cliente)} — ${esc(s.factura)}</div>`).join("")}
-          ${r.sobrantes.length > 30 ? `<div class="text-xs mt-1">…y ${r.sobrantes.length - 30} más</div>` : ""}</div>` : ""}
-      </div>`;
-    toast("Archivo de facturas generado", "ok");
-    cargarHistorialFacturas();
-    cargarPendientesFacturar();
-  } catch (e) {
-    $("fac-resultado").innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`;
-  }
-}
-
-async function cargarHistorialFacturas() {
-  const cont = $("fac-hist");
-  if (!cont) return;
-  let hist;
-  try { hist = await api("invoices.history"); }
-  catch (e) { cont.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
-  if (!$("fac-hist")) return;
-  cont.innerHTML = `
-    <table class="data w-full"><thead><tr>
-      <th>Fecha</th><th>Usuario</th><th>Archivo</th><th>Cargadas</th><th>Sin factura</th><th>Sobrantes</th>
-    </tr></thead><tbody>
-    ${hist.map((h) => `<tr><td>${esc(h.fecha_hora)}</td><td>${esc(h.usuario)}</td>
-      <td class="text-xs">${esc(h.archivo)}</td>
-      <td class="text-center">${h.cargadas}</td><td class="text-center">${h.sin_factura}</td>
-      <td class="text-center">${h.sobrantes}</td></tr>`).join("")
-      || '<tr><td colspan="6" class="text-gray-400 p-4">Sin exportaciones aún</td></tr>'}
-    </tbody></table>`;
-}
-
-async function generarFacturas() {
-  const fo = $("fac-ordenes"), fl = $("fac-libro");
-  if (!fo.files.length || !fl.files.length) return toast("Subí los dos archivos", "warning");
-  $("fac-resultado").innerHTML = spinner("Cruzando órdenes con facturas...");
-  try {
-    const [ordenesRows, facturasRows] = await Promise.all(
-      [parseFile(fo.files[0]), parseFile(fl.files[0])]);
-    const r = await api("invoices.generate", { ordenes: ordenesRows, facturas: facturasRows });
-    // Descargar el xlsx desde base64
-    const bytes = Uint8Array.from(atob(r.base64), (c) => c.charCodeAt(0));
-    const blob = new Blob([bytes],
-      { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = r.archivo;
-    a.click();
-    URL.revokeObjectURL(a.href);
-
-    $("fac-resultado").innerHTML = `
-      <div class="border rounded-lg p-4 bg-green-50">
-        <div class="font-bold mb-2">✅ Archivo generado y descargado — ${r.cargadas} orden(es) cargada(s)</div>
-        <div class="text-sm mb-2">${esc(r.archivo)}</div>
-        ${r.sin_factura.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 mb-2">
-          ⚠️ ${r.sin_factura.length} pendiente(s) sin factura:
-          ${r.sin_factura.map((s) => `<div>· ${esc(s.orden)} — ${esc(s.cliente)}</div>`).join("")}</div>` : ""}
-        ${r.sobrantes.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2">
-          ⚠️ ${r.sobrantes.length} factura(s) sin orden pendiente:
-          ${r.sobrantes.map((s) => `<div>· ${esc(s.cliente)} — ${esc(s.factura)}</div>`).join("")}</div>` : ""}
-      </div>`;
-    toast("Archivo de facturas generado", "ok");
-  } catch (e) {
-    $("fac-resultado").innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`;
-  }
-}
-
-/* ══════════════ PDF DE FACTURAS ══════════════ */
-async function viewPdfs() {
-  setMain(H("PDF de Facturas") + spinner("Consultando..."));
-  let i;
-  try { i = await api("pdfs.info"); }
-  catch (e) { if (!stillOn("pdfs")) return; return setMain(H("PDF de Facturas") + card(`<p class="text-red-600">${esc(e.message)}</p>`)); }
-  if (!stillOn("pdfs")) return;
-
-  window._EVENTOS = i.eventos || [];
-  const ev = (i.eventos || []).map((e, n) => `<tr class="cursor-pointer" onclick="verEvento(${n})">
-    <td class="text-xs whitespace-nowrap">${esc(e.fecha_hora)}</td>
-    <td class="text-xs">${esc(e.topic)}</td>
-    <td class="font-mono text-xs">${esc(e.resource)}</td>
-    <td>${resultadoBadge(String(e.resultado).indexOf("error") !== -1 || String(e.resultado) === "rechazado"
-      ? "error" : String(e.resultado).indexOf("sin") === 0 ? "warning" : "ok")}
-      <span class="text-xs text-gray-600">${esc(e.resultado)}</span></td>
-    <td class="text-xs text-gray-600 max-w-md truncate" title="${esc(e.detalle)}">${esc(e.detalle)}</td>
-    <td class="text-xs text-violet-700 underline whitespace-nowrap">ver detalle</td>
-  </tr>`).join("");
-
-  const a = i;
-  setMain(H("PDF de Facturas") + `
-    ${card(`
-      <div class="flex items-center gap-3 flex-wrap">
-        <span class="text-lg">🔎</span>
-        <div class="text-sm text-gray-600 flex-1 min-w-[18rem]">
-          ¿Buscás qué pasó con un pedido puntual —si se facturó, si tiene PDF, si ya se
-          informó al marketplace? Está todo en una sola pantalla.
-        </div>
-        <a href="#buscar" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm no-underline">
-          Abrir el Buscador de Pedidos</a>
-      </div>`, "mb-4")}
-
-    ${card(`
-      <div class="text-sm text-gray-600 mb-3">
-        Cuando facturás, Tango avisa por <b>webhook</b> y la app le pide el comprobante al
-        endpoint <code>/Invoices</code>, que devuelve la URL del PDF. Esa URL es la que se
-        completa sola en la columna <b>"Url de la factura"</b> de los archivos de Frávega y
-        OnCity.
-        ${i.destino === "drive"
-          ? `<b>Modo Drive:</b> el PDF además se copia a una carpeta propia y se informa ese
-             link, que no caduca.`
-          : `<b>Ojo:</b> la URL de Tango <b>tiene fecha de vencimiento</b> (columna
-             <b>Vence</b> de la tabla de abajo). Si algún marketplace te reclama un link
-             caído, poné <code>pdf_destino = drive</code> en Configuración y la app va a
-             publicar una copia que no vence.`}
-      </div>
-      ${i.solo_nuestras || i.talonarios ? `<div class="text-xs bg-gray-50 border rounded-lg px-3 py-2 mb-2 text-gray-600">
-        🎯 Filtro activo:
-        ${i.solo_nuestras ? "solo se procesan los avisos de <b>pedidos que mandó esta app</b>" : ""}
-        ${i.solo_nuestras && i.talonarios ? " · " : ""}
-        ${i.talonarios ? `solo los talonarios <b>${esc(i.talonarios)}</b>` : ""}.
-        El resto de la facturación de la empresa no entra acá.
-      </div>` : `<div class="text-xs bg-amber-50 border border-amber-200 text-amber-900 rounded-lg px-3 py-2 mb-2">
-        Sin filtro de talonarios: van a entrar <b>todas</b> las facturas de la empresa.
-        Tocá <b>¿Qué talonarios uso?</b> abajo para acotarlo a Frávega y OnCity.
-      </div>`}
-      <div class="text-xs text-gray-500 uppercase mb-1">Pegá esta URL en Tango</div>
-      <div class="text-xs bg-amber-50 border border-amber-200 text-amber-900 rounded-lg px-3 py-2 mb-2">
-        ⚠️ <b>No es la dirección de esta página.</b> Es la del Apps Script: empieza con
-        <code>https://script.google.com/macros/s/…</code> y termina en <code>/exec?wh=…</code>.
-        Si pegás la de GitHub Pages, Tango no va a poder entregar nada.
-      </div>
-      ${a && a.aviso_url ? `<div class="text-xs bg-red-50 border border-red-200 text-red-800 rounded-lg px-3 py-2 mb-2">${esc(a.aviso_url)}</div>` : ""}
-      <div class="flex gap-2 items-center mb-2">
-        <input id="wh-url" readonly value="${esc(i.url)}"
-          class="border rounded-lg px-3 py-2 w-full text-xs font-mono bg-gray-50">
-        <button onclick="copiarWebhook()" class="border px-3 py-2 rounded-lg text-sm whitespace-nowrap">Copiar</button>
-      </div>
-      <p class="text-xs text-gray-500 mb-3">En Tango Tiendas: configuración de la API →
-        tildar notificaciones → pegar esta URL. El <code>?wh=</code> del final es un secreto:
-        sin él las notificaciones se rechazan, así nadie puede inyectar facturas falsas.</p>
-      <div class="border-t pt-3 mt-3 mb-3">
-        <div class="text-xs text-gray-500 uppercase mb-1">Buscar el PDF de una factura ya emitida</div>
-        <div class="text-xs text-gray-500 mb-2">Sirve para probar sin esperar al webhook: confirma
-          si Tango está publicando el comprobante y por qué ruta se baja.</div>
-        <div class="flex gap-2 flex-wrap items-center">
-          <input id="pdf-orden" placeholder="Nro de Orden (v92893535frvg-01)"
-            class="border rounded-lg px-3 py-2 text-sm w-72">
-          <input id="pdf-factura" placeholder="Nro de factura (opcional)"
-            class="border rounded-lg px-3 py-2 text-sm w-56">
-          <input id="pdf-pedido" placeholder="Nro de pedido de Tango (opcional)"
-            class="border rounded-lg px-3 py-2 text-sm w-64">
-          <button onclick="buscarPdf()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
-            🔍 Buscar en Tango</button>
-        </div>
-        <div id="pdf-buscar-res" class="mt-2"></div>
-      </div>
-      <div class="flex gap-3 flex-wrap items-center">
-        <button onclick="viewPdfs()" class="border px-4 py-2 rounded-lg text-sm">Actualizar</button>
-        <button onclick="sincronizarPdfs()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
-          ⬇️ Traer comprobantes de los últimos 30 días</button>
-        <button onclick="reintentarFacturas()" class="border px-4 py-2 rounded-lg text-sm">🔄 Reintentar las que quedaron sin PDF</button>
-        <button onclick="repararFacturadas()" class="border border-amber-300 bg-amber-50 text-amber-900 px-4 py-2 rounded-lg text-sm">🩹 Reparar órdenes marcadas por error</button>
-        <button onclick="verTalonarios()" class="border px-4 py-2 rounded-lg text-sm">🎯 ¿Qué talonarios uso?</button>
-        ${i.destino === "drive" ? `<button onclick="probarCarpeta()" class="border px-4 py-2 rounded-lg text-sm">🧪 Probar la carpeta de Drive</button>` : ""}
-        ${i.destino === "drive" && i.carpeta ? `<a href="${esc(i.carpeta)}" target="_blank" class="text-violet-700 underline text-sm">Abrir la carpeta</a>` : ""}
-        <span class="text-sm text-gray-500 ml-auto"
-              title="La URL del PDF es un extra: si falta, la factura se informa igual.">
-          ${i.total_facturas} factura(s) registradas · <b class="text-green-700">${i.con_pdf}</b> con link ·
-          <b class="text-gray-500">${i.sin_pdf}</b> sin link</span>
-      </div>`, "mb-4")}
-
-    ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Últimos avisos de Tango</div>
-      ${ev ? `<div class="text-xs text-gray-500 mb-2">Tocá una fila para ver el contenido completo
-          del aviso: eso es lo que me permite ajustar cómo se busca el PDF.</div>
-        <table class="data w-full"><thead><tr>
-        <th>Fecha</th><th>Tópico</th><th>Recurso</th><th>Resultado</th><th>Detalle</th><th></th>
-      </tr></thead><tbody>${ev}</tbody></table>`
-        : `<div class="text-sm text-gray-500">Todavía no llegó ningún aviso. Cuando configures la
-             URL en Tango y se facture un pedido, acá van a aparecer los eventos. El cuerpo
-             completo de cada uno queda en la pestaña <b>Webhooks</b> de la planilla, que es lo
-             que necesito para ajustar si Tango manda el PDF de una forma distinta.</div>`}`, "mb-4")}
-
-    ${card(`<div class="flex items-center gap-3 mb-2">
-        <div class="text-xs text-gray-500 uppercase">Facturas registradas</div>
-        <input id="pdf-q" placeholder="Buscar por factura u orden..."
-          class="border rounded-lg px-3 py-1.5 text-sm w-64"
-          onkeydown="if(event.key==='Enter')cargarPdfs()">
-        <button onclick="cargarPdfs()" class="border px-3 py-1.5 rounded-lg text-sm">Buscar</button>
-      </div>
-      <div id="pdf-tabla">${spinner()}</div>`)}`);
-  cargarPdfs();
-}
-
-/* ═══════════════ AVISO AL MARKETPLACE ═══════════════ */
-
-function estadoNotifBadge(e) {
-  const v = String(e || "");
-  if (v.indexOf("aceptada") === 0) return `<span class="text-green-700">✔ ${esc(v)}</span>`;
-  if (v === "sin_url") return `<span class="text-amber-700">⏳ falta el PDF</span>`;
-  if (["notificada", "ya_estaba", "ya_facturada"].includes(v))
-    return `<span class="text-green-700">✔ ${esc(v)}</span>`;
-  if (["estado_incorrecto", "simulado", "pendiente"].includes(v))
-    return `<span class="text-amber-700">⏳ ${esc(v)}</span>`;
-  return `<span class="text-red-700">✖ ${esc(v)}</span>`;
-}
-
-async function viewAvtex() {
-  setMain(H("Aviso al Marketplace") + spinner("Consultando..."));
-  let p;
-  try { p = await api("vtexinv.pendientes"); }
-  catch (e) {
-    if (!stillOn("avtex")) return;
-    return setMain(H("Aviso al Marketplace") + card(`<p class="text-red-600">${esc(e.message)}</p>`));
-  }
-  if (!stillOn("avtex")) return;
-
-  const porCanal = Object.keys(p.por_canal || {})
-    .map((k) => `${esc(k)}: <b>${p.por_canal[k]}</b>`).join(" · ") || "—";
-
-  const estadoCartel = !p.activo
-    ? `<div class="text-sm bg-amber-50 border border-amber-200 text-amber-900 rounded-lg p-3 mb-3">
-         ⏸️ <b>Está apagado.</b> Para encenderlo, tildá
-         <code>vtex_invoice_enabled</code> en <a href="#config" class="underline">Configuración</a>.
-         <div class="text-xs mt-1">Mientras esté apagado no se manda nada, ni automático ni a mano.</div>
-       </div>`
-    : p.dry_run
-    ? `<div class="text-sm bg-blue-50 border border-blue-200 text-blue-900 rounded-lg p-3 mb-3">
-         🧪 <b>Modo simulación.</b> Se arma el envío y queda registrado, pero <b>no se manda a VTEX</b>.
-         Mirá abajo qué se enviaría; cuando estés conforme, destildá
-         <code>vtex_invoice_dry_run</code>.
-       </div>`
-    : `<div class="text-sm bg-green-50 border border-green-200 text-green-900 rounded-lg p-3 mb-3">
-         ✅ <b>Activo.</b> Las facturas se informan solas: apenas llega el aviso de Tango,
-         y de nuevo en cada corrida automática por si alguna quedó pendiente.
-       </div>`;
-
-  setMain(H("Aviso al Marketplace") + `
-    ${card(`
-      <div class="text-sm text-gray-600 mb-3">
-        Cuando facturás en Tango, la factura viaja sola al marketplace. El único
-        trabajo manual es facturar.
-      </div>
-      <div class="text-xs bg-gray-50 border rounded-lg p-3 mb-3 text-gray-600">
-        <b>Cada marketplace tiene su camino:</b>
-        <div class="mt-1">· <b>OnCity</b> → VTEX,
-          <code>POST /api/oms/pvt/orders/{orden}/invoice</code>. Contesta 200 y queda hecho
-          en el momento. Sin dudas acá.</div>
-        <div class="mt-1">· <b>Frávega</b> → configurable en
-          <code>fvg_invoice_via</code>, hoy en <b>${esc(p.fvg_via || "seller-center")}</b>.
-          Frávega documenta <b>dos</b> caminos y no aclara cuál aplica a cada seller:
-          su API de Seller Center (<code>POST /api/v1/invoice</code>, asincrónica, contesta
-          "recibido" y procesa después) y la de VTEX, que su propia guía menciona para
-          pedidos que viven en VTEX. Como nuestros pedidos se leen de VTEX, las dos son
-          plausibles.</div>
-        <div class="mt-1 text-gray-500">Si Seller Center acepta pero el pedido no pasa a
-          facturado, probá <code>ambos</code>: manda por las dos y registra ambas respuestas.</div>
-      </div>
-      ${estadoCartel}
-      <div class="flex gap-3 flex-wrap items-center">
-        <button onclick="correrAvtex()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
-          📤 Informar las pendientes ahora</button>
-        <button onclick="viewAvtex()" class="border px-4 py-2 rounded-lg text-sm">Actualizar</button>
-        <button onclick="verificarFravega()" class="border px-4 py-2 rounded-lg text-sm">
-          🔍 Verificar si Frávega las procesó</button>
-        <button onclick="repararFravegaVtex()" class="border border-amber-300 bg-amber-50 text-amber-900 px-4 py-2 rounded-lg text-sm">
-          🩹 Revisar las de Frávega mandadas a VTEX</button>
-        <span class="text-sm text-gray-500 ml-auto">
-          Esperando ser informadas: <b class="${p.total ? "text-amber-700" : ""}">${p.total}</b>
-          &nbsp;·&nbsp; ${porCanal}</span>
-      </div>
-      ${p.aviso ? `<div class="text-xs text-red-700 mt-2">${esc(p.aviso)}</div>` : ""}`, "mb-4")}
-
-    ${card(`
-      <div class="flex items-center gap-2 mb-1">
-        <span class="text-lg">🧪</span><div class="font-bold">Probar con un pedido</div>
-      </div>
-      <div class="text-sm text-gray-600 mb-3">
-        Manda <b>solo esa orden</b> y te muestra el cuerpo exacto que salió y lo que contestó
-        el marketplace. Sirve para ver un envío entero antes de soltar la cola completa.
-        Si la orden ya figuraba informada, se le borra la marca y se reenvía.
-      </div>
-      <div class="flex gap-2 flex-wrap items-end">
-        <div class="flex-1 min-w-[18rem]">
-          <label class="text-xs text-gray-500 uppercase">Nro de orden</label>
-          <input id="av-orden" placeholder="v92891957frvg-01"
-            class="border rounded-lg px-3 py-2 text-sm w-full font-mono"
-            onkeydown="if(event.key==='Enter')probarAvtex()">
-        </div>
-        <button onclick="probarAvtex()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
-          Probar esta orden</button>
-      </div>
-      ${p.dry_run ? `<div class="text-xs text-blue-800 mt-2">
-        🧪 Con la simulación tildada vas a ver el cuerpo <b>sin que salga nada</b>. Es el paso
-        recomendado antes del envío real.</div>`
-        : `<div class="text-xs text-amber-800 mt-2">
-        ⚠️ La simulación está destildada: esta prueba <b>manda la factura de verdad</b>.</div>`}
-      <div id="av-prueba" class="mt-3"></div>`, "mb-4")}
-
-    ${card(`
-      <div class="flex items-center gap-2 mb-1">
-        <span class="text-lg">⚖️</span><div class="font-bold">Conciliar con Frávega</div>
-      </div>
-      <div class="text-sm text-gray-600 mb-3">
-        Subí el <b>CSV de órdenes que baja Frávega</b> y te digo, de las que ellos dan por
-        facturadas, cuáles llegaron por Seller Center, cuáles por VTEX y cuáles no informamos
-        nunca. Es la única forma de atribuir con certeza: el CSV es la palabra de ellos y el
-        registro es la nuestra.
-        <div class="text-xs mt-1">Lo que más importa es la última categoría: órdenes que
-          informamos y que Frávega sigue mostrando pendientes. Ese es el fallo que de otro
-          modo no se nota.</div>
-      </div>
-      <div class="flex gap-2 flex-wrap items-center">
-        <input type="file" id="av-csv" accept=".csv,.xlsx"
-          class="text-sm file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0
-                 file:bg-violet-50 file:text-violet-700 file:text-sm">
-        <button onclick="conciliarFravega()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
-          Conciliar</button>
-      </div>
-      <div id="av-conc" class="mt-3"></div>`, "mb-4")}
-
-    ${card(`
-      <div class="flex items-center gap-2 mb-1">
-        <span class="text-lg">🔬</span>
-        <div class="font-bold">¿Quién puso la factura en VTEX?</div>
-      </div>
-      <div class="text-sm text-gray-600 mb-3">
-        Compara la factura que quedó aplicada en VTEX contra el cuerpo exacto que mandamos
-        nosotros. Si coincide campo por campo —incluida la hora al segundo— la puso nuestro
-        llamado a VTEX. Si difiere, la aplicó Frávega procesando el aviso de Seller Center.
-        <b>Es la forma de saber cuál de los dos caminos sirve.</b>
-      </div>
-      <div class="flex gap-2 flex-wrap items-end">
-        <div class="flex-1 min-w-[18rem]">
-          <input id="fx-orden" placeholder="v92904656frvg-01"
-            class="border rounded-lg px-3 py-2 text-sm w-full font-mono"
-            onkeydown="if(event.key==='Enter')forenseFactura()">
-        </div>
-        <button onclick="forenseFactura()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
-          Averiguar</button>
-      </div>
-      <div id="fx-res" class="mt-3"></div>`, "mb-4")}
-
-    ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Facturas esperando</div>
-      ${(p.filas || []).length ? `<table class="data w-full"><thead><tr>
-          <th>Orden</th><th>Canal</th><th>Cliente</th><th>Factura</th><th>Fecha</th><th>PDF</th>
-        </tr></thead><tbody>
-        ${p.filas.map((f) => `<tr>
-          <td class="font-mono text-xs">${esc(f.orden)}</td>
-          <td class="text-xs">${esc(f.canal)}</td>
-          <td class="text-xs max-w-[14rem] truncate" title="${esc(f.cliente)}">${esc(f.cliente)}</td>
-          <td class="font-mono text-xs">${esc(f.nro_factura)}</td>
-          <td class="text-xs text-gray-500">${esc(f.fecha_factura)}</td>
-          <td>${f.url ? `<a href="${esc(f.url)}" target="_blank" class="text-violet-700 underline text-xs">sí</a>`
-            : '<span class="text-amber-700 text-xs">falta</span>'}</td>
-        </tr>`).join("")}</tbody></table>`
-        : `<div class="text-sm text-gray-500">No hay ninguna esperando. Todo lo facturado
-             ya se informó al marketplace.</div>`}`, "mb-4")}
-
-    ${card(`<div class="flex items-center gap-3 mb-2 flex-wrap">
-        <div class="text-xs text-gray-500 uppercase">Registro de envíos</div>
-        <input id="av-q" placeholder="Buscar por orden, factura o error..."
-          class="border rounded-lg px-3 py-1.5 text-sm w-72"
-          onkeydown="if(event.key==='Enter')cargarAvtexLog()">
-        <label class="flex items-center gap-1.5 text-xs text-gray-600">
-          <input type="checkbox" id="av-err" class="w-4 h-4" onchange="cargarAvtexLog()">
-          Solo los que fallaron</label>
-        <button onclick="cargarAvtexLog()" class="border px-3 py-1.5 rounded-lg text-sm">Buscar</button>
-      </div>
-      <div class="text-xs text-gray-500 mb-2">Cada intento queda acá con lo que se mandó y lo
-        que contestó VTEX. Tocá una fila para ver el detalle completo.</div>
-      <div id="av-tabla">${spinner()}</div>`)}`);
-  cargarAvtexLog();
-}
 
 async function cargarAvtexLog() {
   const cont = $("av-tabla");
@@ -1898,6 +1336,424 @@ async function viewBuscar() {
 }
 
 
+function descargarXlsx(base64, nombre) {
+  const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+  const blob = new Blob([bytes],
+    { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = nombre;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function leerPlantillaOncity(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("No se pudo leer la plantilla"));
+    reader.onload = (e) => {
+      try {
+        // Guardamos el LIBRO COMPLETO, no solo la primera hoja. La plantilla de
+        // OnCity puede traer hojas auxiliares (ocultas o no) y hay que
+        // devolverlas intactas: si armáramos un libro nuevo, se perderían.
+        const wb = XLSX.read(e.target.result, {
+          type: "array", cellDates: false, cellStyles: true, bookVBA: true,
+        });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        resolve({
+          wb,
+          hoja: wb.SheetNames[0],
+          hojas: wb.SheetNames.slice(),
+          filas: XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: "" }),
+        });
+      } catch (err) { reject(err); }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}async function cargarHistorialFacturas() {
+  const cont = $("fac-hist");
+  if (!cont) return;
+  let hist;
+  try { hist = await api("invoices.history"); }
+  catch (e) { cont.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
+  if (!$("fac-hist")) return;
+  cont.innerHTML = `
+    <table class="data w-full"><thead><tr>
+      <th>Fecha</th><th>Usuario</th><th>Archivo</th><th>Cargadas</th><th>Sin factura</th><th>Sobrantes</th>
+    </tr></thead><tbody>
+    ${hist.map((h) => `<tr><td>${esc(h.fecha_hora)}</td><td>${esc(h.usuario)}</td>
+      <td class="text-xs">${esc(h.archivo)}</td>
+      <td class="text-center">${h.cargadas}</td><td class="text-center">${h.sin_factura}</td>
+      <td class="text-center">${h.sobrantes}</td></tr>`).join("")
+      || '<tr><td colspan="6" class="text-gray-400 p-4">Sin exportaciones aún</td></tr>'}
+    </tbody></table>`;
+}
+
+async function generarFacturasHistorial() {
+  const fl = $("fac-libro-h");
+  if (!fl || !fl.files.length) return toast("Subí el reporte de facturación de Tango", "warning");
+  $("fac-resultado").innerHTML = spinner("Cruzando el reporte contra las órdenes enviadas...");
+  try {
+    const facturasRows = await parseFile(fl.files[0]);
+    const r = await api("invoices.fromHistory", { facturas: facturasRows });
+    descargarXlsx(r.base64, r.archivo);
+
+    $("fac-resultado").innerHTML = `
+      <div class="border rounded-lg p-4 bg-green-50">
+        <div class="font-bold mb-2">✅ Archivo generado y descargado — ${r.cargadas} orden(es) cargada(s)</div>
+        <div class="text-sm mb-2">${esc(r.archivo)}</div>
+        <div class="text-sm text-gray-600 mb-2">
+          Cruce: <b class="text-green-700">exacto (Tango) ${(r.conteo || {}).tango || 0}</b> ·
+          por documento+importe <b>${(r.conteo || {}).doc_importe || 0}</b> ·
+          solo documento <b>${(r.conteo || {}).doc || 0}</b> ·
+          nombre+importe <b>${(r.conteo || {}).nombre_importe || 0}</b> ·
+          solo nombre <b>${(r.conteo || {}).nombre || 0}</b>
+          ${(r.reexportadas || []).length ? `<div class="text-xs bg-blue-50 border border-blue-200 text-blue-900 rounded p-2 my-2">
+          ℹ️ ${(r.reexportadas || []).length} orden(es) ya figuraban como exportadas, pero su
+          factura está en este reporte y Tango confirma que les corresponde, así que entraron
+          igual: ${esc((r.reexportadas || []).join(", "))}</div>` : ""}
+        <div class="text-xs text-gray-500">Columnas usadas del reporte de Tango —
+            documento: ${esc(r.columna_documento)} · importe: ${esc(r.columna_importe)}</div>
+        </div>
+        <div class="text-sm mb-2 text-gray-600">
+          📄 URL de factura: <b>${r.con_url || 0}</b> completadas
+          ${r.sin_url && r.sin_url.length ? `· <b>${r.sin_url.length} sin PDF</b>
+            <div class="text-xs mt-1">${r.sin_url.slice(0, 20).map((s) => `<div>· ${esc(s.orden)} — factura ${esc(s.factura)}</div>`).join("")}
+            ${r.sin_url.length > 20 ? `<div>…y ${r.sin_url.length - 20} más</div>` : ""}</div>
+            <div class="text-xs mt-1">Para Frávega la columna no es obligatoria en la carga, pero sí lo es
+              para vos. Revisá en <a href="#pdfs" class="underline">PDF de Facturas</a> si llegaron los avisos de Tango.</div>` : ""}
+        </div>
+        ${r.sin_factura.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 mb-2">
+          ⚠️ ${r.sin_factura.length} orden(es) enviadas a Tango sin factura en el reporte:
+          ${r.sin_factura.slice(0, 30).map((s) => `<div>· ${esc(s.orden)} — ${esc(s.cliente)}${s.documento ? " (doc " + esc(s.documento) + ")" : ""}</div>`).join("")}
+          ${r.sin_factura.length > 30 ? `<div class="text-xs mt-1">…y ${r.sin_factura.length - 30} más</div>` : ""}
+          <div class="text-xs mt-1">Quedan pendientes: entran solas en la próxima exportación.</div></div>` : ""}
+        ${r.sobrantes.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2">
+          ⚠️ ${r.sobrantes.length} factura(s) del reporte sin orden pendiente que las reclame:
+          ${r.sobrantes.slice(0, 30).map((s) => `<div>· ${esc(s.cliente)} — ${esc(s.factura)}</div>`).join("")}
+          ${r.sobrantes.length > 30 ? `<div class="text-xs mt-1">…y ${r.sobrantes.length - 30} más</div>` : ""}</div>` : ""}
+      </div>`;
+    toast("Archivo de facturas generado", "ok");
+    cargarHistorialFacturas();
+    cargarPendientesFacturar();
+  } catch (e) {
+    $("fac-resultado").innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`;
+  }
+}
+
+async function generarFacturas() {
+  const fo = $("fac-ordenes"), fl = $("fac-libro");
+  if (!fo.files.length || !fl.files.length) return toast("Subí los dos archivos", "warning");
+  $("fac-resultado").innerHTML = spinner("Cruzando órdenes con facturas...");
+  try {
+    const [ordenesRows, facturasRows] = await Promise.all(
+      [parseFile(fo.files[0]), parseFile(fl.files[0])]);
+    const r = await api("invoices.generate", { ordenes: ordenesRows, facturas: facturasRows });
+    // Descargar el xlsx desde base64
+    const bytes = Uint8Array.from(atob(r.base64), (c) => c.charCodeAt(0));
+    const blob = new Blob([bytes],
+      { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = r.archivo;
+    a.click();
+    URL.revokeObjectURL(a.href);
+
+    $("fac-resultado").innerHTML = `
+      <div class="border rounded-lg p-4 bg-green-50">
+        <div class="font-bold mb-2">✅ Archivo generado y descargado — ${r.cargadas} orden(es) cargada(s)</div>
+        <div class="text-sm mb-2">${esc(r.archivo)}</div>
+        ${r.sin_factura.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 mb-2">
+          ⚠️ ${r.sin_factura.length} pendiente(s) sin factura:
+          ${r.sin_factura.map((s) => `<div>· ${esc(s.orden)} — ${esc(s.cliente)}</div>`).join("")}</div>` : ""}
+        ${r.sobrantes.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2">
+          ⚠️ ${r.sobrantes.length} factura(s) sin orden pendiente:
+          ${r.sobrantes.map((s) => `<div>· ${esc(s.cliente)} — ${esc(s.factura)}</div>`).join("")}</div>` : ""}
+      </div>`;
+    toast("Archivo de facturas generado", "ok");
+  } catch (e) {
+    $("fac-resultado").innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`;
+  }
+}
+
+async function generarFacturasOncity() {
+  const fp = $("onc-plantilla"), fl = $("onc-libro");
+  if (!fp.files.length || !fl.files.length) return toast("Subí los dos archivos", "warning");
+  $("fac-resultado").innerHTML = spinner("Cruzando el reporte contra los pedidos de OnCity...");
+  try {
+    const [plantilla, facturasRows] = await Promise.all(
+      [leerPlantillaOncity(fp.files[0]), parseFile(fl.files[0])]);
+
+    const cab = (plantilla.filas[0] || []).map((h) => String(h).toLowerCase());
+    if (!cab.length || cab[0].indexOf("orden") === -1) {
+      throw new Error('La primera columna de la plantilla no parece ser "Nro. de orden". ' +
+                      "¿Subiste el archivo exportado de OnCity?");
+    }
+
+    const r = await api("oncity.invoices", { plantilla: plantilla.filas, facturas: facturasRows });
+
+    // Reescribimos SOBRE la plantilla que subiste: se tocan únicamente las
+    // celdas que cambiaron. Así se conservan las demás hojas, cuáles estaban
+    // ocultas, los desplegables y el formato de todo lo que no completamos.
+    const wb = plantilla.wb;
+    const ws = wb.Sheets[plantilla.hoja];
+
+    // El backend descarta las filas sin número de orden, así que sus índices NO
+    // coinciden con los de la plantilla. Emparejamos por número de orden, que es
+    // lo único estable, y solo ahí escribimos.
+    const filaDeOrden = new Map();
+    plantilla.filas.forEach((fila, i) => {
+      const orden = String((fila || [])[0] ?? "").trim();
+      if (i > 0 && orden && !filaDeOrden.has(orden)) filaDeOrden.set(orden, i);
+    });
+
+    let tocadas = 0, sinUbicar = [];
+    r.filas.forEach((fila, i) => {
+      if (i === 0) return;                                  // encabezados: no se tocan
+      const orden = String((fila || [])[0] ?? "").trim();
+      if (!orden) return;
+      const destino = filaDeOrden.get(orden);
+      if (destino === undefined) { sinUbicar.push(orden); return; }
+
+      (fila || []).forEach((valor, j) => {
+        const antes = ((plantilla.filas[destino] || [])[j] ?? "");
+        if (String(antes) === String(valor ?? "")) return;   // no cambió: no se toca
+        ws[XLSX.utils.encode_cell({ r: destino, c: j })] = { t: "s", v: String(valor ?? "") };
+        tocadas++;
+      });
+    });
+
+    if (sinUbicar.length) {
+      toast(`${sinUbicar.length} orden(es) no se pudieron ubicar en la plantilla`, "warning");
+    }
+    XLSX.writeFile(wb, r.archivo);
+
+    const c = r.conteo || {};
+    $("fac-resultado").innerHTML = `
+      <div class="border rounded-lg p-4 bg-green-50">
+        <div class="font-bold mb-2">✅ Plantilla completada y descargada — ${r.completadas} factura(s) cargada(s)</div>
+        <div class="text-sm mb-2">${esc(r.archivo)}</div>
+        <div class="text-xs text-gray-600 mb-2">
+          Se escribió sobre tu propia plantilla: ${tocadas} celda(s) modificada(s).
+          Hojas conservadas tal cual: <b>${esc((plantilla.hojas || []).join(" · "))}</b>.
+          ${sinUbicar.length ? `<span class="text-amber-700">No se pudieron ubicar:
+            ${esc(sinUbicar.join(", "))}.</span>` : ""}
+        </div>
+        <div class="text-sm text-gray-600 mb-2">
+          Cruce: <b class="text-green-700">exacto (Tango) ${c.tango || 0}</b> ·
+          por documento+importe <b>${c.doc_importe || 0}</b> ·
+          solo documento <b>${c.doc || 0}</b> ·
+          nombre+importe <b>${c.nombre_importe || 0}</b> ·
+          solo nombre <b>${c.nombre || 0}</b>
+          ${(r.reexportadas || []).length ? `<div class="text-xs bg-blue-50 border border-blue-200 text-blue-900 rounded p-2 my-2">
+          ℹ️ ${(r.reexportadas || []).length} orden(es) ya figuraban como exportadas, pero su
+          factura está en este reporte y Tango confirma que les corresponde, así que entraron
+          igual: ${esc((r.reexportadas || []).join(", "))}</div>` : ""}
+        <div class="text-xs text-gray-500">Columnas usadas del reporte de Tango —
+            documento: ${esc(r.columna_documento)} · importe: ${esc(r.columna_importe)}</div>
+          ${r.ya_tenian ? `<div class="text-xs text-gray-500">${r.ya_tenian} fila(s) ya traían número de factura y se dejaron como estaban.</div>` : ""}
+        </div>
+        <div class="text-sm mb-2 ${r.sin_url && r.sin_url.length ? "text-red-800 bg-red-50 border border-red-200 rounded p-2" : "text-gray-600"}">
+          📄 URL de factura: <b>${r.con_url || 0}</b> completadas
+          ${r.sin_url && r.sin_url.length ? `· <b>${r.sin_url.length} SIN PDF</b>
+            <div class="text-xs mt-1">En OnCity esta columna es <b>obligatoria</b>: esas filas
+              van a ser rechazadas en la importación.</div>
+            <div class="text-xs mt-1">${r.sin_url.slice(0, 20).map((s) => `<div>· ${esc(s.orden)} — factura ${esc(s.factura)}</div>`).join("")}
+            ${r.sin_url.length > 20 ? `<div>…y ${r.sin_url.length - 20} más</div>` : ""}</div>` : ""}
+        </div>
+        ${r.sin_match.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 mb-2">
+          ⚠️ ${r.sin_match.length} pedido(s) de la plantilla sin factura asignada:
+          ${r.sin_match.slice(0, 30).map((o) => `<div>· ${esc(o)}</div>`).join("")}
+          ${r.sin_match.length > 30 ? `<div class="text-xs mt-1">…y ${r.sin_match.length - 30} más</div>` : ""}
+          <div class="text-xs mt-1">Puede ser que todavía no los hayas facturado en Tango, o que
+            el pedido no se haya cargado por esta app.</div></div>` : ""}
+        ${r.sobrantes.length ? `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2">
+          ⚠️ ${r.sobrantes.length} factura(s) del reporte que no se asignaron a ningún pedido de OnCity:
+          ${r.sobrantes.slice(0, 30).map((s) => `<div>· ${esc(s.cliente)} — ${esc(s.factura)}${s.importe !== "" ? " ($ " + esc(s.importe) + ")" : ""}</div>`).join("")}
+          ${r.sobrantes.length > 30 ? `<div class="text-xs mt-1">…y ${r.sobrantes.length - 30} más</div>` : ""}
+          <div class="text-xs mt-1">Es esperable si el reporte también trae facturas de Frávega.</div></div>` : ""}
+      </div>`;
+    toast("Plantilla de OnCity completada", "ok");
+    cargarHistorialFacturas();
+    cargarPendientesFacturar("oncity");
+  } catch (e) {
+    $("fac-resultado").innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`;
+  }
+}
+
+/* ═══════════════ AVISO AL MARKETPLACE ═══════════════
+ * Una sola pantalla para todo el circuito de facturas. Lo de todos los días
+ * arriba; la puesta en punto y las herramientas de diagnóstico, plegadas
+ * abajo, porque se usan una vez cada tanto y llenaban la pantalla de botones.
+ */
+
+function estadoNotifBadge(e) {
+  const v = String(e || "");
+  if (v.indexOf("aceptada") === 0) return `<span class="text-green-700">✔ ${esc(v)}</span>`;
+  if (v === "sin_url") return `<span class="text-amber-700">⏳ falta el PDF</span>`;
+  if (["notificada", "ya_estaba", "ya_facturada"].includes(v))
+    return `<span class="text-green-700">✔ ${esc(v)}</span>`;
+  if (["estado_incorrecto", "simulado", "pendiente"].includes(v))
+    return `<span class="text-amber-700">⏳ ${esc(v)}</span>`;
+  return `<span class="text-red-700">✖ ${esc(v)}</span>`;
+}
+
+async function viewAvtex() {
+  setMain(H("Aviso al Marketplace") + spinner("Consultando..."));
+  let p, w = {};
+  try {
+    p = await api("vtexinv.pendientes");
+    try { w = await api("pdfs.info"); } catch (e) { w = {}; }
+  } catch (e) {
+    if (!stillOn("avtex")) return;
+    return setMain(H("Aviso al Marketplace") + card(`<p class="text-red-600">${esc(e.message)}</p>`));
+  }
+  if (!stillOn("avtex")) return;
+
+  const porCanal = Object.keys(p.por_canal || {})
+    .map((k) => `${esc(k)}: <b>${p.por_canal[k]}</b>`).join(" · ") || "—";
+
+  const estadoCartel = !p.activo
+    ? `<div class="text-sm bg-amber-50 border border-amber-200 text-amber-900 rounded-lg p-3 mb-3">
+         ⏸️ <b>Está apagado.</b> Para encenderlo, tildá <code>vtex_invoice_enabled</code>
+         en <a href="#config" class="underline">Configuración</a>.</div>`
+    : p.dry_run
+    ? `<div class="text-sm bg-blue-50 border border-blue-200 text-blue-900 rounded-lg p-3 mb-3">
+         🧪 <b>Modo simulación.</b> Se arma el envío y queda registrado, pero
+         <b>no se manda</b>. Para que salga de verdad, destildá
+         <code>vtex_invoice_dry_run</code> en Configuración.</div>`
+    : `<div class="text-sm bg-green-50 border border-green-200 text-green-900 rounded-lg p-3 mb-3">
+         ✅ <b>Funcionando solo.</b> Cuando facturás en Tango, la factura sale al
+         marketplace en el momento. Si alguna queda pendiente, se reintenta en cada
+         corrida automática.</div>`;
+
+  const ev = (w.eventos || []).slice(0, 12).map((e, n) => `<tr class="cursor-pointer" onclick="verEvento(${n})">
+    <td class="text-xs whitespace-nowrap">${esc(e.fecha_hora)}</td>
+    <td class="text-xs">${esc(e.topic)}</td>
+    <td class="font-mono text-xs">${esc(e.resource)}</td>
+    <td class="text-xs text-gray-600 max-w-md truncate" title="${esc(e.detalle)}">${esc(e.detalle)}</td>
+  </tr>`).join("");
+  window._EVENTOS = w.eventos || [];
+
+  setMain(H("Aviso al Marketplace") + `
+    ${card(`
+      <div class="text-sm text-gray-600 mb-3">
+        Vos facturás en Tango. El resto lo hace la app: registra la factura, la manda al
+        marketplace y la deja cargada. <b>No hay que subir ningún archivo.</b>
+      </div>
+      ${estadoCartel}
+      <div class="flex gap-3 flex-wrap items-center">
+        <button onclick="correrAvtex()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
+          📤 Informar las pendientes ahora</button>
+        <button onclick="viewAvtex()" class="border px-4 py-2 rounded-lg text-sm">Actualizar</button>
+        <span class="text-sm text-gray-500 ml-auto">
+          Esperando ser informadas: <b class="${p.total ? "text-amber-700" : ""}">${p.total}</b>
+          ${p.total ? `&nbsp;·&nbsp; ${porCanal}` : ""}</span>
+      </div>
+      ${p.aviso ? `<div class="text-xs text-red-700 mt-2">${esc(p.aviso)}</div>` : ""}`, "mb-4")}
+
+    ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Facturas esperando</div>
+      ${(p.filas || []).length ? `<table class="data w-full"><thead><tr>
+          <th>Orden</th><th>Canal</th><th>Cliente</th><th>Factura</th><th>Fecha</th><th>PDF</th>
+        </tr></thead><tbody>
+        ${p.filas.map((f) => `<tr>
+          <td class="font-mono text-xs">${esc(f.orden)}</td>
+          <td class="text-xs">${esc(f.canal)}</td>
+          <td class="text-xs max-w-[14rem] truncate" title="${esc(f.cliente)}">${esc(f.cliente)}</td>
+          <td class="font-mono text-xs">${esc(f.nro_factura)}</td>
+          <td class="text-xs text-gray-500">${esc(f.fecha_factura)}</td>
+          <td>${f.url ? `<a href="${esc(f.url)}" target="_blank" class="text-violet-700 underline text-xs">sí</a>`
+            : '<span class="text-gray-400 text-xs">—</span>'}</td>
+        </tr>`).join("")}</tbody></table>`
+        : `<div class="text-sm text-gray-500">Ninguna. Todo lo que facturaste ya se informó.</div>`}`, "mb-4")}
+
+    ${card(`<div class="flex items-center gap-3 mb-2 flex-wrap">
+        <div class="text-xs text-gray-500 uppercase">Registro de envíos</div>
+        <input id="av-q" placeholder="Buscar por orden, factura o error..."
+          class="border rounded-lg px-3 py-1.5 text-sm w-72"
+          onkeydown="if(event.key==='Enter')cargarAvtexLog()">
+        <label class="flex items-center gap-1.5 text-xs text-gray-600">
+          <input type="checkbox" id="av-err" class="w-4 h-4" onchange="cargarAvtexLog()">
+          Solo los que fallaron</label>
+        <button onclick="cargarAvtexLog()" class="border px-3 py-1.5 rounded-lg text-sm">Buscar</button>
+      </div>
+      <div class="text-xs text-gray-500 mb-2">Cada envío queda acá con lo que se mandó y lo que
+        contestó el marketplace. Tocá una fila para ver el detalle.</div>
+      <div id="av-tabla">${spinner()}</div>`, "mb-4")}
+
+    ${card(`
+      <details>
+        <summary class="cursor-pointer text-sm font-bold text-gray-700">
+          🛠 Herramientas y puesta en punto
+          <span class="font-normal text-gray-500">— se usan al configurar o cuando algo no salió</span>
+        </summary>
+
+        <div class="mt-4 border-t pt-3">
+          <div class="text-xs text-gray-500 uppercase mb-1">Probar con un pedido</div>
+          <div class="text-sm text-gray-600 mb-2">Manda <b>solo esa orden</b> y muestra el cuerpo
+            exacto que salió y lo que contestó. Además mide el estado del pedido antes y después.</div>
+          <div class="flex gap-2 flex-wrap items-center">
+            <input id="av-orden" placeholder="v92904656frvg-01"
+              class="border rounded-lg px-3 py-2 text-sm flex-1 min-w-[16rem] font-mono"
+              onkeydown="if(event.key==='Enter')probarAvtex()">
+            <button onclick="probarAvtex()" class="border px-4 py-2 rounded-lg text-sm">Probar</button>
+          </div>
+          <div id="av-prueba" class="mt-2"></div>
+        </div>
+
+        <div class="mt-4 border-t pt-3">
+          <div class="text-xs text-gray-500 uppercase mb-1">Si alguna factura quedó sin PDF</div>
+          <div class="text-sm text-gray-600 mb-2">Tango publica el comprobante unos segundos
+            después de facturar. Si el aviso llegó antes, la factura queda sin el link: esto lo
+            vuelve a pedir.</div>
+          <div class="flex gap-2 flex-wrap">
+            <button onclick="reintentarFacturas()" class="border px-4 py-2 rounded-lg text-sm">
+              🔄 Reintentar las que quedaron sin PDF</button>
+            <button onclick="sincronizarPdfs()" class="border px-4 py-2 rounded-lg text-sm">
+              ⬇️ Traer los comprobantes de los últimos 30 días</button>
+          </div>
+        </div>
+
+        <div class="mt-4 border-t pt-3">
+          <div class="text-xs text-gray-500 uppercase mb-1">Controlar contra Frávega</div>
+          <div class="text-sm text-gray-600 mb-2">Subí el CSV de órdenes que baja Frávega y te
+            digo si hay alguna que informamos y ellos siguen mostrando pendiente. Ese es el
+            fallo que de otro modo no se nota.</div>
+          <div class="flex gap-2 flex-wrap items-center">
+            <input type="file" id="av-csv" accept=".csv,.xlsx"
+              class="text-sm file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0
+                     file:bg-violet-50 file:text-violet-700 file:text-sm">
+            <button onclick="conciliarFravega()" class="border px-4 py-2 rounded-lg text-sm">Conciliar</button>
+          </div>
+          <div id="av-conc" class="mt-2"></div>
+        </div>
+
+        <div class="mt-4 border-t pt-3">
+          <div class="text-xs text-gray-500 uppercase mb-1">La URL del webhook de Tango</div>
+          <div class="text-sm text-gray-600 mb-2">Es lo que hace que Tango avise cuando facturás.
+            Se pega una sola vez, en la configuración de notificaciones de Tango Tiendas.
+            <b>No es la dirección de esta página</b>: es la del Apps Script, termina en
+            <code>/exec?wh=…</code></div>
+          <div class="flex gap-2 items-center">
+            <input id="wh-url" readonly value="${esc(w.url || "")}"
+              class="border rounded-lg px-3 py-2 w-full text-xs font-mono bg-gray-50">
+            <button onclick="copiarWebhook()" class="border px-3 py-2 rounded-lg text-sm">Copiar</button>
+          </div>
+          ${w.aviso_url ? `<div class="text-xs text-red-700 mt-1">${esc(w.aviso_url)}</div>` : ""}
+        </div>
+
+        <div class="mt-4 border-t pt-3">
+          <div class="text-xs text-gray-500 uppercase mb-2">Últimos avisos que mandó Tango</div>
+          ${ev ? `<table class="data w-full"><thead><tr>
+              <th>Fecha</th><th>Tipo</th><th>Orden</th><th>Detalle</th>
+            </tr></thead><tbody>${ev}</tbody></table>`
+            : `<div class="text-sm text-gray-500">Todavía no llegó ninguno. Si ya facturaste y
+                 no aparece nada, la URL del webhook no está cargada en Tango.</div>`}
+        </div>
+      </details>`)}`);
+  cargarAvtexLog();
+}
+
 /** Rastrea la cadena completa de un pedido y muestra dónde se cortó. */
 async function diagnosticarOrden() {
   const orden = (($("dx-orden") || {}).value || "").trim();
@@ -2010,7 +1866,7 @@ async function buscarFacturas() {
     <div class="overflow-x-auto">
     <table class="data w-full"><thead><tr>
       <th>Orden</th><th>Canal</th><th>Cliente</th><th>DNI / CUIT</th><th>Fecha</th>
-      <th>Total</th><th>Factura</th><th>PDF</th><th>Marketplace</th><th>Vence</th><th></th>
+      <th>Total</th><th>Factura</th><th>PDF</th><th>Marketplace</th><th>Vence</th><th>Acciones</th>
     </tr></thead><tbody>
     ${r.filas.map((f, n) => `<tr>
       <td class="font-mono text-xs whitespace-nowrap">${esc(f.order_id)}</td>
@@ -2030,10 +1886,51 @@ async function buscarFacturas() {
       <td class="text-xs whitespace-nowrap">${badgeMarketplace(f)}</td>
       <td class="text-xs whitespace-nowrap">${badgeVence(f.vence)}</td>
       <td class="whitespace-nowrap">
+        <button onclick="verItems(${n})" class="text-xs border rounded px-2 py-1">📦 Ítems</button>
         ${f.url ? `<button onclick="copiarUrlFactura(${n})" class="text-xs border rounded px-2 py-1">Copiar link</button>`
                 : `<button onclick="traerPdfDe(${n})" class="text-xs bg-violet-700 text-white rounded px-2 py-1">Traer PDF</button>`}
       </td>
-    </tr>`).join("")}
+    </tr>
+    <tr id="fb-items-${n}" class="hidden"><td colspan="11" class="bg-gray-50 p-0"></td></tr>`).join("")}
+    </tbody></table></div>`;
+}
+
+/** Despliega los ítems del pedido: SKU, descripción y cantidades. */
+async function verItems(n) {
+  const f = (window._FB || [])[n];
+  const fila = $(`fb-items-${n}`);
+  if (!f || !fila) return;
+  const celda = fila.querySelector("td");
+
+  if (!fila.classList.contains("hidden")) { fila.classList.add("hidden"); return; }
+  fila.classList.remove("hidden");
+  celda.innerHTML = `<div class="p-3 text-sm text-gray-500">Leyendo el pedido…</div>`;
+
+  let r;
+  try { r = await api("orden.items", { orden: f.order_id, canal: f.canal }); }
+  catch (e) {
+    celda.innerHTML = `<div class="p-3 text-sm text-red-600">${esc(e.message)}</div>`;
+    return;
+  }
+
+  celda.innerHTML = `<div class="p-3">
+    <div class="text-xs text-gray-500 uppercase mb-2">
+      Ítems del pedido · ${r.total_items} unidad(es) · estado en VTEX
+      <code>${esc(r.estado_vtex)}</code></div>
+    <table class="data w-full"><thead><tr>
+      <th>SKU Tango</th><th>SKU / refId</th><th>Descripción</th>
+      <th class="text-right">Cant.</th><th class="text-right">Precio</th><th class="text-right">Total</th>
+    </tr></thead><tbody>
+      ${r.items.map((i) => `<tr>
+        <td class="font-mono text-xs">${i.sku_tango
+          ? esc(i.sku_tango)
+          : '<span class="text-amber-700" title="No hay relación cargada para este SKU">sin relación</span>'}</td>
+        <td class="font-mono text-xs text-gray-600">${esc(i.ref || i.sku_vtex)}</td>
+        <td class="text-xs">${esc(i.descripcion)}</td>
+        <td class="text-xs text-right font-bold">${i.cantidad}</td>
+        <td class="text-xs text-right">$ ${esc(i.precio.toLocaleString("es-AR", { minimumFractionDigits: 2 }))}</td>
+        <td class="text-xs text-right">$ ${esc(i.total.toLocaleString("es-AR", { minimumFractionDigits: 2 }))}</td>
+      </tr>`).join("")}
     </tbody></table></div>`;
 }
 
@@ -2057,7 +1954,7 @@ async function traerPdfDe(n) {
   let r;
   try { r = await api("pdfs.buscar", { orden, factura: f.nro_factura || "" }); }
   catch (e) { return toast(e.message, "error"); }
-  if (r.ok) { toast("PDF encontrado", "ok"); buscarFacturas(); cargarPdfs(); }
+  if (r.ok) { toast("PDF encontrado", "ok"); buscarFacturas(); }
   else {
     showModal(`<h3 class="font-bold text-lg mb-2">No se encontró el PDF de ${esc(orden)}</h3>
       <div class="text-sm text-gray-700 mb-3">${esc(r.sugerencia || "")}</div>
@@ -2096,128 +1993,14 @@ async function reintentarFacturas() {
       ${r.truncado ? `<div class="text-amber-700">Se cortó por tiempo: volvé a tocarlo para seguir.</div>` : ""}
       ${!r.pendientes && !h.completadas ? `<div class="text-gray-600">No había nada pendiente.</div>` : ""}
     </div>
-    <div class="mt-4 text-right"><button onclick="closeModal(); viewPdfs();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
-}
-
-/**
- * Reparación puntual del error de las versiones .23 y .24: las órdenes que el
- * webhook marcó como "facturada" quedaban fuera de la exportación y su URL
- * nunca llegaba al archivo. Esto las devuelve a "pendiente".
- */
-async function repararFacturadas() {
-  showModal(`<h3 class="font-bold text-lg mb-3">Revisando…</h3>${spinner()}`);
-  let r;
-  try { r = await api("facturas.reparar"); }
-  catch (e) {
-    return showModal(`<h3 class="font-bold text-lg mb-3">Reparación</h3>
-      <p class="text-red-600 text-sm">${esc(e.message)}</p>
-      <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
-  }
-  showModal(`
-    <h3 class="font-bold text-lg mb-3">Órdenes marcadas por error</h3>
-    <div class="text-sm space-y-1 mb-3">
-      <div>Órdenes en estado "facturada" revisadas: <b>${r.revisadas}</b></div>
-      <div class="${r.reparadas ? "text-green-700" : "text-gray-600"}">
-        Devueltas a pendiente: <b>${r.reparadas}</b></div>
-      <div class="text-xs text-gray-500">Solo se tocan las marcadas desde el
-        ${esc(r.corte || "")}, que es cuando se introdujo el error. Las que salieron
-        en un archivo de verdad no se tocan.</div>
-    </div>
-    ${r.ordenes && r.ordenes.length ? `<div class="text-xs font-mono bg-gray-50 border rounded p-2 max-h-48 overflow-y-auto">
-      ${r.ordenes.map(esc).join("<br>")}</div>` : ""}
-    ${r.reparadas ? `<div class="text-sm bg-green-50 border border-green-200 rounded p-2 mt-3">
-      Ya podés volver a generar el archivo de facturas: estas órdenes van a entrar,
-      con su número de factura y su URL.</div>` : ""}
-    <div class="mt-4 text-right"><button onclick="closeModal(); viewPdfs();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
-}
-
-/**
- * Frávega acepta y procesa después. Esto mira el estado del pedido en VTEX
- * —que es su backend— para saber si la factura realmente se aplicó.
- */
-async function verificarFravega() {
-  showModal(`<h3 class="font-bold text-lg mb-3">Verificando en Frávega…</h3>${spinner()}`);
-  let r;
-  try { r = await api("vtexinv.verificar"); }
-  catch (e) {
-    return showModal(`<h3 class="font-bold text-lg mb-3">Verificación</h3>
-      <p class="text-red-600 text-sm">${esc(e.message)}</p>
-      <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
-  }
-  showModal(`
-    <h3 class="font-bold text-lg mb-2">¿Frávega las procesó?</h3>
-    <div class="text-sm text-gray-600 mb-3">Seller Center contesta "recibido" y procesa después.
-      Esto mira el estado del pedido en VTEX, que es el backend de Frávega: cuando pasa a
-      <code>invoiced</code>, la factura se aplicó de verdad.</div>
-    <div class="text-sm space-y-1 mb-3">
-      <div>Facturas aceptadas pendientes de confirmar: <b>${r.revisadas || 0}</b></div>
-      <div class="text-green-700">Confirmadas ahora: <b>${r.confirmadas || 0}</b></div>
-      ${r.esperando ? `<div class="text-gray-600">Todavía procesando (es normal los primeros
-        minutos): <b>${r.esperando}</b></div>` : ""}
-      ${(r.perdidas || []).length ? `<div class="text-amber-700">Sin novedad hace rato:
-        <b>${r.perdidas.length}</b></div>` : ""}
-      ${(r.sin_verificar || []).length ? `<div class="text-blue-800">No verificables por acá:
-        <b>${r.sin_verificar.length}</b></div>` : ""}
-      ${!r.revisadas ? `<div class="text-gray-600">No hay ninguna esperando confirmación.</div>` : ""}
-    </div>
-    ${(r.sin_verificar || []).length ? `<div class="text-xs bg-blue-50 border border-blue-200 rounded p-2 mb-2 max-h-56 overflow-y-auto">
-      <div class="font-bold text-blue-900 mb-1">No se pueden verificar automáticamente</div>
-      ${r.sin_verificar.map((x) => `<div class="mb-1">${esc(x)}</div>`).join("")}</div>` : ""}
-    ${(r.perdidas || []).length ? `<div class="text-xs bg-amber-50 border border-amber-200 rounded p-2 mb-2 max-h-48 overflow-y-auto">
-      ${r.perdidas.map(esc).join("<br>")}
-      <div class="mt-2 text-gray-600">Conviene mirarlas en el panel de Seller Center.</div></div>` : ""}
-    ${(r.detalle || []).length ? `<div class="text-xs bg-gray-50 border rounded p-2 max-h-32 overflow-y-auto">
-      ${r.detalle.map(esc).join("<br>")}</div>` : ""}
     <div class="mt-4 text-right"><button onclick="closeModal(); viewAvtex();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
 }
 
-/** Averigua quién aplicó la factura que VTEX tiene cargada. */
-async function forenseFactura() {
-  const orden = (($("fx-orden") || {}).value || "").trim();
-  const box = $("fx-res");
-  if (!orden) return toast("Poné el número de orden", "warning");
-  box.innerHTML = spinner("Comparando lo que tiene VTEX con lo que mandamos...");
 
-  let r;
-  try { r = await api("orden.forense", { orden }); }
-  catch (e) { box.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
-  if (!$("fx-res")) return;
 
-  const V = {
-    nuestro_vtex: { t: "La puso NUESTRO llamado a VTEX", c: "border-amber-300 bg-amber-50", x: "text-amber-900",
-      n: "O sea: para este pedido, el camino que tuvo efecto fue el de VTEX. No prueba que Seller Center falle, pero acá no fue el que la aplicó." },
-    fravega: { t: "La puso FRÁVEGA", c: "border-green-300 bg-green-50", x: "text-green-800",
-      n: "O sea: Seller Center funciona. Frávega procesó el aviso y aplicó la factura por su cuenta." },
-    sin_factura: { t: "VTEX todavía no tiene ninguna factura aplicada", c: "border-gray-300 bg-gray-50", x: "text-gray-800",
-      n: "Nadie la aplicó todavía. Si ya pasó más de una hora del aviso a Seller Center, es señal de que no la está procesando." },
-    dudoso: { t: "No es concluyente", c: "border-blue-300 bg-blue-50", x: "text-blue-900", n: "" }
-  }[r.veredicto] || { t: esc(r.veredicto || "Sin resultado"), c: "border-gray-300 bg-gray-50", x: "", n: "" };
 
-  box.innerHTML = `
-    <div class="border ${V.c} rounded-lg p-3 text-sm">
-      <div class="font-bold ${V.x} mb-1">${V.t}</div>
-      ${V.n ? `<div class="text-xs text-gray-700 mb-2">${V.n}</div>` : ""}
-      <div class="text-xs text-gray-600 mb-2">Estado del pedido en VTEX:
-        <code>${esc(r.estado_vtex || "?")}</code></div>
-      ${(r.porque || []).length ? `<div class="text-xs text-gray-700 mb-2">
-        ${r.porque.map((x) => `<div class="mb-1">· ${esc(x)}</div>`).join("")}</div>` : ""}
-      ${(r.distintos || []).length ? `<div class="text-xs mb-2">
-        <div class="text-gray-500 uppercase mb-1">Campos que NO coinciden</div>
-        <pre class="bg-white border rounded p-2 whitespace-pre-wrap break-all">${r.distintos.map(esc).join("\n")}</pre></div>` : ""}
-      ${(r.iguales || []).length ? `<details class="text-xs mb-2">
-        <summary class="cursor-pointer text-gray-500">Campos que coinciden (${r.iguales.length})</summary>
-        <pre class="bg-white border rounded p-2 mt-1 whitespace-pre-wrap break-all">${r.iguales.map(esc).join("\n")}</pre></details>` : ""}
-      ${(r.paquetes || []).length ? `<details class="text-xs mb-1">
-        <summary class="cursor-pointer text-gray-500">La factura tal como la tiene VTEX</summary>
-        <pre class="bg-white border rounded p-2 mt-1 whitespace-pre-wrap break-all max-h-56 overflow-y-auto">${esc(r.paquetes[0].crudo)}</pre></details>` : ""}
-      ${r.enviamos && r.enviamos.vtex ? `<details class="text-xs mb-1">
-        <summary class="cursor-pointer text-gray-500">Lo que mandamos por VTEX (${esc(r.enviamos.vtex.fecha)})</summary>
-        <pre class="bg-white border rounded p-2 mt-1 whitespace-pre-wrap break-all">${esc(r.enviamos.vtex.cuerpo)}</pre></details>` : ""}
-      ${r.enviamos && r.enviamos.seller_center ? `<details class="text-xs">
-        <summary class="cursor-pointer text-gray-500">Lo que mandamos por Seller Center (${esc(r.enviamos.seller_center.fecha)})</summary>
-        <pre class="bg-white border rounded p-2 mt-1 whitespace-pre-wrap break-all">${esc(r.enviamos.seller_center.cuerpo)}</pre></details>` : ""}
-    </div>`;
-}
+
+
 
 /** Cruza el CSV de Frávega contra nuestro registro de envíos. */
 async function conciliarFravega() {
@@ -2308,8 +2091,6 @@ async function probarAvtex(igual) {
           lo que corresponde es <b>esperar y verificar</b>, no volver a mandarla.
         </div>
         <div class="flex gap-2">
-          <button onclick="verificarFravega()" class="bg-violet-700 text-white px-3 py-1.5 rounded-lg text-xs">
-            🔍 Verificar si ya la procesó</button>
           <button onclick="probarAvtex(true)" class="border border-amber-400 px-3 py-1.5 rounded-lg text-xs">
             Mandarla igual</button>
         </div>
@@ -2373,94 +2154,11 @@ async function probarAvtex(igual) {
   cargarAvtexLog();
 }
 
-/**
- * Las órdenes de Frávega que se informaron a VTEX cuando en realidad iban por
- * Seller Center. Primero muestra la lista; recién si confirmás, las desmarca
- * para que se vuelvan a mandar por el camino correcto.
- */
-async function repararFravegaVtex() {
-  showModal(`<h3 class="font-bold text-lg mb-3">Revisando…</h3>${spinner()}`);
-  let r;
-  try { r = await api("vtexinv.reparar", {}); }
-  catch (e) {
-    return showModal(`<h3 class="font-bold text-lg mb-3">Revisión</h3>
-      <p class="text-red-600 text-sm">${esc(e.message)}</p>
-      <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
-  }
-  const n = (r.ordenes || []).length;
-  showModal(`
-    <h3 class="font-bold text-lg mb-2">Frávega informado a VTEX por error</h3>
-    <div class="text-sm text-gray-600 mb-3">
-      La versión anterior mandaba las facturas de Frávega a VTEX. Frávega usa VTEX para los
-      pedidos, pero la facturación entra por su API de Seller Center: esas órdenes
-      <b>no llegaron a Frávega</b>.
-    </div>
-    <div class="text-sm mb-3">Órdenes de Frávega marcadas: <b>${r.revisadas || 0}</b> ·
-      mandadas por el camino equivocado: <b class="${n ? "text-amber-700" : ""}">${n}</b></div>
-    ${n ? `<div class="text-xs font-mono bg-gray-50 border rounded p-2 max-h-48 overflow-y-auto mb-3">
-      ${r.ordenes.map(esc).join("<br>")}</div>
-      <div class="text-sm bg-amber-50 border border-amber-200 rounded p-2 mb-2">
-        Si confirmás, se les borra la marca y vuelven a la cola. La próxima corrida —o el botón
-        "Informar las pendientes ahora"— las manda por Seller Center.
-      </div>` : `<div class="text-sm text-green-700 mb-2">No hay ninguna: todo lo de Frávega
-        ya se informó por Seller Center.</div>`}
-    <div class="mt-4 flex gap-2 justify-end">
-      ${n ? `<button onclick="aplicarReparacionFvg()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
-        Desmarcarlas y reenviar</button>` : ""}
-      <button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button>
-    </div>`);
-}
 
-async function aplicarReparacionFvg() {
-  showModal(`<h3 class="font-bold text-lg mb-3">Desmarcando…</h3>${spinner()}`);
-  let r;
-  try { r = await api("vtexinv.reparar", { aplicar: "1" }); }
-  catch (e) {
-    return showModal(`<h3 class="font-bold text-lg mb-3">Reparación</h3>
-      <p class="text-red-600 text-sm">${esc(e.message)}</p>
-      <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
-  }
-  showModal(`<h3 class="font-bold text-lg mb-3">Listo</h3>
-    <div class="text-sm mb-3">Se desmarcaron <b>${r.desmarcadas || 0}</b> orden(es).
-      Ya están en la cola para informarse por Seller Center.</div>
-    <div class="mt-4 text-right">
-      <button onclick="closeModal(); viewAvtex();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
-}
 
-/** Descubre con qué talonarios se facturaron nuestros pedidos. */
-async function verTalonarios() {
-  showModal(`<h3 class="font-bold text-lg mb-3">Buscando los talonarios…</h3>${spinner()}`);
-  let r;
-  try { r = await api("pdfs.talonarios", { dias: 60 }); }
-  catch (e) {
-    return showModal(`<h3 class="font-bold text-lg mb-3">Talonarios</h3>
-      <p class="text-red-600 text-sm">${esc(e.message)}</p>
-      <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
-  }
-  showModal(`
-    <h3 class="font-bold text-lg mb-1">Talonarios de los últimos ${r.dias} días</h3>
-    <div class="text-xs text-gray-500 mb-3">${esc(r.desde)} a ${esc(r.hasta)} ·
-      ${r.comprobantes} comprobante(s) en Tango</div>
-    ${r.talonarios.length ? `<table class="data w-full mb-3"><thead><tr>
-        <th>Punto de venta</th><th>Comprobantes</th><th>De pedidos de esta app</th><th>Ejemplo</th>
-      </tr></thead><tbody>
-      ${r.talonarios.map((t) => `<tr class="${t.nuestros ? "bg-green-50" : ""}">
-        <td class="font-mono">${esc(t.punto_venta)}</td>
-        <td>${t.total}</td>
-        <td class="${t.nuestros ? "text-green-700 font-bold" : "text-gray-400"}">${t.nuestros}</td>
-        <td class="font-mono text-xs">${esc(t.ejemplo)}</td>
-      </tr>`).join("")}</tbody></table>`
-      : `<div class="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 mb-3">
-           Tango no devolvió comprobantes en ese período.</div>`}
-    ${r.sugerencia ? `<div class="text-sm bg-gray-50 border rounded-lg p-3">
-        Los pedidos de Frávega y OnCity se facturaron con el/los punto(s) de venta
-        <b class="font-mono">${esc(r.sugerencia)}</b>.<br>
-        Copiá ese valor en <b>Configuración → PDF de facturas → Talonarios de Frávega/OnCity</b>
-        y el resto de la facturación de la empresa deja de entrar acá.
-      </div>` : `<div class="text-sm text-gray-600">Ninguno de esos comprobantes corresponde a
-        pedidos que haya mandado esta app, así que todavía no puedo sugerirte un talonario.</div>`}
-    <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
-}
+
+
+
 
 function verEvento(n) {
   const e = (window._EVENTOS || [])[n];
@@ -2501,57 +2199,9 @@ function copiarWebhook() {
   catch (e) { toast("Copiala a mano desde el campo", "warning"); }
 }
 
-async function cargarPdfs() {
-  const cont = $("pdf-tabla");
-  if (!cont) return;
-  let rows;
-  try { rows = await api("pdfs.list", { q: ($("pdf-q") || {}).value || "" }); }
-  catch (e) { cont.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
-  if (!$("pdf-tabla")) return;
-  cont.innerHTML = `<table class="data w-full"><thead><tr>
-      <th>Nro de factura</th><th>Orden</th><th>PDF</th><th>Vence</th><th>Origen</th><th>Fecha</th><th>Detalle</th>
-    </tr></thead><tbody>
-    ${rows.map((r) => `<tr>
-      <td class="font-mono text-xs">${esc(r.nro_factura)}</td>
-      <td class="font-mono text-xs">${esc(r.order_id)}</td>
-      <td>${r.url ? `<a href="${esc(r.url)}" target="_blank" class="text-violet-700 underline text-xs">abrir</a>`
-        : '<span class="text-amber-700 text-xs">sin PDF</span>'}</td>
-      <td class="text-xs whitespace-nowrap">${badgeVence(r.vence)}</td>
-      <td class="text-xs">${badgeOrigen(r.origen)}</td>
-      <td class="text-xs text-gray-500">${esc(r.fecha_hora)}</td>
-      <td class="text-xs text-gray-500 max-w-xs truncate" title="${esc(r.detalle)}">${esc(r.detalle)}</td>
-    </tr>`).join("") || '<tr><td colspan="7" class="text-gray-400 p-4">Sin registros</td></tr>'}
-    </tbody></table>`;
-}
 
-async function buscarPdf() {
-  const orden = ($("pdf-orden") || {}).value || "";
-  const factura = ($("pdf-factura") || {}).value || "";
-  const box = $("pdf-buscar-res");
-  if (!orden.trim()) return toast("Poné el Nro de Orden", "warning");
-  box.innerHTML = spinner("Buscando el PDF en Tango...");
-  let r;
-  try { r = await api("pdfs.buscar", { orden, factura, pedido: ($("pdf-pedido") || {}).value || "" }); }
-  catch (e) { box.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
 
-  box.innerHTML = r.ok
-    ? `<div class="border border-green-300 bg-green-50 rounded-lg p-3 text-sm">
-         <div class="font-bold text-green-800 mb-1">✅ PDF encontrado</div>
-         <div class="text-xs text-gray-600 mb-2">${esc(r.via)}</div>
-         <a href="${esc(r.url)}" target="_blank" class="text-violet-700 underline break-all">${esc(r.url)}</a>
-         <div class="text-xs text-gray-500 mt-2">Ya quedó registrado: volvé a generar el archivo
-           de exportación y la URL se va a completar sola.</div>
-       </div>`
-    : `<div class="border border-amber-300 bg-amber-50 rounded-lg p-3 text-sm">
-         <div class="font-bold text-amber-900 mb-1">No se encontró el PDF</div>
-         <div class="text-xs text-gray-700 mb-2">${esc(r.sugerencia)}</div>
-         <div class="text-xs text-gray-500 uppercase mb-1">Qué contestó cada ruta
-           ${r.probadas ? `(${r.probadas} combinaciones)` : ""}</div>
-         <pre class="text-xs bg-white border rounded p-2 whitespace-pre-wrap break-all">${esc(r.diagnostico)}</pre>
-         <div class="text-xs text-gray-500 mt-2">Pasame este detalle y ajusto la ruta.</div>
-       </div>`;
-  cargarPdfs();
-}
+
 
 async function sincronizarPdfs() {
   confirmar("Se van a traer de Tango todos los comprobantes electrónicos de los últimos 30 días " +
@@ -2582,26 +2232,12 @@ async function sincronizarPdfs() {
         Tango no devolvió ningún comprobante en ese período. Revisá que el talonario tenga
         tildado <b>"Publica comprobantes en Tango Tiendas"</b> en la solapa Documentos
         electrónicos: solo se publican los comprobantes emitidos después de ese cambio.</div>` : ""}
-      <div class="mt-4 text-right"><button onclick="closeModal(); viewPdfs();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
+      <div class="mt-4 text-right"><button onclick="closeModal(); viewAvtex();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
     toast(`${r.guardados} PDF guardados`, r.guardados ? "ok" : "warning");
   });
 }
 
-async function probarCarpeta() {
-  showModal(`<h3 class="font-bold text-lg mb-3">Probando la carpeta…</h3>${spinner()}`);
-  try {
-    const r = await api("pdfs.test");
-    showModal(`<h3 class="font-bold text-lg mb-3">Prueba de la carpeta de Drive</h3>
-      <p class="text-sm text-gray-600 mb-3">${esc(r.mensaje)}</p>
-      <div class="text-xs font-mono bg-gray-50 border rounded p-2 break-all mb-3">${esc(r.url)}</div>
-      <a href="${esc(r.url)}" target="_blank" class="text-violet-700 underline text-sm">Abrir el archivo de prueba</a>
-      <div class="mt-4 text-right"><button onclick="closeModal(); viewPdfs();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
-  } catch (e) {
-    showModal(`<h3 class="font-bold text-lg mb-3">Prueba de la carpeta</h3>
-      <p class="text-red-600 text-sm">${esc(e.message)}</p>
-      <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
-  }
-}
+
 
 /* ══════════════ SKUs ══════════════ */
 async function viewSkus() {

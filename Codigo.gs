@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-26.15';
+var APP_VERSION = '2026-08-26.16';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -512,22 +512,16 @@ function doPost(e) {
       case 'vtex.orders.ignore':  out = apiVtexIgnorar(user, p); break;
       case 'orders.autoStatus':   out = apiOrdersAutoStatus(); break;
       case 'pdfs.info':           out = apiWebhookInfo(); break;
-      case 'pdfs.list':           out = apiPdfsList(p.q); break;
-      case 'pdfs.test':           out = apiPdfsTest(user); break;
       case 'pdfs.buscar':         out = apiPdfBuscar(user, p); break;
       case 'pdfs.sync':           out = apiPdfsSync(user, p); break;
       case 'facturas.buscar':     out = apiFacturasBuscar(p); break;
-      case 'pdfs.talonarios':     out = apiTalonariosSugeridos(p); break;
       case 'facturas.reintentar': out = apiFacturasReintentar(user); break;
-      case 'facturas.reparar':    out = REPARAR_FACTURADAS_POR_ERROR(); break;
       case 'vtexinv.run':         out = apiVtexInvoicesRun(user, p); break;
       case 'vtexinv.log':         out = apiVtexInvoicesLog(p); break;
       case 'vtexinv.pendientes':  out = apiVtexInvoicesPendientes(); break;
-      case 'vtexinv.reparar':     out = apiRepararFravegaVtex(user, p); break;
-      case 'vtexinv.verificar':   out = apiVerificarFravega(user); break;
       case 'vtexinv.conciliar':   out = apiConciliarFravega(user, p); break;
       case 'orden.diagnostico':   out = apiDiagnosticoOrden(p); break;
-      case 'orden.forense':       out = apiForenseFactura(p); break;
+      case 'orden.items':         out = apiOrdenItems(p); break;
       case 'orders.autoRun':      out = apiOrdersAutoRun(user); break;
       case 'oncity.invoices':     out = apiOncityInvoices(user, p); break;
       case 'skus.list':          out = apiSkusList(p.q || ''); break;
@@ -5335,6 +5329,51 @@ function apiForenseFactura(p) {
     out.porque.push('La fecha coincide pero hay otros campos distintos. Mirá el detalle.');
   }
   return out;
+}
+
+/**
+ * Los ítems de un pedido: SKU, descripción y cantidad.
+ *
+ * No los guardamos al enviar a Tango —solo la cantidad de renglones—, así que
+ * se leen del pedido en VTEX en el momento. Eso tiene la ventaja de servir
+ * también para los pedidos viejos, sin migrar nada.
+ */
+function apiOrdenItems(p) {
+  p = p || {};
+  var orden = String(p.orden || '').trim();
+  if (!orden) throw new Error('Falta el número de orden');
+  var canal = String(p.canal || '').trim().toLowerCase();
+  var cfg = _configMap();
+
+  // Sin canal (filas viejas del CSV) probamos los dos.
+  var candidatos = canal ? [canal] : ['fravega', 'oncity'];
+  var ultimo = '';
+  for (var i = 0; i < candidatos.length; i++) {
+    try {
+      var det = vtexOrderDetail(candidatos[i], _idVtex(candidatos[i], orden, cfg));
+      var div = parseFloat(_cfgCanalVal(cfg, candidatos[i], 'precio_divisor', '100')) || 100;
+      var rels = _skuRelations();
+      var idx = _indiceSkuCanal(candidatos[i], rels);
+
+      var items = (det.items || []).map(function (it) {
+        var ref = String(it.refId || it.sellerSku || '').trim();
+        var skuTango = idx.porRef[ref] || idx.porSkuId[String(it.id || '')] || '';
+        return {
+          sku_vtex: String(it.id || ''),
+          ref: ref,
+          sku_tango: skuTango,
+          descripcion: String(it.name || ''),
+          cantidad: Number(it.quantity) || 0,
+          precio: (Number(it.price) || 0) / div,
+          total: ((Number(it.price) || 0) * (Number(it.quantity) || 0)) / div
+        };
+      });
+      return { orden: orden, canal: candidatos[i], estado_vtex: String(det.status || ''),
+               items: items,
+               total_items: items.reduce(function (a, b) { return a + b.cantidad; }, 0) };
+    } catch (e) { ultimo = e.message; }
+  }
+  throw new Error('No se pudo leer el pedido en VTEX: ' + ultimo);
 }
 
 /* ── Orquestación: cola, reintentos y registro ─────────────────────────── */
