@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-25.24';
+var APP_VERSION = '2026-08-25.25';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -3747,7 +3747,9 @@ function _generarXlsxFacturas(filas) {
     hoja.getRange(2, 1, full.length, 7).setValues(full);
   }
 
-  // Hoja Transportadoras (opciones válidas del dropdown, 50 filas)
+  // Hoja Transportadoras (opciones válidas del dropdown, 50 filas).
+  // En la plantilla original está OCULTA: es de uso interno del importador y no
+  // tiene que aparecer como una solapa más cuando abrís el archivo.
   var transp = ss.insertSheet('Transportadoras');
   var opciones = [];
   opciones.push(['FravegaEnvios - Envio a domicilio']);
@@ -3760,9 +3762,18 @@ function _generarXlsxFacturas(filas) {
     .setAllowInvalid(true).build();
   hoja.getRange('G2:G9999').setDataValidation(rule);
 
-  // Hoja config
+  // Hoja config. También va oculta, y `version` tiene que quedar como TEXTO:
+  // si se guarda como número, sale 1.0 en el xlsx y el importador de Frávega
+  // no lo reconoce. Por eso se fuerza el formato de texto antes de escribir.
   var cfgSheet = ss.insertSheet('config');
+  cfgSheet.getRange(1, 1, 2, 2).setNumberFormat('@');
   cfgSheet.getRange(1, 1, 2, 2).setValues([['version', '1'], ['operation', 'invoice']]);
+
+  // Las dos hojas auxiliares se ocultan, igual que en la plantilla que baja
+  // Frávega. Ordenes queda como única solapa visible.
+  transp.hideSheet();
+  cfgSheet.hideSheet();
+  ss.setActiveSheet(hoja);
 
   SpreadsheetApp.flush();
 

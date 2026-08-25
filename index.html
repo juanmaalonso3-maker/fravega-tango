@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-25.24";
+const APP_VERSION = "2026-08-25.25";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -1178,10 +1178,17 @@ function leerPlantillaOncity(file) {
     reader.onerror = () => reject(new Error("No se pudo leer la plantilla"));
     reader.onload = (e) => {
       try {
-        const wb = XLSX.read(e.target.result, { type: "array", cellDates: false });
+        // Guardamos el LIBRO COMPLETO, no solo la primera hoja. La plantilla de
+        // OnCity puede traer hojas auxiliares (ocultas o no) y hay que
+        // devolverlas intactas: si armáramos un libro nuevo, se perderían.
+        const wb = XLSX.read(e.target.result, {
+          type: "array", cellDates: false, cellStyles: true, bookVBA: true,
+        });
         const ws = wb.Sheets[wb.SheetNames[0]];
         resolve({
+          wb,
           hoja: wb.SheetNames[0],
+          hojas: wb.SheetNames.slice(),
           filas: XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: "" }),
         });
       } catch (err) { reject(err); }
@@ -1206,17 +1213,56 @@ async function generarFacturasOncity() {
 
     const r = await api("oncity.invoices", { plantilla: plantilla.filas, facturas: facturasRows });
 
-    // Reescribimos el xlsx conservando la hoja original y los tipos de cada celda
-    const ws = XLSX.utils.aoa_to_sheet(r.filas);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, plantilla.hoja || "Principal");
+    // Reescribimos SOBRE la plantilla que subiste: se tocan únicamente las
+    // celdas que cambiaron. Así se conservan las demás hojas, cuáles estaban
+    // ocultas, los desplegables y el formato de todo lo que no completamos.
+    const wb = plantilla.wb;
+    const ws = wb.Sheets[plantilla.hoja];
+
+    // El backend descarta las filas sin número de orden, así que sus índices NO
+    // coinciden con los de la plantilla. Emparejamos por número de orden, que es
+    // lo único estable, y solo ahí escribimos.
+    const filaDeOrden = new Map();
+    plantilla.filas.forEach((fila, i) => {
+      const orden = String((fila || [])[0] ?? "").trim();
+      if (i > 0 && orden && !filaDeOrden.has(orden)) filaDeOrden.set(orden, i);
+    });
+
+    let tocadas = 0, sinUbicar = [];
+    r.filas.forEach((fila, i) => {
+      if (i === 0) return;                                  // encabezados: no se tocan
+      const orden = String((fila || [])[0] ?? "").trim();
+      if (!orden) return;
+      const destino = filaDeOrden.get(orden);
+      if (destino === undefined) { sinUbicar.push(orden); return; }
+
+      (fila || []).forEach((valor, j) => {
+        const antes = ((plantilla.filas[destino] || [])[j] ?? "");
+        if (String(antes) === String(valor ?? "")) return;   // no cambió: no se toca
+        ws[XLSX.utils.encode_cell({ r: destino, c: j })] = { t: "s", v: String(valor ?? "") };
+        tocadas++;
+      });
+    });
+
+    if (sinUbicar.length) {
+      toast(`${sinUbicar.length} orden(es) no se pudieron ubicar en la plantilla`, "warning");
+    }
     XLSX.writeFile(wb, r.archivo);
+    console.log(`[OnCity] celdas modificadas: ${tocadas} · hojas conservadas: ` +
+                `${(plantilla.hojas || []).join(", ")}` +
+                (sinUbicar.length ? ` · sin ubicar: ${sinUbicar.join(", ")}` : ""));
 
     const c = r.conteo || {};
     $("fac-resultado").innerHTML = `
       <div class="border rounded-lg p-4 bg-green-50">
         <div class="font-bold mb-2">✅ Plantilla completada y descargada — ${r.completadas} factura(s) cargada(s)</div>
         <div class="text-sm mb-2">${esc(r.archivo)}</div>
+        <div class="text-xs text-gray-600 mb-2">
+          Se escribió sobre tu propia plantilla: ${tocadas} celda(s) modificada(s).
+          Hojas conservadas tal cual: <b>${esc((plantilla.hojas || []).join(" · "))}</b>.
+          ${sinUbicar.length ? `<span class="text-amber-700">No se pudieron ubicar en la
+            plantilla: ${esc(sinUbicar.join(", "))}.</span>` : ""}
+        </div>
         <div class="text-sm text-gray-600 mb-2">
           Cruce: por documento+importe <b>${c.doc_importe || 0}</b> ·
           solo documento <b>${c.doc || 0}</b> ·
