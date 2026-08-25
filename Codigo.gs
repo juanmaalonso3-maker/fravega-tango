@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-25.23';
+var APP_VERSION = '2026-08-25.24';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -2806,10 +2806,14 @@ function _procesarComprobante(item, forzar, esNuestra) {
     _registrarFactura({
       nro_factura: nro, order_id: oid, url: url, archivo_id: '',
       origen: 'Tango', vence: vence,
-      detalle: item.InvoiceType + ' ' + item.InvoiceNumber
+      detalle: item.InvoiceType + ' ' + item.InvoiceNumber +
+               ' · link de Tango (no se copió a Drive)'
     });
     _marcarFacturadaEnHistorial(oid, item.InvoiceNumber, _fechaComprobante(item));
-    return { estado: 'guardado', nro: nro, orden: oid, url: url, vence: vence };
+    // OJO: acá NO se copia nada a Drive. Se anota en la planilla el link que
+    // da Tango, que es el que después se informa al marketplace.
+    return { estado: 'anotado (link de Tango)', nro: nro, orden: oid,
+             url: url, vence: vence, destino: 'tango' };
   }
 
   var blob = _bajarPdfDeUrl(url);
@@ -2823,7 +2827,8 @@ function _procesarComprobante(item, forzar, esNuestra) {
              (vence ? ' · la URL de Tango vencía el ' + vence : '')
   });
   _marcarFacturadaEnHistorial(oid, item.InvoiceNumber, _fechaComprobante(item));
-  return { estado: 'guardado', nro: nro, orden: oid, url: g.url };
+  return { estado: 'copiado a Drive', nro: nro, orden: oid, url: g.url,
+           destino: 'drive' };
 }
 
 /**
@@ -2884,9 +2889,11 @@ function _guardarPdfDeWebhook(req, resource, message) {
   var hechos = [];
   items.forEach(function (it) {
     var r = _procesarComprobante(it, false, true);   // viene de un aviso: es nuestra
-    hechos.push(r.nro + ': ' + r.estado);
+    hechos.push(_lindaFactura(r.nro) + ': ' + r.estado +
+                (r.destino === 'tango' && r.vence ? ', vence el ' + r.vence : ''));
   });
-  var alguno = hechos.some(function (h) { return h.indexOf('guardado') !== -1 ||
+  var alguno = hechos.some(function (h) { return h.indexOf('anotado') !== -1 ||
+                                                 h.indexOf('Drive') !== -1 ||
                                                  h.indexOf('ya_estaba') !== -1; });
   return { ok: alguno, detalle: hechos.join(' · ') };
 }
@@ -3153,6 +3160,7 @@ function apiPdfsSync(user, p) {
   var items = tangoInvoices({ fromDate: f(desde), toDate: f(hasta) });
 
   var res = { total: items.length, guardados: 0, ya_estaban: 0, sin_url: 0,
+              destino: getConfig('pdf_destino') !== 'drive' ? 'tango' : 'drive',
               otro_talonario: 0, talonarios: getConfig('webhook_talonarios') || '',
               fallidos: [], desde: f(desde), hasta: f(hasta) };
   var t0 = Date.now();
@@ -3164,7 +3172,7 @@ function apiPdfsSync(user, p) {
       break;
     }
     var r = _procesarComprobante(items[i], false);
-    if (r.estado === 'guardado') res.guardados++;
+    if (r.destino) res.guardados++;
     else if (r.estado === 'ya_estaba') res.ya_estaban++;
     else if (r.estado === 'sin_url') res.sin_url++;
     else if (r.estado === 'otro_talonario') res.otro_talonario++;

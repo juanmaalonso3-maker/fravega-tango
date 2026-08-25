@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-25.23";
+const APP_VERSION = "2026-08-25.24";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -1527,6 +1527,15 @@ async function viewPdfs() {
 
 /* ── Buscador de Facturas ─────────────────────────────────────────────── */
 
+/** De dónde sale el link que se le informa al marketplace. */
+function badgeOrigen(o) {
+  const v = String(o || "").trim();
+  if (v === "Tango") return `<span title="El link es el de Tango. No hay copia en Drive: vence.">🔗 Tango</span>`;
+  if (v === "Drive") return `<span title="Se bajó el PDF y se publicó una copia propia, que no vence.">📁 Drive</span>`;
+  if (v === "Pendiente") return `<span class="text-amber-700" title="Tango la dio por facturada pero todavía no publicó el comprobante.">⏳ esperando</span>`;
+  return esc(v);
+}
+
 /** Muestra la fecha de vencimiento del link de Tango, avisando si está cerca. */
 function badgeVence(v) {
   v = String(v || "").trim();
@@ -1760,7 +1769,7 @@ async function cargarPdfs() {
       <td>${r.url ? `<a href="${esc(r.url)}" target="_blank" class="text-violet-700 underline text-xs">abrir</a>`
         : '<span class="text-amber-700 text-xs">sin PDF</span>'}</td>
       <td class="text-xs whitespace-nowrap">${badgeVence(r.vence)}</td>
-      <td class="text-xs">${esc(r.origen)}</td>
+      <td class="text-xs">${badgeOrigen(r.origen)}</td>
       <td class="text-xs text-gray-500">${esc(r.fecha_hora)}</td>
       <td class="text-xs text-gray-500 max-w-xs truncate" title="${esc(r.detalle)}">${esc(r.detalle)}</td>
     </tr>`).join("") || '<tr><td colspan="7" class="text-gray-400 p-4">Sin registros</td></tr>'}
@@ -1812,7 +1821,9 @@ async function sincronizarPdfs() {
       <div class="text-sm space-y-1 mb-3">
         <div>Período: <b>${esc(r.desde)}</b> a <b>${esc(r.hasta)}</b></div>
         <div>Comprobantes encontrados en Tango: <b>${r.total}</b></div>
-        <div class="text-green-700">PDF guardados ahora: <b>${r.guardados}</b></div>
+        <div class="text-green-700">${r.destino === "drive"
+          ? "PDF copiados a Drive ahora" : "Comprobantes anotados ahora (link de Tango)"}:
+          <b>${r.guardados}</b></div>
         <div class="text-gray-600">Ya los teníamos: <b>${r.ya_estaban}</b></div>
         ${r.sin_url ? `<div class="text-amber-700">Sin archivo publicado: <b>${r.sin_url}</b></div>` : ""}
         ${r.truncado ? `<div class="text-amber-700">${esc(r.mensaje)}</div>` : ""}
