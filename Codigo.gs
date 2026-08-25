@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-26.01';
+var APP_VERSION = '2026-08-26.04';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -107,7 +107,7 @@ var SH = {
 var COLS_WEBHOOKS = ['fecha_hora', 'topic', 'resource', 'message',
                      'resultado', 'detalle', 'raw'];
 var COLS_NOTIF = ['fecha_hora', 'canal', 'order_id', 'order_id_vtex', 'nro_factura',
-                  'estado_vtex', 'estado', 'http', 'detalle', 'enviado'];
+                  'estado_vtex', 'estado', 'http', 'detalle', 'enviado', 'via'];
 
 var COLS_PDFS = ['nro_factura', 'order_id', 'url', 'archivo_id',
                  'fecha_hora', 'origen', 'detalle', 'vence'];
@@ -222,6 +222,8 @@ var DEFAULT_CONFIG = [
   ['vtex_invoice_pausa_ms', '400', 'Pausa entre llamadas a VTEX (ms)'],
   ['vtex_invoice_valor', 'orden', 'Importe informado: orden (el total de VTEX) o tango (el de la factura)'],
   ['vtex_invoice_al_vuelo', '1', 'Informar apenas llega el aviso de Tango (si no, solo en las corridas)'],
+  ['fvg_invoice_formato', 'tango', 'Formato del nro de factura para Frávega: tango (B0000700002727) · guion (00007-00002727) · guion_letra'],
+  ['fvg_invoice_exigir_url', '1', 'Frávega pide la URL del PDF: si falta, esperar en vez de mandar incompleta'],
   ['invoices_match_importe', '1', 'Usar también el importe para matchear facturas'],
   ['invoices_tolerancia_importe', '1', 'Diferencia máxima de importe aceptada (en pesos)'],
   ['invoices_origen', 'historial', 'De dónde salen las órdenes a facturar: historial | csv'],
@@ -513,6 +515,7 @@ function doPost(e) {
       case 'vtexinv.run':         out = apiVtexInvoicesRun(user, p); break;
       case 'vtexinv.log':         out = apiVtexInvoicesLog(p); break;
       case 'vtexinv.pendientes':  out = apiVtexInvoicesPendientes(); break;
+      case 'vtexinv.reparar':     out = apiRepararFravegaVtex(user, p); break;
       case 'orders.autoRun':      out = apiOrdersAutoRun(user); break;
       case 'oncity.invoices':     out = apiOncityInvoices(user, p); break;
       case 'skus.list':          out = apiSkusList(p.q || ''); break;
@@ -3706,7 +3709,10 @@ function apiFacturasBuscar(p) {
       estado: String(r.estado_facturacion || ''),
       url: url,
       vence: pdf ? _soloFecha(pdf.vence) : '',
-      origen_pdf: pdf ? String(pdf.origen || '') : ''
+      origen_pdf: pdf ? String(pdf.origen || '') : '',
+      // Qué pasó con el aviso al marketplace: es la última etapa del circuito
+      // y es lo primero que uno quiere saber cuando busca un pedido.
+      vtex: String(r.vtex_notificada || '')
     });
     if (out.length >= 300) break;
   }
@@ -3741,7 +3747,7 @@ function apiFacturasBuscar(p) {
         order_id: oid, suborder_id: '', canal: '', cliente: '', documento: '',
         total: '', fecha_compra: '', nro_factura: _lindaFactura(r.nro_factura),
         fecha_factura: f, estado: 'solo_pdf', url: String(r.url || ''),
-        factura_de_tango: true,
+        factura_de_tango: true, vtex: '',
         vence: _soloFecha(r.vence), origen_pdf: String(r.origen || '')
       });
     });
@@ -4476,6 +4482,211 @@ function _informarAlMarketplace(orderId) {
   }
 }
 
+/* ── Frávega: la factura va por SELLER CENTER, no por VTEX ──────────────
+ *
+ * Este fue un error mío y conviene dejarlo escrito. Como los pedidos de
+ * Frávega se LEEN de VTEX, di por sentado que la factura también se informaba
+ * ahí. No es así: Frávega usa VTEX como backend de pedidos, pero la
+ * facturación entra por su propia API de Seller Center.
+ *
+ *   POST https://seller-center-api.fravega.com/api/v1/invoice
+ *   headers: x-fvg-api-token, x-fvg-api-key, seller-id
+ *   body: UN ARRAY de objetos (permite mandar varias de una)
+ *   [{ orderId, invoiceNumber, issuanceDate, invoiceUrl, invoiceKey,
+ *      trackingNumber, trackingUrl, courier }]
+ *
+ * Diferencias con VTEX que importan:
+ *   · La fecha va como "DD-MM-YYYY", con guiones, no ISO.
+ *   · El orderId es el de siempre (v92891957frvg-01), SIN el prefijo FVG-
+ *     que le pone VTEX.
+ *   · invoiceUrl es obligatoria.
+ *   · Contesta 202, no 200: quiere decir "lo recibí", no "lo hice". El
+ *     procesamiento es asincrónico y hay que verificarlo después.
+ */
+
+/** La fecha como la quiere Frávega: DD-MM-YYYY. */
+function _fechaFravega(ddmmyyyy) {
+  var m = String(ddmmyyyy || '').match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (m) return m[1] + '-' + m[2] + '-' + m[3];
+  return Utilities.formatDate(new Date(), TZ_AR, 'dd-MM-yyyy');
+}
+
+/**
+ * El número de factura con el formato que espera Frávega.
+ * Su documentación muestra "0005-00136332", pero el histórico de este seller
+ * está cargado como "B0000700002092". Por eso es configurable y por defecto
+ * usamos el formato que ya venía funcionando.
+ */
+function _nroFacturaFravega(nro, cfg) {
+  var n = _normFactura(nro);
+  var modo = String(_cfgVal(cfg || _configMap(), 'fvg_invoice_formato') || 'tango');
+  if (modo === 'tango') return n;
+  var m = n.match(/^([A-Z]?)(\d{12,14})$/);
+  if (!m) return n;
+  var d = m[2], num = d.slice(-8), pv = d.slice(0, d.length - 8);
+  if (modo === 'guion') return pv + '-' + num;
+  if (modo === 'guion_letra') return (m[1] ? m[1] + ' ' : '') + pv + '-' + num;
+  return n;
+}
+
+/**
+ * Informa UNA factura a Frávega por Seller Center.
+ * Como todo el módulo, nunca lanza: devuelve el detalle de lo que pasó.
+ */
+function _fvgNotificarFactura(orderId, factura, cfg) {
+  cfg = cfg || _configMap();
+  var res = { canal: 'fravega', via: 'seller-center', orden: orderId,
+              nro_factura: factura.nro_factura, ok: false, estado: '', http: 0, detalle: '' };
+
+  // El orderId de Seller Center es el de siempre, sin el prefijo de VTEX.
+  var oid = _sinPrefijo(String(orderId || '').trim(), 'FVG-');
+  res.orden_vtex = oid;
+
+  var url = String(factura.url || '').trim();
+  if (!url && String(_cfgVal(cfg, 'fvg_invoice_exigir_url')) !== '0') {
+    res.estado = 'sin_url';
+    res.detalle = 'Frávega marca invoiceUrl como obligatoria y todavía no tenemos el PDF ' +
+                  'de esta factura. Queda pendiente: cuando Tango publique el comprobante ' +
+                  'se manda sola. Si querés mandarla igual, poné fvg_invoice_exigir_url en 0.';
+    return res;
+  }
+
+  var cuerpo = [{
+    orderId: oid,
+    invoiceNumber: _nroFacturaFravega(factura.nro_factura, cfg),
+    issuanceDate: _fechaFravega(factura.fecha_factura),
+    invoiceUrl: url,
+    invoiceKey: '',
+    trackingNumber: '',
+    trackingUrl: '',
+    courier: ''
+  }];
+  res.enviado = cuerpo;
+
+  if (String(_cfgVal(cfg, 'vtex_invoice_dry_run')) === '1') {
+    res.estado = 'simulado';
+    res.detalle = 'Modo simulación: NO se envió. Cuerpo: ' + JSON.stringify(cuerpo).slice(0, 400);
+    return res;
+  }
+
+  var h = _fravegaHeaders();
+  h['Content-Type'] = 'application/json';
+  h['accept'] = 'application/json';
+
+  var r;
+  try {
+    r = UrlFetchApp.fetch(FRAVEGA_BASE + '/api/v1/invoice', {
+      method: 'post', headers: h, payload: JSON.stringify(cuerpo),
+      muteHttpExceptions: true, followRedirects: true
+    });
+  } catch (e) {
+    res.estado = 'error';
+    res.detalle = 'No se pudo llamar a Seller Center: ' + String(e && e.message || e);
+    return res;
+  }
+
+  res.http = r.getResponseCode();
+  var txt = r.getContentText() || '';
+
+  if (res.http >= 200 && res.http < 300) {
+    res.ok = true;
+    // OJO: 202 es "recibido", no "procesado". Frávega lo hace asincrónico.
+    res.estado = 'aceptada (202)';
+    var id = '';
+    try { id = String((JSON.parse(txt) || {}).id || ''); } catch (e2) { /* nada */ }
+    res.detalle = 'Frávega recibió la factura' + (id ? ' (transacción ' + id + ')' : '') +
+                  '. El procesamiento es asincrónico: se confirma en unos minutos. ' +
+                  txt.slice(0, 200);
+    return res;
+  }
+
+  if (res.http === 400 && /already|duplicat|exist|ya\s|factur/i.test(txt)) {
+    res.ok = true;
+    res.estado = 'ya_estaba';
+    res.detalle = 'Frávega dice que ya la tenía: ' + txt.slice(0, 300);
+    return res;
+  }
+
+  res.estado = 'error';
+  res.detalle = 'HTTP ' + res.http + ': ' + txt.slice(0, 400);
+  return res;
+}
+
+/**
+ * Elige por dónde informar según el canal.
+ *   · Frávega → su API de Seller Center.
+ *   · OnCity  → VTEX.
+ * Los dos leen los pedidos de VTEX, pero la facturación va por caminos
+ * distintos y confundirlos fue el error original.
+ */
+function _notificarFacturaCanal(canal, orderId, factura, cfg) {
+  if (String(canal).toLowerCase() === 'fravega') {
+    return _fvgNotificarFactura(orderId, factura, cfg);
+  }
+  var r = _vtexNotificarFactura(canal, orderId, factura, cfg);
+  r.via = 'vtex';
+  return r;
+}
+
+/**
+ * REPARACIÓN — las órdenes de Frávega que se marcaron como informadas cuando
+ * en realidad se les habló a VTEX y no a Seller Center.
+ *
+ * La versión 2026-08-26.01 informaba las facturas de Frávega a VTEX. Estaba
+ * mal: Frávega usa VTEX como backend de PEDIDOS, pero la facturación entra por
+ * su propia API de Seller Center. Las órdenes que quedaron marcadas con
+ * "vtex" no fueron informadas a Frávega de verdad.
+ *
+ * Esto les borra la marca para que el circuito las vuelva a mandar, ahora por
+ * el camino correcto. Solo toca las de Frávega marcadas vía VTEX: no afecta a
+ * OnCity, que sí va por VTEX.
+ *
+ * Devuelve la lista para que puedas revisarla antes de reenviar nada.
+ */
+function REPARAR_FRAVEGA_VTEX(soloVer) {
+  var sheet = _sheetAuto(SH.SENT, COLS_SENT);
+  var last = sheet.getLastRow();
+  var res = { revisadas: 0, desmarcadas: 0, ordenes: [], solo_ver: !!soloVer };
+  if (last < 2) return res;
+
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+                  .map(function (h) { return String(h).trim(); });
+  var cOrden = headers.indexOf('order_id');
+  var cCanal = headers.indexOf('canal');
+  var cNotif = headers.indexOf('vtex_notificada');
+  if (cOrden === -1 || cCanal === -1 || cNotif === -1) {
+    res.aviso = 'Faltan columnas en OrdenesEnviadas. Ejecutá SETUP().';
+    return res;
+  }
+
+  var ancho = sheet.getLastColumn();
+  var datos = sheet.getRange(2, 1, last - 1, ancho).getValues();
+
+  datos.forEach(function (fila) {
+    if (String(fila[cCanal] || '').toLowerCase() !== 'fravega') return;
+    var marca = String(fila[cNotif] || '').trim();
+    if (!marca) return;
+    res.revisadas++;
+    // Las que ya se informaron por Seller Center llevan "· seller-center".
+    if (marca.indexOf('seller-center') !== -1) return;
+    res.ordenes.push(String(fila[cOrden]).trim() + '  →  ' + marca);
+    if (!soloVer) { fila[cNotif] = ''; res.desmarcadas++; }
+  });
+
+  if (!soloVer && res.desmarcadas) {
+    sheet.getRange(2, 1, datos.length, ancho).setValues(datos);
+    log_('reparacion', 'facturas', 'Frávega desmarcadas (se habían informado a VTEX)', 'ok',
+         'desmarcadas=' + res.desmarcadas);
+  }
+  return res;
+}
+
+/** Desde la pantalla. */
+function apiRepararFravegaVtex(user, p) {
+  p = p || {};
+  return REPARAR_FRAVEGA_VTEX(!(p.aplicar === true || p.aplicar === '1'));
+}
+
 /* ── Orquestación: cola, reintentos y registro ─────────────────────────── */
 
 /**
@@ -4562,7 +4773,7 @@ function notificarFacturasAVtex(quien, opciones) {
 
     var r;
     try {
-      r = _vtexNotificarFactura(canal, orden, factura, cfg);
+      r = _notificarFacturaCanal(canal, orden, factura, cfg);
     } catch (e) {
       r = { canal: canal, orden: orden, nro_factura: nro, ok: false,
             estado: 'excepcion', http: 0, detalle: String(e && e.message || e) };
@@ -4573,11 +4784,12 @@ function notificarFacturasAVtex(quien, opciones) {
     if (r.ok) {
       if (r.estado === 'ya_facturada' || r.estado === 'ya_estaba') res.ya_estaban++;
       else res.notificadas++;
-      datos[i][col.vtex_notificada] = _now() + ' · ' + r.estado;
+      datos[i][col.vtex_notificada] = _now() + ' · ' + r.estado +
+                                      (r.via ? ' · ' + r.via : '');
       hubo = true;
     } else if (r.estado === 'simulado') {
       res.detalle.push(orden + ': simulado');
-    } else if (r.estado === 'estado_incorrecto') {
+    } else if (r.estado === 'estado_incorrecto' || r.estado === 'sin_url') {
       res.pendientes++;                                   // se reintenta solo
       res.detalle.push(orden + ': ' + r.detalle);
     } else {
@@ -4609,7 +4821,8 @@ function _registrarNotifVtex(r) {
       _now(), r.canal || '', r.orden || '', r.orden_vtex || '',
       r.nro_factura || '', r.estado_vtex || '', r.estado || '',
       r.http || '', String(r.detalle || '').slice(0, 900),
-      r.enviado ? JSON.stringify(r.enviado).slice(0, 2000) : ''
+      r.enviado ? JSON.stringify(r.enviado).slice(0, 2000) : '',
+      r.via || ''
     ]);
   } catch (e) { /* que un fallo de registro no frene la notificación */ }
 }
@@ -4617,13 +4830,78 @@ function _registrarNotifVtex(r) {
 /** Desde la pantalla: correr el barrido a mano. */
 function apiVtexInvoicesRun(user, p) {
   p = p || {};
+  var orden = String(p.orden || '').trim();
+
+  // Para probar de nuevo con una orden puntual: le borramos la marca de
+  // "ya informada" para que vuelva a entrar en la cola. Solo con orden
+  // explícita, para no reenviar nada sin querer.
+  if (orden && (p.reenviar === true || p.reenviar === '1')) {
+    var d = _desmarcarOrden(orden);
+    if (!d.encontrada) {
+      return { revisadas: 0, notificadas: 0, ya_estaban: 0, fallidas: 0,
+               pendientes: 0, saltadas: 0, detalle: [], errores: [],
+               aviso: 'No encontré la orden "' + orden + '" en OrdenesEnviadas. ' +
+                      'Fijate de escribirla igual que en el Buscador de Pedidos.' };
+    }
+    if (!d.tiene_factura) {
+      return { revisadas: 0, notificadas: 0, ya_estaban: 0, fallidas: 0,
+               pendientes: 0, saltadas: 0, detalle: [], errores: [],
+               aviso: 'La orden "' + orden + '" todavía no tiene número de factura ' +
+                      'cargado, así que no hay nada para informar.' };
+    }
+  }
+
   var r = notificarFacturasAVtex(user.email, {
     forzar: p.forzar === true || p.forzar === '1',
     canal: String(p.canal || '').toLowerCase() || null,
-    orden: String(p.orden || '').trim() || null
+    orden: orden || null
   });
+
+  // En una prueba de una sola orden devolvemos el último intento completo,
+  // con el cuerpo enviado y la respuesta, que es lo que uno quiere ver.
+  if (orden) {
+    try {
+      var ult = _readRows(SH.NOTIF, 20).reverse();
+      for (var i = 0; i < ult.length; i++) {
+        if (String(ult[i].order_id || '').trim() === orden ||
+            String(ult[i].order_id_vtex || '').trim() === orden) { r.intento = ult[i]; break; }
+      }
+    } catch (e) { /* el resumen alcanza */ }
+  }
+
   if (r.fallidas) _avisarFallosVtex(r);
   return r;
+}
+
+/** Borra la marca de "ya informada" de UNA orden, para poder reenviarla. */
+function _desmarcarOrden(orden) {
+  var sheet = _sheetAuto(SH.SENT, COLS_SENT);
+  var last = sheet.getLastRow();
+  var out = { encontrada: false, tiene_factura: false, marca_anterior: '' };
+  if (last < 2) return out;
+
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+                  .map(function (h) { return String(h).trim(); });
+  var cOrden = headers.indexOf('order_id');
+  var cNotif = headers.indexOf('vtex_notificada');
+  var cNro = headers.indexOf('nro_factura');
+  if (cOrden === -1 || cNotif === -1) return out;
+
+  var ids = sheet.getRange(2, cOrden + 1, last - 1, 1).getValues();
+  var buscado = String(orden).trim().toUpperCase();
+  for (var i = ids.length - 1; i >= 0; i--) {
+    var id = String(ids[i][0]).trim();
+    if (id.toUpperCase() !== buscado &&
+        _sinPrefijo(id, 'FVG-').toUpperCase() !== _sinPrefijo(buscado, 'FVG-').toUpperCase()) continue;
+    var fila = i + 2;
+    out.encontrada = true;
+    out.marca_anterior = String(sheet.getRange(fila, cNotif + 1).getValue() || '');
+    out.tiene_factura = cNro === -1 ? true :
+                        !!String(sheet.getRange(fila, cNro + 1).getValue() || '').trim();
+    sheet.getRange(fila, cNotif + 1).setValue('');
+    return out;
+  }
+  return out;
 }
 
 /** Las últimas filas del registro, para la pantalla. */
