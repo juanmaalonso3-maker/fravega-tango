@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-26.09";
+const APP_VERSION = "2026-08-26.10";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -1840,6 +1840,26 @@ async function viewBuscar() {
       </div>
       <div id="fb-res" class="mt-3"></div>`, "mb-4")}
 
+    ${card(`
+      <div class="flex items-center gap-2 mb-1">
+        <span class="text-lg">🩺</span>
+        <div class="font-bold">¿Por qué este pedido no aparece?</div>
+      </div>
+      <div class="text-sm text-gray-600 mb-3">
+        Rastrea la cadena entera —si llegó a Tango, si llegó el aviso, si se registró la
+        factura, si se informó al marketplace— y te dice en qué eslabón se cortó.
+      </div>
+      <div class="flex gap-2 flex-wrap items-end">
+        <div class="flex-1 min-w-[18rem]">
+          <input id="dx-orden" placeholder="v92904656frvg-01"
+            class="border rounded-lg px-3 py-2 text-sm w-full font-mono"
+            onkeydown="if(event.key==='Enter')diagnosticarOrden()">
+        </div>
+        <button onclick="diagnosticarOrden()" class="border px-4 py-2 rounded-lg text-sm">
+          Rastrear</button>
+      </div>
+      <div id="dx-res" class="mt-3"></div>`, "mb-4")}
+
     ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Cómo leer el resultado</div>
       <div class="text-sm text-gray-600 space-y-1">
         <div><b>Factura</b> — el número que le puso Tango. Si dice "sin facturar",
@@ -1851,6 +1871,38 @@ async function viewBuscar() {
       </div>`)}`);
 }
 
+
+/** Rastrea la cadena completa de un pedido y muestra dónde se cortó. */
+async function diagnosticarOrden() {
+  const orden = (($("dx-orden") || {}).value || "").trim();
+  const box = $("dx-res");
+  if (!orden) return toast("Poné el número de orden", "warning");
+  box.innerHTML = spinner("Rastreando...");
+
+  let d;
+  try { d = await api("orden.diagnostico", { orden }); }
+  catch (e) { box.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
+  if (!$("dx-res")) return;
+
+  const icono = (e) => e === "ok" ? "✅" : e === "espera" ? "⏳" : "❌";
+  const tinta = (e) => e === "ok" ? "text-green-700" : e === "espera" ? "text-amber-700" : "text-red-700";
+
+  box.innerHTML = `
+    <div class="border rounded-lg p-3">
+      ${d.pasos.map((p) => `
+        <div class="flex gap-2 py-1.5 ${p.n > 1 ? "border-t" : ""}">
+          <div class="text-sm">${icono(p.estado)}</div>
+          <div class="flex-1">
+            <div class="text-sm font-bold ${tinta(p.estado)}">${p.n}. ${esc(p.titulo)}</div>
+            <div class="text-xs text-gray-600">${esc(p.detalle)}</div>
+          </div>
+        </div>`).join("")}
+      <div class="border-t mt-2 pt-2">
+        <div class="text-sm font-bold mb-1">${esc(d.conclusion)}</div>
+        ${d.siguiente ? `<div class="text-sm text-gray-700">👉 ${esc(d.siguiente)}</div>` : ""}
+      </div>
+    </div>`;
+}
 
 /* ── Buscador de Facturas ─────────────────────────────────────────────── */
 

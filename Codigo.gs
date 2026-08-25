@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-26.09';
+var APP_VERSION = '2026-08-26.10';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -521,6 +521,7 @@ function doPost(e) {
       case 'vtexinv.reparar':     out = apiRepararFravegaVtex(user, p); break;
       case 'vtexinv.verificar':   out = apiVerificarFravega(user); break;
       case 'vtexinv.conciliar':   out = apiConciliarFravega(user, p); break;
+      case 'orden.diagnostico':   out = apiDiagnosticoOrden(p); break;
       case 'orders.autoRun':      out = apiOrdersAutoRun(user); break;
       case 'oncity.invoices':     out = apiOncityInvoices(user, p); break;
       case 'skus.list':          out = apiSkusList(p.q || ''); break;
@@ -4986,6 +4987,157 @@ function apiConciliarFravega(user, p) {
        res.informadas_sin_efecto.length ? 'warning' : 'ok',
        JSON.stringify(res.resumen));
   return res;
+}
+
+/**
+ * ¿POR QUÉ ESTE PEDIDO NO APARECE?
+ *
+ * Rastrea la cadena completa de una orden y dice en qué eslabón se cortó:
+ *   1. ¿Está en OrdenesEnviadas? (si no, el webhook la descarta)
+ *   2. ¿Llegó el aviso de Tango?
+ *   3. ¿Tango tiene el comprobante publicado?
+ *   4. ¿Quedó registrada la factura?
+ *   5. ¿Se informó al marketplace?
+ *
+ * Devuelve los hechos y una conclusión con el próximo paso concreto.
+ */
+function apiDiagnosticoOrden(p) {
+  p = p || {};
+  var orden = String(p.orden || '').trim();
+  if (!orden) throw new Error('Poné el número de orden');
+  var base = _sinPrefijo(orden, 'FVG-');
+  var cfg = _configMap();
+
+  var d = { orden: orden, pasos: [], conclusion: '', siguiente: '' };
+  function paso(n, titulo, ok, detalle) {
+    d.pasos.push({ n: n, titulo: titulo, estado: ok, detalle: detalle });
+  }
+
+  /* ── 1. OrdenesEnviadas ─────────────────────────────────────────────── */
+  var fila = null, col = {};
+  try {
+    var sheet = _sheetAuto(SH.SENT, COLS_SENT);
+    var last = sheet.getLastRow();
+    if (last > 1) {
+      var hs = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+                 .map(function (h) { return String(h).trim(); });
+      hs.forEach(function (h, i) { col[h] = i; });
+      var datos = sheet.getRange(2, 1, last - 1, hs.length).getValues();
+      for (var i = datos.length - 1; i >= 0; i--) {
+        var id = String(datos[i][col.order_id]).trim();
+        if (id === orden || _sinPrefijo(id, 'FVG-') === base) { fila = datos[i]; break; }
+      }
+    }
+  } catch (e) { /* seguimos */ }
+
+  if (!fila) {
+    paso(1, 'El pedido en el historial de la app', 'error',
+         'NO está en OrdenesEnviadas. Sin eso, el aviso de Tango se descarta: la app ' +
+         'solo procesa las facturas de los pedidos que ella misma mandó.');
+    d.conclusion = 'El pedido no figura como enviado a Tango desde esta app.';
+    d.siguiente = 'Fijate en Ingreso de Órdenes si quedó sin confirmar el envío, o apagá ' +
+                  'webhook_solo_nuestras en Configuración si lo cargaste a mano en Tango.';
+    return d;
+  }
+
+  var canal = String(fila[col.canal] || '');
+  var nro = String(fila[col.nro_factura] || '').trim();
+  var notif = String(fila[col.vtex_notificada] || '').trim();
+  paso(1, 'El pedido en el historial de la app', 'ok',
+       'Está. Canal: ' + (canal || '(vacío)') + ' · cliente: ' + String(fila[col.cliente] || '') +
+       ' · estado: ' + String(fila[col.estado_facturacion] || ''));
+
+  /* ── 2. Avisos de Tango ─────────────────────────────────────────────── */
+  var avisos = [];
+  try {
+    _sheetWebhooks();
+    _readRows(SH.WEBHOOKS, 800).forEach(function (w) {
+      var r = String(w.resource || '').trim();
+      if (r === orden || _sinPrefijo(r, 'FVG-') === base) avisos.push(w);
+    });
+  } catch (e) { /* nada */ }
+
+  if (!avisos.length) {
+    paso(2, 'El aviso de Tango (webhook)', 'error',
+         'No llegó ningún aviso para este pedido. Tango avisa apenas facturás; si no ' +
+         'llegó, o la URL del webhook no está bien configurada, o Tango todavía no lo ' +
+         'disparó (reintenta a las 3, 6 y 24 horas).');
+  } else {
+    paso(2, 'El aviso de Tango (webhook)', 'ok',
+         avisos.length + ' aviso(s): ' + avisos.map(function (w) {
+           return w.topic + ' ' + w.fecha_hora + ' → ' + w.resultado;
+         }).join(' · '));
+  }
+
+  /* ── 3. El comprobante en Tango ─────────────────────────────────────── */
+  var comp = null;
+  try {
+    var items = tangoInvoices({ orderNumber: base });
+    if (!items.length) items = tangoInvoices({ orderNumber: orden });
+    if (items.length) comp = items[0];
+  } catch (e) {
+    paso(3, 'El comprobante en Tango', 'error', 'Error consultando /Invoices: ' + e.message);
+  }
+  if (comp) {
+    paso(3, 'El comprobante en Tango', 'ok',
+         comp.InvoiceType + ' ' + comp.InvoiceNumber +
+         ' · PDF ' + (comp.InvoiceFileUrl ? 'publicado' : 'NO publicado'));
+  } else if (!d.pasos[2]) {
+    paso(3, 'El comprobante en Tango', 'error',
+         'Tango no devuelve comprobantes para este pedido. O no se facturó todavía, o el ' +
+         'talonario no tiene tildado "Publica comprobantes en Tango Tiendas".');
+  }
+
+  /* ── 4. La factura registrada ───────────────────────────────────────── */
+  if (nro) {
+    paso(4, 'La factura registrada en la app', 'ok',
+         'Número ' + _lindaFactura(nro) + ' · fecha ' + String(fila[col.fecha_factura] || '(vacía)'));
+  } else {
+    paso(4, 'La factura registrada en la app', 'error',
+         'La orden todavía no tiene número de factura cargado. Hasta que lo tenga, no ' +
+         'entra en la cola del marketplace.');
+  }
+
+  /* ── 5. El aviso al marketplace ─────────────────────────────────────── */
+  var activo = String(_cfgVal(cfg, 'vtex_invoice_enabled')) === '1';
+  if (notif) {
+    paso(5, 'El aviso al marketplace', 'ok', notif);
+  } else if (!nro) {
+    paso(5, 'El aviso al marketplace', 'espera',
+         'Esperando que aparezca el número de factura.');
+  } else if (!activo) {
+    paso(5, 'El aviso al marketplace', 'error',
+         'La factura está lista para informar, pero el aviso automático está APAGADO ' +
+         '(vtex_invoice_enabled = 0).');
+  } else {
+    paso(5, 'El aviso al marketplace', 'espera',
+         'Está en la cola. Entra en la próxima corrida, o tocá "Informar las pendientes ahora".');
+  }
+
+  /* ── Conclusión ─────────────────────────────────────────────────────── */
+  if (notif) {
+    d.conclusion = 'El circuito se completó: la factura ya se informó al marketplace.';
+    d.siguiente = 'Si querés confirmar que la aplicaron, usá "Verificar si Frávega las procesó".';
+  } else if (nro) {
+    d.conclusion = 'La factura está registrada pero todavía no se informó.';
+    d.siguiente = activo ? 'Tocá "Informar las pendientes ahora" o esperá la próxima corrida.'
+                         : 'Encendé vtex_invoice_enabled en Configuración.';
+  } else if (!avisos.length && comp) {
+    d.conclusion = 'Tango YA tiene el comprobante, pero el aviso nunca llegó a la app. ' +
+                   'El eslabón que falla es el webhook.';
+    d.siguiente = 'Revisá en PDF de Facturas que la URL del webhook esté bien cargada en ' +
+                  'Tango. Mientras tanto, tocá "Reintentar las que quedaron sin PDF": ' +
+                  'levanta el comprobante sin depender del aviso.';
+  } else if (!avisos.length && !comp) {
+    d.conclusion = 'Ni Tango publicó el comprobante ni llegó ningún aviso.';
+    d.siguiente = 'Si ya facturaste, revisá que el talonario tenga tildado "Publica ' +
+                  'comprobantes en Tango Tiendas" en la solapa Documentos electrónicos. ' +
+                  'Ese tilde solo aplica a los comprobantes emitidos después de activarlo.';
+  } else {
+    d.conclusion = 'Llegó el aviso pero no se pudo registrar la factura.';
+    d.siguiente = 'Mirá el detalle del aviso en PDF de Facturas.';
+  }
+  return d;
 }
 
 /* ── Orquestación: cola, reintentos y registro ─────────────────────────── */
