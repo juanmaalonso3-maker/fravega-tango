@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-26.13";
+const APP_VERSION = "2026-08-26.14";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -2926,7 +2926,10 @@ const CONFIG_CAMPOS = [
     ["oncity_ignorar", "Pedidos a ignorar siempre (separados por coma)", "text"],
   ]],
   ["PDF de facturas", [
-    ["pdf_destino", "Dónde vive el PDF: tango (la URL de Tango, vence) · drive (copia propia)", "text"],
+    ["pdf_destino", "Dónde vive el PDF", "select", [
+      ["tango", "tango — la URL de Tango (vence a los 30 días)"],
+      ["drive", "drive — copia propia que no vence"],
+    ]],
     ["webhook_solo_nuestras", "Procesar solo los avisos de pedidos que mandó esta app", "bool"],
     ["webhook_talonarios", "Talonarios de Frávega/OnCity (puntos de venta, con coma). Vacío = todos", "text"],
     ["pdf_dias_sync", "Días hacia atrás al sincronizar comprobantes", "text"],
@@ -2940,11 +2943,22 @@ const CONFIG_CAMPOS = [
     ["vtex_invoice_dry_run", "Modo simulación (arma el envío pero NO lo manda)", "bool"],
     ["vtex_invoice_al_vuelo", "Informar apenas llega el aviso de Tango", "bool"],
     ["vtex_invoice_canales", "Canales a los que informar (fravega, oncity)", "text"],
-    ["vtex_invoice_valor", "Importe informado: orden · tango", "text"],
+    ["vtex_invoice_valor", "Importe informado a VTEX", "select", [
+      ["orden", "orden — el total que tiene VTEX"],
+      ["tango", "tango — el total de la factura"],
+    ]],
     ["vtex_invoice_max", "Máximo de facturas por corrida", "text"],
     ["vtex_invoice_pausa_ms", "Pausa entre llamadas (ms)", "text"],
-    ["fvg_invoice_via", "Frávega, por dónde informar: seller-center · vtex · ambos", "text"],
-    ["fvg_invoice_formato", "Formato del nro de factura para Frávega: tango · guion · guion_letra", "text"],
+    ["fvg_invoice_via", "⭐ Frávega: por dónde se informa la factura", "select", [
+      ["seller-center", "Seller Center — POST /api/v1/invoice (asincrónico)"],
+      ["vtex", "VTEX — POST /api/oms/pvt/orders/{orden}/invoice (inmediato)"],
+      ["ambos", "Ambos — manda por los dos caminos"],
+    ]],
+    ["fvg_invoice_formato", "Frávega: formato del número de factura", "select", [
+      ["tango", "tango — B0000700002728 (como el histórico)"],
+      ["guion", "guion — 00007-00002728 (como el ejemplo de su doc)"],
+      ["guion_letra", "guion_letra — B 00007-00002728"],
+    ]],
     ["fvg_invoice_exigir_url", "Frávega: esperar a tener el PDF antes de informar (la pide obligatoria)", "bool"],
     ["fvg_invoice_horas_alerta", "Frávega: horas a esperar la confirmación antes de avisar", "text"],
     ["invoice_reenvio_minutos", "Minutos dentro de los cuales avisar antes de reenviar la misma factura", "text"],
@@ -2969,7 +2983,13 @@ async function viewConfig() {
   // Depósito de destino de las órdenes en Tango: por defecto "04".
   if (!v.orders_warehouse_code) v.orders_warehouse_code = "04";
 
-  const campo = ([key, label, tipo]) => tipo === "bool"
+  const campo = ([key, label, tipo, opciones]) => Array.isArray(opciones)
+    ? `<div class="py-1"><label class="text-xs text-gray-500 uppercase">${label}</label>
+         <select data-key="${key}" class="cfg-input border rounded-lg px-3 py-2 w-full text-sm bg-white">
+           ${opciones.map(([val, txt]) => `<option value="${esc(val)}"
+             ${String(v[key] ?? "") === val ? "selected" : ""}>${esc(txt)}</option>`).join("")}
+         </select></div>`
+    : tipo === "bool"
     ? `<label class="flex items-center gap-2 text-sm py-1">
          <input type="checkbox" data-key="${key}" ${v[key] === "1" ? "checked" : ""}
            class="cfg-input w-4 h-4"> ${label}</label>`
