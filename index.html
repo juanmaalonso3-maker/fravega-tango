@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-25.25";
+const APP_VERSION = "2026-08-25.26";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -1264,7 +1264,8 @@ async function generarFacturasOncity() {
             plantilla: ${esc(sinUbicar.join(", "))}.</span>` : ""}
         </div>
         <div class="text-sm text-gray-600 mb-2">
-          Cruce: por documento+importe <b>${c.doc_importe || 0}</b> ·
+          Cruce: <b class="text-green-700">exacto (Tango) ${c.tango || 0}</b> ·
+          por documento+importe <b>${c.doc_importe || 0}</b> ·
           solo documento <b>${c.doc || 0}</b> ·
           nombre+importe <b>${c.nombre_importe || 0}</b> ·
           solo nombre <b>${c.nombre || 0}</b>
@@ -1326,7 +1327,8 @@ async function generarFacturasHistorial() {
         <div class="font-bold mb-2">✅ Archivo generado y descargado — ${r.cargadas} orden(es) cargada(s)</div>
         <div class="text-sm mb-2">${esc(r.archivo)}</div>
         <div class="text-sm text-gray-600 mb-2">
-          Cruce: por documento+importe <b>${(r.conteo || {}).doc_importe || 0}</b> ·
+          Cruce: <b class="text-green-700">exacto (Tango) ${(r.conteo || {}).tango || 0}</b> ·
+          por documento+importe <b>${(r.conteo || {}).doc_importe || 0}</b> ·
           solo documento <b>${(r.conteo || {}).doc || 0}</b> ·
           nombre+importe <b>${(r.conteo || {}).nombre_importe || 0}</b> ·
           solo nombre <b>${(r.conteo || {}).nombre || 0}</b>
@@ -1541,6 +1543,7 @@ async function viewPdfs() {
         <button onclick="sincronizarPdfs()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
           ⬇️ Traer comprobantes de los últimos 30 días</button>
         <button onclick="reintentarFacturas()" class="border px-4 py-2 rounded-lg text-sm">🔄 Reintentar las que quedaron sin PDF</button>
+        <button onclick="repararFacturadas()" class="border border-amber-300 bg-amber-50 text-amber-900 px-4 py-2 rounded-lg text-sm">🩹 Reparar órdenes marcadas por error</button>
         <button onclick="verTalonarios()" class="border px-4 py-2 rounded-lg text-sm">🎯 ¿Qué talonarios uso?</button>
         ${i.destino === "drive" ? `<button onclick="probarCarpeta()" class="border px-4 py-2 rounded-lg text-sm">🧪 Probar la carpeta de Drive</button>` : ""}
         ${i.destino === "drive" && i.carpeta ? `<a href="${esc(i.carpeta)}" target="_blank" class="text-violet-700 underline text-sm">Abrir la carpeta</a>` : ""}
@@ -1722,6 +1725,38 @@ async function reintentarFacturas() {
       ${r.truncado ? `<div class="text-amber-700">Se cortó por tiempo: volvé a tocarlo para seguir.</div>` : ""}
       ${!r.pendientes && !h.completadas ? `<div class="text-gray-600">No había nada pendiente.</div>` : ""}
     </div>
+    <div class="mt-4 text-right"><button onclick="closeModal(); viewPdfs();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
+}
+
+/**
+ * Reparación puntual del error de las versiones .23 y .24: las órdenes que el
+ * webhook marcó como "facturada" quedaban fuera de la exportación y su URL
+ * nunca llegaba al archivo. Esto las devuelve a "pendiente".
+ */
+async function repararFacturadas() {
+  showModal(`<h3 class="font-bold text-lg mb-3">Revisando…</h3>${spinner()}`);
+  let r;
+  try { r = await api("facturas.reparar"); }
+  catch (e) {
+    return showModal(`<h3 class="font-bold text-lg mb-3">Reparación</h3>
+      <p class="text-red-600 text-sm">${esc(e.message)}</p>
+      <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
+  }
+  showModal(`
+    <h3 class="font-bold text-lg mb-3">Órdenes marcadas por error</h3>
+    <div class="text-sm space-y-1 mb-3">
+      <div>Órdenes en estado "facturada" revisadas: <b>${r.revisadas}</b></div>
+      <div class="${r.reparadas ? "text-green-700" : "text-gray-600"}">
+        Devueltas a pendiente: <b>${r.reparadas}</b></div>
+      <div class="text-xs text-gray-500">Solo se tocan las marcadas desde el
+        ${esc(r.corte || "")}, que es cuando se introdujo el error. Las que salieron
+        en un archivo de verdad no se tocan.</div>
+    </div>
+    ${r.ordenes && r.ordenes.length ? `<div class="text-xs font-mono bg-gray-50 border rounded p-2 max-h-48 overflow-y-auto">
+      ${r.ordenes.map(esc).join("<br>")}</div>` : ""}
+    ${r.reparadas ? `<div class="text-sm bg-green-50 border border-green-200 rounded p-2 mt-3">
+      Ya podés volver a generar el archivo de facturas: estas órdenes van a entrar,
+      con su número de factura y su URL.</div>` : ""}
     <div class="mt-4 text-right"><button onclick="closeModal(); viewPdfs();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
 }
 

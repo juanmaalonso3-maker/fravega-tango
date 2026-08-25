@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-25.25';
+var APP_VERSION = '2026-08-25.26';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -496,6 +496,7 @@ function doPost(e) {
       case 'facturas.buscar':     out = apiFacturasBuscar(p); break;
       case 'pdfs.talonarios':     out = apiTalonariosSugeridos(p); break;
       case 'facturas.reintentar': out = apiFacturasReintentar(user); break;
+      case 'facturas.reparar':    out = REPARAR_FACTURADAS_POR_ERROR(); break;
       case 'orders.autoRun':      out = apiOrdersAutoRun(user); break;
       case 'oncity.invoices':     out = apiOncityInvoices(user, p); break;
       case 'skus.list':          out = apiSkusList(p.q || ''); break;
@@ -3338,10 +3339,12 @@ function _marcarFacturadaEnHistorial(orderId, nro, fecha) {
 
     var fila = i + 2;
     if (String(sheet.getRange(fila, cNro + 1).getValue()).trim()) return false;  // ya estaba
+    // OJO: solo se completa el número y la fecha. NO se toca estado_facturacion,
+    // porque "facturada" quiere decir "ya exportada al marketplace" y la
+    // exportación saltea esas filas: si la marcáramos acá, la orden nunca
+    // llegaría al archivo de Frávega y su URL se perdería.
     sheet.getRange(fila, cNro + 1).setValue(nro);
-    if (cEstado !== -1) sheet.getRange(fila, cEstado + 1).setValue('facturada');
     if (cFecha !== -1 && fecha) sheet.getRange(fila, cFecha + 1).setValue(fecha);
-    if (cEn !== -1) sheet.getRange(fila, cEn + 1).setValue(_now());
     return true;
   }
   return false;
@@ -3403,12 +3406,11 @@ function _completarHistorial(quien) {
     if (i === undefined) { res.sin_orden++; return; }
 
     if (String(datos[i][cNro]).trim()) return;       // ya estaba cargada
+    // Igual que arriba: solo número y fecha, nunca el estado.
     datos[i][cNro] = nro;
-    if (cEstado !== -1) datos[i][cEstado] = 'facturada';
     if (cFecha !== -1 && !String(datos[i][cFecha]).trim()) {
       datos[i][cFecha] = _soloFecha(r.fecha_hora);
     }
-    if (cEn !== -1) datos[i][cEn] = ts;
     res.completadas++;
   });
 
@@ -3433,6 +3435,89 @@ function _lindaFactura(v) {
   var d = m[2];
   var num = d.slice(-8), pv = d.slice(0, d.length - 8);
   return (m[1] ? m[1] + ' ' : '') + pv + '-' + num;
+}
+
+/**
+ * REPARACIÓN — órdenes que quedaron marcadas "facturada" sin haberse exportado.
+ *
+ * Las versiones 2026-08-25.23 y .24 tenían un error: cuando llegaba el aviso de
+ * Tango, la orden se marcaba como "facturada" en OrdenesEnviadas. Pero para la
+ * exportación "facturada" significa "ya la mandé al marketplace", así que esas
+ * órdenes quedaban excluidas del archivo de Frávega/OnCity y su URL nunca se
+ * cargaba.
+ *
+ * Esta función devuelve al estado "pendiente" las órdenes que se marcaron así
+ * por error. Reconoce el caso porque son órdenes cuya factura figura en
+ * FacturasPDF (o sea, la puso el webhook) y que nunca salieron en un archivo.
+ * Es idempotente y se puede correr sin miedo: si una orden ya se exportó de
+ * verdad, no la toca.
+ */
+function REPARAR_FACTURADAS_POR_ERROR(desdeFecha) {
+  // El error se introdujo el 2026-08-25: solo se revisan las marcas de ese día
+  // en adelante. Las anteriores las puso una exportación real y no se tocan.
+  var corte = _soloFecha(desdeFecha) || '2026-08-25';
+  var sheet = _sheet(SH.SENT);
+  var last = sheet.getLastRow();
+  var res = { revisadas: 0, reparadas: 0, ordenes: [] };
+  if (last < 2) return res;
+
+  // Todo lo que ya salió en un archivo de exportación, según el historial.
+  // (Las exportaciones viejas no guardaban esta lista; por eso además filtramos
+  // por fecha más abajo.)
+  var exportadas = {};
+  try {
+    _readRows(SH.INVOICES, 500).forEach(function (h) {
+      var d = {};
+      try { d = JSON.parse(h.detalle_json || '{}'); } catch (e) { return; }
+      (d.ordenes || []).forEach(function (o) { exportadas[String(o).trim()] = true; });
+    });
+  } catch (e) { /* sin historial, tratamos todo como no exportado */ }
+
+  // Las facturas que puso el webhook: son la huella del error.
+  var delWebhook = {};
+  try {
+    _sheetPdfs();
+    _readRows(SH.PDFS, 5000).forEach(function (fp) {
+      var o = String(fp.order_id || '').trim();
+      if (o && String(fp.nro_factura || '').trim()) {
+        delWebhook[o] = true;
+        delWebhook[_sinPrefijo(o, 'FVG-')] = true;
+      }
+    });
+  } catch (e) { return res; }
+
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+                  .map(function (h) { return String(h).trim(); });
+  var cOrden = headers.indexOf('order_id');
+  var cEstado = headers.indexOf('estado_facturacion');
+  var cEn = headers.indexOf('facturada_en');
+  if (cOrden === -1 || cEstado === -1) return res;
+
+  var ancho = sheet.getLastColumn();
+  var datos = sheet.getRange(2, 1, last - 1, ancho).getValues();
+  res.corte = corte;
+
+  datos.forEach(function (fila) {
+    if (String(fila[cEstado] || '').toLowerCase() !== 'facturada') return;
+    var o = String(fila[cOrden]).trim();
+    res.revisadas++;
+    if (!delWebhook[o]) return;        // no la tocó el webhook: la marcó una exportación
+    if (exportadas[o]) return;         // salió en un archivo de verdad: se respeta
+    // Solo las marcadas a partir del día del error.
+    var cuando = cEn !== -1 ? _soloFecha(fila[cEn]) : '';
+    if (cuando && cuando < corte) return;
+    fila[cEstado] = 'pendiente';
+    if (cEn !== -1) fila[cEn] = '';
+    res.reparadas++;
+    res.ordenes.push(o);
+  });
+
+  if (res.reparadas) {
+    sheet.getRange(2, 1, datos.length, ancho).setValues(datos);
+    log_('reparacion', 'facturas', 'Órdenes desmarcadas (bug .23/.24)', 'ok',
+         'reparadas=' + res.reparadas + ' · ' + res.ordenes.slice(0, 20).join(', '));
+  }
+  return res;
 }
 
 /* ── Buscador de Facturas ──────────────────────────────────────────────── */
@@ -3896,7 +3981,7 @@ function _matchearFacturas(facturasRows, canal) {
   var facturas = facturasRows.slice().sort(function (a, b) {
     return String(a['N_COMP']).localeCompare(String(b['N_COMP']));
   });
-  var usadas = {}, porDoc = {}, porNombre = {};
+  var usadas = {}, porDoc = {}, porNombre = {}, porNumero = {};
   facturas.forEach(function (f, i) {
     f.__i = i;
     f.__imp = colImp ? _aNumero(f[colImp]) : NaN;
@@ -3905,7 +3990,23 @@ function _matchearFacturas(facturasRows, canal) {
       if (d) (porDoc[d] = porDoc[d] || []).push(f);
     }
     (porNombre[_normKey(f['RAZON_SOCI'])] = porNombre[_normKey(f['RAZON_SOCI'])] || []).push(f);
+    // Por número de comprobante: es el cruce EXACTO, el único que no adivina.
+    var n = _normFactura(f['N_COMP']);
+    if (n) (porNumero[n] = porNumero[n] || []).push(f);
   });
+
+  // Qué factura le corresponde a cada orden, según lo que nos dijo Tango por el
+  // webhook / la API. Esto es un dato, no una hipótesis: mientras exista, no
+  // hace falta cruzar por nombre ni por documento.
+  var registro = {};
+  try {
+    _sheetPdfs();
+    _readRows(SH.PDFS, 5000).forEach(function (fp) {
+      var n = _normFactura(fp.nro_factura);
+      var o = String(fp.order_id || '').trim();
+      if (n && o) { registro[o] = n; registro[_sinPrefijo(o, 'FVG-')] = n; }
+    });
+  } catch (e) { /* si la hoja no existe todavía, seguimos con las heurísticas */ }
 
   function tomar(lista, importe) {
     if (!lista) return null;
@@ -3923,7 +4024,7 @@ function _matchearFacturas(facturasRows, canal) {
   }
 
   var asignaciones = {}, sinFactura = [];
-  var conteo = { doc_importe: 0, doc: 0, nombre_importe: 0, nombre: 0 };
+  var conteo = { tango: 0, doc_importe: 0, doc: 0, nombre_importe: 0, nombre: 0 };
   var ts = _now();
   var cambios = false;
 
@@ -3938,12 +4039,25 @@ function _matchearFacturas(facturasRows, canal) {
     if (!orden) continue;
     var cliente = String(fila[col.cliente] || '').trim();
     var doc = _soloDigitos(fila[col.documento]);
-    if (!cliente && !doc) continue;   // fila vieja sin datos: no se puede matchear
     var importe = _aNumero(fila[col.total]);
     var nk = cliente ? _normKey(cliente) : '';
 
     var f = null, via = '';
-    if (doc && colImp && !isNaN(importe)) { f = tomar(porDoc[doc], importe); if (f) { via = 'doc_importe'; } }
+
+    // 1) Cruce exacto: si Tango ya nos dijo qué factura es de esta orden, la
+    //    buscamos por número. No depende de que el reporte traiga el documento
+    //    ni de que el nombre esté escrito igual.
+    var nroConocido = String(fila[col.nro_factura] || '').trim() ||
+                      registro[orden] || registro[_sinPrefijo(orden, 'FVG-')] || '';
+    if (nroConocido) {
+      f = tomar(porNumero[_normFactura(nroConocido)], null);
+      if (f) via = 'tango';
+    }
+
+    // 2) Si no, las heurísticas de siempre. Para eso sí hacen falta los datos
+    //    del cliente: una fila vieja sin nombre ni documento no se puede cruzar.
+    if (!f && !cliente && !doc) continue;
+    if (!f && doc && colImp && !isNaN(importe)) { f = tomar(porDoc[doc], importe); if (f) { via = 'doc_importe'; } }
     if (!f && doc) { f = tomar(porDoc[doc], null); if (f) via = 'doc'; }
     if (!f && nk && colImp && !isNaN(importe)) { f = tomar(porNombre[nk], importe); if (f) via = 'nombre_importe'; }
     if (!f && nk) { f = tomar(porNombre[nk], null); if (f) via = 'nombre'; }
@@ -4014,7 +4128,8 @@ function apiInvoicesFromHistory(user, facturasRows) {
 
   _appendRow(SH.INVOICES, [_now(), user.email, xls.archivo, filas.length,
                            m.sin_factura.length, m.sobrantes.length,
-                           JSON.stringify({ sin_factura: m.sin_factura,
+                           JSON.stringify({ ordenes: Object.keys(m.asignaciones),
+                                            sin_factura: m.sin_factura,
                                             sobrantes: m.sobrantes, conteo: m.conteo })]);
   log_(user.email, 'facturas', 'Exportación Frávega (desde el historial)', 'ok',
        'cargadas=' + filas.length + ' ' + JSON.stringify(m.conteo) +
@@ -4082,7 +4197,8 @@ function apiOncityInvoices(user, p) {
 
   _appendRow(SH.INVOICES, [_now(), user.email, nombre, completadas,
                            sinMatch.length, m.sobrantes.length,
-                           JSON.stringify({ sin_match_en_plantilla: sinMatch,
+                           JSON.stringify({ ordenes: Object.keys(m.asignaciones),
+                                            sin_match_en_plantilla: sinMatch,
                                             sin_factura_en_historial: m.sin_factura,
                                             sobrantes: m.sobrantes, conteo: m.conteo })]);
   log_(user.email, 'facturas', 'Exportación OnCity (plantilla completada)', 'ok',
