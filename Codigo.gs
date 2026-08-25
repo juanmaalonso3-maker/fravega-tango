@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-25.15';
+var APP_VERSION = '2026-08-25.16';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -2618,8 +2618,8 @@ function _procesarWebhook(req, e) {
   var esperado = getConfig('webhook_secret');
   var recibido = (e && e.parameter && (e.parameter.wh || e.parameter.secret)) || '';
   if (esperado && recibido !== esperado) {
-    _appendRow(SH.WEBHOOKS, [_now(), topic, resource, String(message || ''),
-                             'rechazado', 'secreto inválido', raw.slice(0, 2000)]);
+    _sheetWebhooks().appendRow([_now(), topic, resource, String(message || ''),
+                                'rechazado', 'secreto inválido', raw.slice(0, 2000)]);
     return { ok: false, error: 'no autorizado' };
   }
 
@@ -2649,9 +2649,9 @@ function _procesarWebhook(req, e) {
     detalle = String(err && err.message ? err.message : err);
   }
 
-  _appendRow(SH.WEBHOOKS, [_now(), topic, resource,
-                           String(message === undefined ? '' : message).slice(0, 500),
-                           resultado, detalle, raw.slice(0, 4000)]);
+  _sheetWebhooks().appendRow([_now(), topic, resource,
+                              String(message === undefined ? '' : message).slice(0, 500),
+                              resultado, detalle, raw.slice(0, 4000)]);
   return { ok: true };
 }
 
@@ -2976,7 +2976,7 @@ function _buscarBase64(obj) {
 
 /** Alta o actualización de una fila en FacturasPDF. */
 function _registrarFactura(f) {
-  var sheet = _sheet(SH.PDFS);
+  var sheet = _sheetPdfs();
   var nro = _normFactura(f.nro_factura);
   var oid = String(f.order_id || '').trim();
   var last = sheet.getLastRow();
@@ -3007,6 +3007,7 @@ function _registrarFactura(f) {
 /** { nroFacturaNormalizado: url } y { orderId: url } para completar los archivos. */
 function _indicePdfs() {
   var porFactura = {}, porOrden = {};
+  _sheetPdfs();
   _readRows(SH.PDFS, 5000).forEach(function (r) {
     var url = String(r.url || '').trim();
     if (!url) return;
@@ -3027,12 +3028,23 @@ function apiWebhookInfo() {
     secret = Utilities.getUuid().replace(/-/g, '');
     setConfig('webhook_secret', secret);
   }
+  _sheetWebhooks(); _sheetPdfs();
   var eventos = _readRows(SH.WEBHOOKS, 25).reverse();
   var pdfs = _readRows(SH.PDFS, 2000);
   var conUrl = pdfs.filter(function (r) { return String(r.url || '').trim(); }).length;
 
+  var base = '';
+  try { base = ScriptApp.getService().getUrl(); } catch (e) { base = ''; }
   return {
-    url: ScriptApp.getService().getUrl() + '?wh=' + secret,
+    url: base ? base + '?wh=' + secret : '',
+    base: base,
+    // La URL /dev es la de pruebas y exige estar logueado: Tango no puede usarla.
+    aviso_url: !base ? 'No se pudo obtener la URL de la app. Copiala de Implementar → ' +
+                       'Administrar implementaciones (la que termina en /exec) y agregale ' +
+                       '?wh=' + secret
+             : (base.indexOf('/dev') !== -1
+                ? 'Ojo: esta es la URL de prueba (/dev) y requiere estar logueado. ' +
+                  'Usá la de la implementación, que termina en /exec.' : ''),
     secret: secret,
     carpeta: getConfig('pdf_folder_id')
       ? 'https://drive.google.com/drive/folders/' + getConfig('pdf_folder_id') : '',
@@ -3046,6 +3058,7 @@ function apiWebhookInfo() {
 
 /** Facturas registradas, para revisar el estado de los PDF. */
 function apiPdfsList(q) {
+  _sheetPdfs();
   var rows = _readRows(SH.PDFS, 2000).reverse();
   q = String(q || '').toLowerCase();
   if (q) {
@@ -4320,6 +4333,27 @@ function apiOncityTest() {
 }
 
 /* ═══════════════ HELPERS DE SHEETS ═══════════════ */
+
+/**
+ * Devuelve la hoja y la CREA si no existe.
+ * Se usa para las pestañas que se agregaron después de la instalación: que
+ * falte una hoja nueva no debería romper una pantalla ni, peor, hacer que se
+ * pierda una notificación de Tango.
+ */
+function _sheetAuto(name, cols) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var s = ss.getSheetByName(name);
+  if (!s) {
+    s = ss.insertSheet(name);
+    s.getRange(1, 1, 1, cols.length).setValues([cols]).setFontWeight('bold');
+    s.setFrozenRows(1);
+    log_('sistema', 'sistema', 'Pestaña creada: ' + name, 'ok', '');
+  }
+  return s;
+}
+
+function _sheetPdfs() { return _sheetAuto(SH.PDFS, COLS_PDFS); }
+function _sheetWebhooks() { return _sheetAuto(SH.WEBHOOKS, COLS_WEBHOOKS); }
 
 function _sheet(name) {
   var s = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);

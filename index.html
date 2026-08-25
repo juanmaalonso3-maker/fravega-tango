@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-25.15";
+const APP_VERSION = "2026-08-25.16";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -1385,6 +1385,7 @@ async function viewPdfs() {
     <td class="text-xs text-gray-600 max-w-md truncate" title="${esc(e.detalle)}">${esc(e.detalle)}</td>
   </tr>`).join("");
 
+  const a = i;
   setMain(H("PDF de Facturas") + `
     ${card(`
       <div class="text-sm text-gray-600 mb-3">
@@ -1394,6 +1395,12 @@ async function viewPdfs() {
         <b>"Url de la factura"</b> de los archivos de Frávega y OnCity.
       </div>
       <div class="text-xs text-gray-500 uppercase mb-1">Pegá esta URL en Tango</div>
+      <div class="text-xs bg-amber-50 border border-amber-200 text-amber-900 rounded-lg px-3 py-2 mb-2">
+        ⚠️ <b>No es la dirección de esta página.</b> Es la del Apps Script: empieza con
+        <code>https://script.google.com/macros/s/…</code> y termina en <code>/exec?wh=…</code>.
+        Si pegás la de GitHub Pages, Tango no va a poder entregar nada.
+      </div>
+      ${a && a.aviso_url ? `<div class="text-xs bg-red-50 border border-red-200 text-red-800 rounded-lg px-3 py-2 mb-2">${esc(a.aviso_url)}</div>` : ""}
       <div class="flex gap-2 items-center mb-2">
         <input id="wh-url" readonly value="${esc(i.url)}"
           class="border rounded-lg px-3 py-2 w-full text-xs font-mono bg-gray-50">
