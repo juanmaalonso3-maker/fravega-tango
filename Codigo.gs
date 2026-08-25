@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-25.27';
+var APP_VERSION = '2026-08-26.01';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -100,11 +100,15 @@ var SH = {
   INVOICES: 'HistorialFacturas',
   SENT: 'OrdenesEnviadas',
   WEBHOOKS: 'Webhooks',
-  PDFS: 'FacturasPDF'
+  PDFS: 'FacturasPDF',
+  NOTIF: 'NotifVtex'
 };
 
 var COLS_WEBHOOKS = ['fecha_hora', 'topic', 'resource', 'message',
                      'resultado', 'detalle', 'raw'];
+var COLS_NOTIF = ['fecha_hora', 'canal', 'order_id', 'order_id_vtex', 'nro_factura',
+                  'estado_vtex', 'estado', 'http', 'detalle', 'enviado'];
+
 var COLS_PDFS = ['nro_factura', 'order_id', 'url', 'archivo_id',
                  'fecha_hora', 'origen', 'detalle', 'vence'];
 
@@ -118,7 +122,7 @@ var COLS_PDFS = ['nro_factura', 'order_id', 'url', 'archivo_id',
 var COLS_SENT = ['order_id', 'suborder_id', 'fecha_hora', 'fecha_compra',
                  'cliente', 'documento', 'cuil', 'email', 'total', 'items',
                  'origen', 'estado_facturacion', 'nro_factura', 'fecha_factura',
-                 'facturada_en', 'canal'];
+                 'facturada_en', 'canal', 'vtex_notificada'];
 
 var DEFAULT_CONFIG = [
   ['stock_warehouse_code', '04', 'Depósito de Tango para el stock'],
@@ -210,6 +214,14 @@ var DEFAULT_CONFIG = [
   ['pdf_dias_sync', '30', 'Días hacia atrás al sincronizar comprobantes'],
   ['webhook_solo_nuestras', '1', 'Procesar solo los avisos de pedidos que mandó esta app'],
   ['webhook_talonarios', '', 'Talonarios de Frávega/OnCity, separados por coma (vacío = todos). Ej: 00007,00008'],
+  // ── Informar la factura al marketplace (VTEX) ───────────────────────────
+  ['vtex_invoice_enabled', '0', 'Informar automáticamente las facturas a VTEX (Frávega y OnCity)'],
+  ['vtex_invoice_dry_run', '1', 'Simulación: arma el envío y lo registra, pero NO lo manda'],
+  ['vtex_invoice_canales', 'fravega,oncity', 'Canales a los que informar (separados por coma)'],
+  ['vtex_invoice_max', '40', 'Máximo de facturas a informar por corrida'],
+  ['vtex_invoice_pausa_ms', '400', 'Pausa entre llamadas a VTEX (ms)'],
+  ['vtex_invoice_valor', 'orden', 'Importe informado: orden (el total de VTEX) o tango (el de la factura)'],
+  ['vtex_invoice_al_vuelo', '1', 'Informar apenas llega el aviso de Tango (si no, solo en las corridas)'],
   ['invoices_match_importe', '1', 'Usar también el importe para matchear facturas'],
   ['invoices_tolerancia_importe', '1', 'Diferencia máxima de importe aceptada (en pesos)'],
   ['invoices_origen', 'historial', 'De dónde salen las órdenes a facturar: historial | csv'],
@@ -254,6 +266,7 @@ function SETUP() {
   _ensureSheet(ss, SH.SENT, COLS_SENT);
   _ensureSheet(ss, SH.WEBHOOKS, COLS_WEBHOOKS);
   _ensureSheet(ss, SH.PDFS, COLS_PDFS);
+  _ensureSheet(ss, SH.NOTIF, COLS_NOTIF);
 
   // Config por defecto (solo claves faltantes)
   var cfgSheet = ss.getSheetByName(SH.CONFIG);
@@ -497,6 +510,9 @@ function doPost(e) {
       case 'pdfs.talonarios':     out = apiTalonariosSugeridos(p); break;
       case 'facturas.reintentar': out = apiFacturasReintentar(user); break;
       case 'facturas.reparar':    out = REPARAR_FACTURADAS_POR_ERROR(); break;
+      case 'vtexinv.run':         out = apiVtexInvoicesRun(user, p); break;
+      case 'vtexinv.log':         out = apiVtexInvoicesLog(p); break;
+      case 'vtexinv.pendientes':  out = apiVtexInvoicesPendientes(); break;
       case 'orders.autoRun':      out = apiOrdersAutoRun(user); break;
       case 'oncity.invoices':     out = apiOncityInvoices(user, p); break;
       case 'skus.list':          out = apiSkusList(p.q || ''); break;
@@ -2486,6 +2502,15 @@ function runOrdersImport(disparadaPor) {
         res.facturas = _reintentarFacturas(disparadaPor);
         res.facturas.historial = _completarHistorial(disparadaPor);
       } catch (e2) { res.errores.push('Reintento de facturas: ' + e2.message); }
+
+      // Y por último, las facturas que haya que informar al marketplace.
+      try {
+        res.vtex_facturas = notificarFacturasAVtex(disparadaPor,
+                              { deadline: t0 + 5.2 * 60 * 1000 });
+        if (res.vtex_facturas.fallidas) {
+          res.errores = res.errores.concat(res.vtex_facturas.errores);
+        }
+      } catch (e3) { res.errores.push('Informar facturas a VTEX: ' + e3.message); }
     }
 
     _avisarCorrida(cfg, res);
@@ -2657,6 +2682,7 @@ function _procesarWebhook(req, e) {
       var r = _guardarPdfDeWebhook(req, resource, message);
       resultado = r.ok ? 'pdf guardado' : 'sin pdf';
       detalle = r.detalle;
+      if (r.ok) detalle += _informarAlMarketplace(resource);
     } else if (topic === 'OrderBilled') {
       // El aviso viene sin número de factura (Message llega vacío), así que no
       // sirve de nada leer el payload: le preguntamos a /Invoices, que además
@@ -2665,7 +2691,8 @@ function _procesarWebhook(req, e) {
       var rb = _guardarPdfDeWebhook(req, resource, message);
       if (rb.ok) {
         resultado = 'ok';
-        detalle = 'orden ' + resource + ' → ' + rb.detalle;
+        detalle = 'orden ' + resource + ' → ' + rb.detalle +
+                  _informarAlMarketplace(resource);
       } else {
         var nro = _buscarNroFactura(req);   // por si algún día viene en el aviso
         if (nro) {
@@ -2791,7 +2818,7 @@ function _procesarComprobante(item, forzar, esNuestra) {
     if (yaTengo) {
       // Aunque el PDF ya lo tuviéramos, la orden puede seguir figurando "sin
       // facturar" en OrdenesEnviadas: aprovechamos para completarla.
-      _marcarFacturadaEnHistorial(oid, item.InvoiceNumber, _fechaComprobante(item));
+      _marcarFacturadaEnHistorial(oid, item.InvoiceNumber, _fechaComprobante(item, esNuestra));
       return { estado: 'ya_estaba', nro: nro, orden: oid, url: yaTengo };
     }
   }
@@ -2810,7 +2837,7 @@ function _procesarComprobante(item, forzar, esNuestra) {
       detalle: item.InvoiceType + ' ' + item.InvoiceNumber +
                ' · link de Tango (no se copió a Drive)'
     });
-    _marcarFacturadaEnHistorial(oid, item.InvoiceNumber, _fechaComprobante(item));
+    _marcarFacturadaEnHistorial(oid, item.InvoiceNumber, _fechaComprobante(item, esNuestra));
     // OJO: acá NO se copia nada a Drive. Se anota en la planilla el link que
     // da Tango, que es el que después se informa al marketplace.
     return { estado: 'anotado (link de Tango)', nro: nro, orden: oid,
@@ -2827,7 +2854,7 @@ function _procesarComprobante(item, forzar, esNuestra) {
     detalle: item.InvoiceType + ' ' + item.InvoiceNumber +
              (vence ? ' · la URL de Tango vencía el ' + vence : '')
   });
-  _marcarFacturadaEnHistorial(oid, item.InvoiceNumber, _fechaComprobante(item));
+  _marcarFacturadaEnHistorial(oid, item.InvoiceNumber, _fechaComprobante(item, esNuestra));
   return { estado: 'copiado a Drive', nro: nro, orden: oid, url: g.url,
            destino: 'drive' };
 }
@@ -2859,9 +2886,24 @@ function _talonarioNuestro(item) {
   return false;
 }
 
-/** La fecha del comprobante, venga con el nombre que venga, como dd/MM/yyyy. */
-function _fechaComprobante(item) {
-  var v = item.InvoiceDate || item.Date || item.EmissionDate || item.CreationDate || '';
+/**
+ * La fecha de emisión del comprobante, en dd/MM/yyyy.
+ *
+ * OJO: /Invoices NO publica la fecha de la factura. Lo comprobamos mirando
+ * todos los campos que devuelve: el único con forma de fecha es `OrderDate`,
+ * que es la fecha del PEDIDO, no la de emisión, y difiere cuando facturás al
+ * día siguiente.
+ *
+ * Por eso el orden de preferencia es:
+ *   1. `ahora` — cuando el comprobante llega por el aviso de Tango, que se
+ *      dispara en el momento de facturar: esa ES la fecha de emisión.
+ *   2. Un campo con nombre de fecha de emisión, por si algún día lo agregan.
+ *   3. Nada. Preferimos vacío antes que poner una fecha equivocada; el cruce
+ *      contra el reporte de Tango (que sí trae FECHA_EMI) la completa después.
+ */
+function _fechaComprobante(item, ahora) {
+  if (ahora) return Utilities.formatDate(new Date(), TZ_AR, 'dd/MM/yyyy');
+  var v = item.InvoiceDate || item.EmissionDate || item.IssuanceDate || '';
   var s = String(v).trim();
   if (!s) return '';
   var m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
@@ -4224,6 +4266,440 @@ function apiOncityInvoices(user, p) {
   };
 }
 
+/* ═══════════════ NOTIFICACIÓN DE FACTURAS A VTEX ═══════════════
+ *
+ * Cierra el círculo: vos facturás en Tango y la factura viaja sola al
+ * marketplace. Frávega y OnCity corren sobre VTEX, así que es el mismo
+ * endpoint para los dos, cambiando la cuenta y las credenciales.
+ *
+ *   POST /api/oms/pvt/orders/{orderId}/invoice
+ *   { type, issuanceDate, invoiceNumber, invoiceValue, invoiceUrl,
+ *     invoiceKey, courier, trackingNumber, trackingUrl, items[] }
+ *
+ * Tres cosas que aprendimos y que están codificadas acá:
+ *   · invoiceValue y los precios de items van en CENTAVOS.
+ *   · El pedido tiene que estar en "handling". Si está en ready-for-handling
+ *     hay que llamar antes a /start-handling.
+ *   · Los items hay que mandarlos con el id de VTEX, no con el SKU de Tango.
+ *     Por eso se leen del propio pedido en vez de reconstruirlos.
+ */
+
+/** Estados de VTEX en los que el pedido acepta que le carguemos la factura. */
+var VTEX_ESTADOS_FACTURABLES = ['handling', 'ready-for-handling'];
+
+/** Como _vtexFetch pero permitiendo mandar cuerpo JSON. */
+function _vtexPost(path, canal, cuerpo, metodo) {
+  var h = _vtexHeaders(canal);
+  h['Content-Type'] = 'application/json';
+  return UrlFetchApp.fetch(_vtexBase(canal) + path, {
+    method: metodo || 'post',
+    headers: h,
+    payload: JSON.stringify(cuerpo || {}),
+    muteHttpExceptions: true,
+    followRedirects: true
+  });
+}
+
+/** El identificador que espera VTEX: el nuestro con el prefijo puesto de nuevo. */
+function _idVtex(canal, orderId, cfg) {
+  var c = _cfgCanal(cfg || _configMap(), canal);
+  var id = String(orderId || '').trim();
+  var pref = String(c.quitar_prefijo || '');
+  if (pref && id.toUpperCase().indexOf(pref.toUpperCase()) !== 0) id = pref + id;
+  return id;
+}
+
+/** issuanceDate en el formato que pide VTEX, con el huso de Argentina. */
+function _fechaVtex(ddmmyyyy) {
+  var d = new Date();
+  var m = String(ddmmyyyy || '').match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (m) {
+    // Mantenemos la hora actual: VTEX rechaza fechas futuras, y una factura
+    // del día de hoy con hora 00:00 puede quedar antes de la creación del pedido.
+    d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]),
+                 d.getHours(), d.getMinutes(), d.getSeconds());
+  }
+  return Utilities.formatDate(d, TZ_AR, "yyyy-MM-dd'T'HH:mm:ssZ");
+}
+
+/**
+ * Notifica UNA factura a VTEX.
+ *
+ * Devuelve siempre un objeto con el detalle de lo que pasó — nunca lanza —
+ * para que el que llama pueda registrarlo y seguir con las demás.
+ */
+function _vtexNotificarFactura(canal, orderId, factura, cfg) {
+  cfg = cfg || _configMap();
+  var res = { canal: canal, orden: orderId, nro_factura: factura.nro_factura,
+              ok: false, estado: '', http: 0, detalle: '' };
+
+  var idv = _idVtex(canal, orderId, cfg);
+  res.orden_vtex = idv;
+
+  // ── 1. ¿En qué estado está el pedido? ─────────────────────────────────
+  var det;
+  try {
+    det = vtexOrderDetail(canal, idv);
+  } catch (e) {
+    res.estado = 'no_existe';
+    res.detalle = 'No se pudo leer el pedido en VTEX: ' + e.message;
+    return res;
+  }
+
+  var status = String(det.status || '');
+  res.estado_vtex = status;
+
+  if (status === 'invoiced') {
+    res.ok = true; res.estado = 'ya_facturada';
+    res.detalle = 'VTEX ya la tiene facturada. No hace falta hacer nada.';
+    return res;
+  }
+  if (status === 'canceled') {
+    res.estado = 'cancelada';
+    res.detalle = 'El pedido está cancelado en VTEX: no se le puede cargar factura.';
+    return res;
+  }
+  if (VTEX_ESTADOS_FACTURABLES.indexOf(status) === -1) {
+    res.estado = 'estado_incorrecto';
+    res.detalle = 'El pedido está en "' + status + '" y VTEX solo acepta la factura ' +
+                  'en ' + VTEX_ESTADOS_FACTURABLES.join(' o ') + '. Queda pendiente ' +
+                  'y se reintenta.';
+    return res;
+  }
+
+  // ── 2. Si está en ready-for-handling, hay que arrancarlo ──────────────
+  if (status === 'ready-for-handling') {
+    var rh = _vtexPost('/api/oms/pvt/orders/' + encodeURIComponent(idv) + '/start-handling',
+                       canal, {});
+    var ch = rh.getResponseCode();
+    if (ch >= 200 && ch < 300) {
+      res.detalle += 'Se pasó a handling. ';
+      Utilities.sleep(1500);
+    } else {
+      res.estado = 'no_se_pudo_iniciar';
+      res.detalle = 'start-handling devolvió HTTP ' + ch + ': ' +
+                    rh.getContentText().slice(0, 200);
+      return res;
+    }
+  }
+
+  // ── 3. Armar el cuerpo ────────────────────────────────────────────────
+  // Los items salen del propio pedido: así los id y los precios son
+  // exactamente los que VTEX conoce y no hay que traducir nada.
+  var items = (det.items || []).map(function (it) {
+    return { id: String(it.id), price: Number(it.price) || 0,
+             quantity: Number(it.quantity) || 0 };
+  });
+  if (!items.length) {
+    res.estado = 'sin_items';
+    res.detalle = 'El pedido de VTEX no trae items.';
+    return res;
+  }
+
+  // El valor va en centavos. Por defecto usamos el total del pedido en VTEX,
+  // que es coherente con los items que mandamos.
+  var valor = Number(det.value) || 0;
+  if (String(_cfgVal(cfg, 'vtex_invoice_valor')) === 'tango') {
+    var t = parseFloat(String(factura.total || '').replace(',', '.'));
+    if (!isNaN(t) && t > 0) valor = Math.round(t * 100);
+  }
+
+  var cuerpo = {
+    type: 'Output',
+    issuanceDate: _fechaVtex(factura.fecha_factura),
+    invoiceNumber: String(factura.nro_factura || ''),
+    invoiceValue: valor,
+    invoiceUrl: factura.url || null,
+    invoiceKey: factura.cae || null,
+    courier: null,
+    trackingNumber: null,
+    trackingUrl: null,
+    items: items
+  };
+  res.enviado = cuerpo;
+
+  if (String(_cfgVal(cfg, 'vtex_invoice_dry_run')) === '1') {
+    res.estado = 'simulado';
+    res.detalle = 'Modo simulación: NO se envió. Cuerpo: ' + JSON.stringify(cuerpo).slice(0, 400);
+    return res;
+  }
+
+  // ── 4. Enviar ─────────────────────────────────────────────────────────
+  var r = _vtexPost('/api/oms/pvt/orders/' + encodeURIComponent(idv) + '/invoice',
+                    canal, cuerpo);
+  res.http = r.getResponseCode();
+  var txt = r.getContentText() || '';
+
+  if (res.http >= 200 && res.http < 300) {
+    res.ok = true;
+    res.estado = 'notificada';
+    res.detalle += 'VTEX aceptó la factura. ' + txt.slice(0, 200);
+    return res;
+  }
+
+  // VTEX contesta 400 y un mensaje si ya la tenía cargada.
+  if (res.http === 400 && /already|duplicat|exist/i.test(txt)) {
+    res.ok = true;
+    res.estado = 'ya_estaba';
+    res.detalle = 'VTEX dice que la factura ya estaba cargada: ' + txt.slice(0, 200);
+    return res;
+  }
+
+  res.estado = 'error';
+  res.detalle = 'HTTP ' + res.http + ': ' + txt.slice(0, 400);
+  return res;
+}
+
+/**
+ * Informa la factura al marketplace apenas Tango avisa que se emitió.
+ *
+ * Se hace acá para que el circuito sea inmediato, pero con red de contención:
+ * si algo falla —VTEX caído, el pedido todavía no está en handling— NO se
+ * rompe el webhook. La orden queda pendiente y el barrido de la corrida
+ * automática la reintenta. Por eso nunca lanza excepción.
+ */
+function _informarAlMarketplace(orderId) {
+  if (getConfig('vtex_invoice_enabled') !== '1') return '';
+  if (getConfig('vtex_invoice_al_vuelo') === '0') return '';
+  try {
+    var r = notificarFacturasAVtex('webhook', {
+      orden: String(orderId || '').trim(),
+      deadline: Date.now() + 45 * 1000
+    });
+    if (r.notificadas) return ' · informada al marketplace';
+    if (r.ya_estaban) return ' · el marketplace ya la tenía';
+    if (r.pendientes) return ' · el marketplace todavía no la acepta, se reintenta';
+    if (r.fallidas) return ' · NO se pudo informar al marketplace (ver NotifVtex)';
+    return '';
+  } catch (e) {
+    return ' · error al informar al marketplace: ' + String(e && e.message || e);
+  }
+}
+
+/* ── Orquestación: cola, reintentos y registro ─────────────────────────── */
+
+/**
+ * Recorre OrdenesEnviadas buscando facturas que todavía no se informaron al
+ * marketplace y las manda. Es el corazón de la automatización.
+ *
+ * Una orden entra si:
+ *   · tiene nro_factura cargado (o sea, ya se facturó en Tango), y
+ *   · no está marcada como notificada, y
+ *   · su canal tiene la notificación activada.
+ *
+ * Cada intento queda registrado en la hoja NotifVtex con el cuerpo enviado y
+ * la respuesta, para poder rastrear cualquier problema.
+ */
+function notificarFacturasAVtex(quien, opciones) {
+  opciones = opciones || {};
+  var cfg = _configMap();
+  var res = { revisadas: 0, notificadas: 0, ya_estaban: 0, fallidas: 0,
+              pendientes: 0, saltadas: 0, detalle: [], errores: [] };
+
+  if (String(_cfgVal(cfg, 'vtex_invoice_enabled')) !== '1' && !opciones.forzar) {
+    res.apagado = true;
+    res.mensaje = 'La notificación automática a VTEX está apagada ' +
+                  '(vtex_invoice_enabled = 0 en Configuración).';
+    return res;
+  }
+
+  var canalesOn = String(_cfgVal(cfg, 'vtex_invoice_canales') || 'fravega,oncity')
+    .split(',').map(function (x) { return x.trim().toLowerCase(); }).filter(String);
+
+  var sheet = _sheetAuto(SH.SENT, COLS_SENT);
+  var last = sheet.getLastRow();
+  if (last < 2) return res;
+
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+                  .map(function (h) { return String(h).trim(); });
+  var col = {}; headers.forEach(function (h, i) { col[h] = i; });
+  if (col.vtex_notificada === undefined) {
+    res.errores.push('Falta la columna vtex_notificada en OrdenesEnviadas. ' +
+                     'Ejecutá SETUP() o MIGRAR_ORDENES_API().');
+    return res;
+  }
+
+  var ancho = sheet.getLastColumn();
+  var datos = sheet.getRange(2, 1, last - 1, ancho).getValues();
+  var idx = _indicePdfs();
+  var tope = parseInt(_cfgVal(cfg, 'vtex_invoice_max'), 10) || 40;
+  var t0 = Date.now();
+  var limite = opciones.deadline || (t0 + 4 * 60 * 1000);
+  var hubo = false;
+
+  for (var i = 0; i < datos.length; i++) {
+    if (res.notificadas + res.fallidas >= tope) {
+      res.truncado = 'Se llegó al tope de ' + tope + ' por corrida.';
+      break;
+    }
+    if (Date.now() > limite) {
+      res.truncado = 'Se cortó por tiempo. Lo que falta entra en la próxima corrida.';
+      break;
+    }
+
+    var fila = datos[i];
+    var nro = String(fila[col.nro_factura] || '').trim();
+    if (!nro) continue;                                   // todavía no se facturó
+    var yaNotif = String(fila[col.vtex_notificada] || '').trim();
+    if (yaNotif) continue;                                // ya se informó
+
+    var orden = String(fila[col.order_id] || '').trim();
+    if (!orden) continue;
+    var canal = String(fila[col.canal] || '').trim().toLowerCase();
+    if (!canal) { res.saltadas++; continue; }             // filas viejas del CSV
+    if (canalesOn.indexOf(canal) === -1) { res.saltadas++; continue; }
+    if (opciones.canal && canal !== opciones.canal) continue;
+    if (opciones.orden && orden !== opciones.orden) continue;
+
+    res.revisadas++;
+
+    var factura = {
+      nro_factura: nro,
+      fecha_factura: String(fila[col.fecha_factura] || '').trim(),
+      total: fila[col.total],
+      url: idx.porFactura[_normFactura(nro)] || idx.porOrden[orden] || ''
+    };
+
+    var r;
+    try {
+      r = _vtexNotificarFactura(canal, orden, factura, cfg);
+    } catch (e) {
+      r = { canal: canal, orden: orden, nro_factura: nro, ok: false,
+            estado: 'excepcion', http: 0, detalle: String(e && e.message || e) };
+    }
+
+    _registrarNotifVtex(r);
+
+    if (r.ok) {
+      if (r.estado === 'ya_facturada' || r.estado === 'ya_estaba') res.ya_estaban++;
+      else res.notificadas++;
+      datos[i][col.vtex_notificada] = _now() + ' · ' + r.estado;
+      hubo = true;
+    } else if (r.estado === 'simulado') {
+      res.detalle.push(orden + ': simulado');
+    } else if (r.estado === 'estado_incorrecto') {
+      res.pendientes++;                                   // se reintenta solo
+      res.detalle.push(orden + ': ' + r.detalle);
+    } else {
+      res.fallidas++;
+      res.errores.push(_canal(canal).nombre + ' · ' + orden + ' (' + nro + '): ' + r.detalle);
+    }
+
+    var pausa = parseInt(_cfgVal(cfg, 'vtex_invoice_pausa_ms'), 10);
+    if (pausa > 0) Utilities.sleep(pausa);
+  }
+
+  if (hubo) sheet.getRange(2, 1, datos.length, ancho).setValues(datos);
+
+  if (res.revisadas) {
+    log_(quien || 'automatico', 'facturas', 'Facturas informadas a VTEX',
+         res.fallidas ? 'warning' : 'ok',
+         'revisadas=' + res.revisadas + ' notificadas=' + res.notificadas +
+         ' ya_estaban=' + res.ya_estaban + ' pendientes=' + res.pendientes +
+         ' fallidas=' + res.fallidas, Date.now() - t0);
+  }
+  return res;
+}
+
+/** Una fila por intento, con el cuerpo enviado y lo que contestó VTEX. */
+function _registrarNotifVtex(r) {
+  try {
+    var sheet = _sheetAuto(SH.NOTIF, COLS_NOTIF);
+    sheet.appendRow([
+      _now(), r.canal || '', r.orden || '', r.orden_vtex || '',
+      r.nro_factura || '', r.estado_vtex || '', r.estado || '',
+      r.http || '', String(r.detalle || '').slice(0, 900),
+      r.enviado ? JSON.stringify(r.enviado).slice(0, 2000) : ''
+    ]);
+  } catch (e) { /* que un fallo de registro no frene la notificación */ }
+}
+
+/** Desde la pantalla: correr el barrido a mano. */
+function apiVtexInvoicesRun(user, p) {
+  p = p || {};
+  var r = notificarFacturasAVtex(user.email, {
+    forzar: p.forzar === true || p.forzar === '1',
+    canal: String(p.canal || '').toLowerCase() || null,
+    orden: String(p.orden || '').trim() || null
+  });
+  if (r.fallidas) _avisarFallosVtex(r);
+  return r;
+}
+
+/** Las últimas filas del registro, para la pantalla. */
+function apiVtexInvoicesLog(p) {
+  p = p || {};
+  _sheetAuto(SH.NOTIF, COLS_NOTIF);
+  var rows = _readRows(SH.NOTIF, 500).reverse();
+  var q = String(p.q || '').toLowerCase();
+  if (q) {
+    rows = rows.filter(function (r) {
+      return (String(r.order_id) + String(r.nro_factura) + String(r.estado) +
+              String(r.detalle)).toLowerCase().indexOf(q) !== -1;
+    });
+  }
+  if (p.solo_errores === true || p.solo_errores === '1') {
+    rows = rows.filter(function (r) {
+      var e = String(r.estado || '');
+      return e === 'error' || e === 'excepcion' || e === 'no_existe' ||
+             e === 'estado_incorrecto' || e === 'no_se_pudo_iniciar' || e === 'sin_items';
+    });
+  }
+  return rows.slice(0, 200);
+}
+
+/** Cuántas facturas están esperando que las informemos. */
+function apiVtexInvoicesPendientes() {
+  var cfg = _configMap();
+  var sheet = _sheetAuto(SH.SENT, COLS_SENT);
+  var last = sheet.getLastRow();
+  var out = { total: 0, por_canal: {}, filas: [],
+              activo: String(_cfgVal(cfg, 'vtex_invoice_enabled')) === '1',
+              dry_run: String(_cfgVal(cfg, 'vtex_invoice_dry_run')) === '1',
+              canales: _cfgVal(cfg, 'vtex_invoice_canales') };
+  if (last < 2) return out;
+
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+                  .map(function (h) { return String(h).trim(); });
+  var col = {}; headers.forEach(function (h, i) { col[h] = i; });
+  if (col.vtex_notificada === undefined) {
+    out.aviso = 'Falta la columna vtex_notificada. Ejecutá SETUP().';
+    return out;
+  }
+  var idx = _indicePdfs();
+  sheet.getRange(2, 1, last - 1, headers.length).getValues().forEach(function (fila) {
+    var nro = String(fila[col.nro_factura] || '').trim();
+    if (!nro) return;
+    if (String(fila[col.vtex_notificada] || '').trim()) return;
+    var canal = String(fila[col.canal] || '').trim().toLowerCase();
+    if (!canal) return;
+    out.total++;
+    out.por_canal[canal] = (out.por_canal[canal] || 0) + 1;
+    if (out.filas.length < 100) {
+      out.filas.push({
+        orden: String(fila[col.order_id] || ''), canal: canal, nro_factura: nro,
+        fecha_factura: String(fila[col.fecha_factura] || ''),
+        cliente: String(fila[col.cliente] || ''),
+        url: idx.porFactura[_normFactura(nro)] || idx.porOrden[String(fila[col.order_id] || '')] || ''
+      });
+    }
+  });
+  return out;
+}
+
+/** Aviso por mail cuando alguna factura no se pudo informar. */
+function _avisarFallosVtex(res) {
+  var para = getConfig('orders_auto_email');
+  if (!para || !res.errores.length) return;
+  var cuerpo = 'No se pudieron informar ' + res.fallidas + ' factura(s) al marketplace.\n\n' +
+    res.errores.slice(0, 30).join('\n\n') +
+    '\n\nQuedan pendientes y se reintentan solos en la próxima corrida.\n' +
+    'El detalle completo está en la pestaña NotifVtex de la planilla.';
+  try {
+    MailApp.sendEmail(para, 'Facturas que no se pudieron informar al marketplace', cuerpo);
+  } catch (e) { /* si falla el mail, ya quedó en el log */ }
+}
+
 /* ═══════════════ MÓDULO SKUs / PENDIENTES ═══════════════ */
 
 function _skuRelations() {
@@ -5107,7 +5583,7 @@ function _filaSent(id, reg, ts) {
           reg.cliente || '', reg.documento || '', reg.cuil || '', reg.email || '',
           (reg.total === undefined || reg.total === null) ? '' : reg.total,
           reg.items || '', reg.origen || 'csv', 'pendiente', '', '', '',
-          reg.canal || 'fravega'];
+          reg.canal || 'fravega', ''];
 }
 
 /**

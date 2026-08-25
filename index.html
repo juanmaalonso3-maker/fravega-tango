@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-25.27";
+const APP_VERSION = "2026-08-26.01";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -83,6 +83,7 @@ const VIEWS = [
   { id: "ordenes", label: "📦 Ingreso de Órdenes" },
   { id: "facturas", label: "🧾 Exportación de Facturas" },
   { id: "pdfs", label: "📄 PDF de Facturas" },
+  { id: "avtex", label: "📤 Aviso al Marketplace" },
   { id: "skus", label: "🔗 Relación de SKUs" },
   { id: "pendientes", label: "⚠️ SKU Pendientes" },
   { id: "logs", label: "📜 Logs" },
@@ -323,7 +324,7 @@ function route() {
   document.querySelectorAll(".nav-item").forEach((el) =>
     el.classList.toggle("active", el.dataset.view === view));
   const fn = { dashboard: viewDashboard, stock: viewStock, ordenes: viewOrdenes,
-               facturas: viewFacturas, pdfs: viewPdfs, skus: viewSkus,
+               facturas: viewFacturas, pdfs: viewPdfs, avtex: viewAvtex, skus: viewSkus,
                pendientes: viewPendientes, logs: viewLogs, config: viewConfig
              }[view] || viewDashboard;
   // Sin este try/catch, si una vista falla ANTES de dibujar, la pantalla se
@@ -1582,6 +1583,173 @@ async function viewPdfs() {
   cargarPdfs();
 }
 
+/* ═══════════════ AVISO AL MARKETPLACE ═══════════════ */
+
+function estadoNotifBadge(e) {
+  const v = String(e || "");
+  if (["notificada", "ya_estaba", "ya_facturada"].includes(v))
+    return `<span class="text-green-700">✔ ${esc(v)}</span>`;
+  if (["estado_incorrecto", "simulado", "pendiente"].includes(v))
+    return `<span class="text-amber-700">⏳ ${esc(v)}</span>`;
+  return `<span class="text-red-700">✖ ${esc(v)}</span>`;
+}
+
+async function viewAvtex() {
+  setMain(H("Aviso al Marketplace") + spinner("Consultando..."));
+  let p;
+  try { p = await api("vtexinv.pendientes"); }
+  catch (e) {
+    if (!stillOn("avtex")) return;
+    return setMain(H("Aviso al Marketplace") + card(`<p class="text-red-600">${esc(e.message)}</p>`));
+  }
+  if (!stillOn("avtex")) return;
+
+  const porCanal = Object.keys(p.por_canal || {})
+    .map((k) => `${esc(k)}: <b>${p.por_canal[k]}</b>`).join(" · ") || "—";
+
+  const estadoCartel = !p.activo
+    ? `<div class="text-sm bg-amber-50 border border-amber-200 text-amber-900 rounded-lg p-3 mb-3">
+         ⏸️ <b>Está apagado.</b> Para encenderlo, tildá
+         <code>vtex_invoice_enabled</code> en <a href="#config" class="underline">Configuración</a>.
+         <div class="text-xs mt-1">Mientras esté apagado no se manda nada, ni automático ni a mano.</div>
+       </div>`
+    : p.dry_run
+    ? `<div class="text-sm bg-blue-50 border border-blue-200 text-blue-900 rounded-lg p-3 mb-3">
+         🧪 <b>Modo simulación.</b> Se arma el envío y queda registrado, pero <b>no se manda a VTEX</b>.
+         Mirá abajo qué se enviaría; cuando estés conforme, destildá
+         <code>vtex_invoice_dry_run</code>.
+       </div>`
+    : `<div class="text-sm bg-green-50 border border-green-200 text-green-900 rounded-lg p-3 mb-3">
+         ✅ <b>Activo.</b> Las facturas se informan solas: apenas llega el aviso de Tango,
+         y de nuevo en cada corrida automática por si alguna quedó pendiente.
+       </div>`;
+
+  setMain(H("Aviso al Marketplace") + `
+    ${card(`
+      <div class="text-sm text-gray-600 mb-3">
+        Cuando facturás en Tango, la factura viaja sola a VTEX y queda cargada en
+        Frávega y OnCity. El único trabajo manual es facturar.
+        El envío usa <code>POST /api/oms/pvt/orders/{orden}/invoice</code> con el número,
+        el importe, la fecha y la URL del PDF.
+      </div>
+      ${estadoCartel}
+      <div class="flex gap-3 flex-wrap items-center">
+        <button onclick="correrAvtex()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
+          📤 Informar las pendientes ahora</button>
+        <button onclick="viewAvtex()" class="border px-4 py-2 rounded-lg text-sm">Actualizar</button>
+        <span class="text-sm text-gray-500 ml-auto">
+          Esperando ser informadas: <b class="${p.total ? "text-amber-700" : ""}">${p.total}</b>
+          &nbsp;·&nbsp; ${porCanal}</span>
+      </div>
+      ${p.aviso ? `<div class="text-xs text-red-700 mt-2">${esc(p.aviso)}</div>` : ""}`, "mb-4")}
+
+    ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Facturas esperando</div>
+      ${(p.filas || []).length ? `<table class="data w-full"><thead><tr>
+          <th>Orden</th><th>Canal</th><th>Cliente</th><th>Factura</th><th>Fecha</th><th>PDF</th>
+        </tr></thead><tbody>
+        ${p.filas.map((f) => `<tr>
+          <td class="font-mono text-xs">${esc(f.orden)}</td>
+          <td class="text-xs">${esc(f.canal)}</td>
+          <td class="text-xs max-w-[14rem] truncate" title="${esc(f.cliente)}">${esc(f.cliente)}</td>
+          <td class="font-mono text-xs">${esc(f.nro_factura)}</td>
+          <td class="text-xs text-gray-500">${esc(f.fecha_factura)}</td>
+          <td>${f.url ? `<a href="${esc(f.url)}" target="_blank" class="text-violet-700 underline text-xs">sí</a>`
+            : '<span class="text-amber-700 text-xs">falta</span>'}</td>
+        </tr>`).join("")}</tbody></table>`
+        : `<div class="text-sm text-gray-500">No hay ninguna esperando. Todo lo facturado
+             ya se informó al marketplace.</div>`}`, "mb-4")}
+
+    ${card(`<div class="flex items-center gap-3 mb-2 flex-wrap">
+        <div class="text-xs text-gray-500 uppercase">Registro de envíos</div>
+        <input id="av-q" placeholder="Buscar por orden, factura o error..."
+          class="border rounded-lg px-3 py-1.5 text-sm w-72"
+          onkeydown="if(event.key==='Enter')cargarAvtexLog()">
+        <label class="flex items-center gap-1.5 text-xs text-gray-600">
+          <input type="checkbox" id="av-err" class="w-4 h-4" onchange="cargarAvtexLog()">
+          Solo los que fallaron</label>
+        <button onclick="cargarAvtexLog()" class="border px-3 py-1.5 rounded-lg text-sm">Buscar</button>
+      </div>
+      <div class="text-xs text-gray-500 mb-2">Cada intento queda acá con lo que se mandó y lo
+        que contestó VTEX. Tocá una fila para ver el detalle completo.</div>
+      <div id="av-tabla">${spinner()}</div>`)}`);
+  cargarAvtexLog();
+}
+
+async function cargarAvtexLog() {
+  const cont = $("av-tabla");
+  if (!cont) return;
+  let rows;
+  try {
+    rows = await api("vtexinv.log", {
+      q: ($("av-q") || {}).value || "",
+      solo_errores: ($("av-err") || {}).checked ? "1" : ""
+    });
+  } catch (e) { cont.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
+  if (!$("av-tabla")) return;
+
+  window._AVLOG = rows;
+  cont.innerHTML = `<div class="overflow-x-auto"><table class="data w-full"><thead><tr>
+      <th>Fecha</th><th>Canal</th><th>Orden</th><th>Factura</th>
+      <th>Estado en VTEX</th><th>Resultado</th><th>HTTP</th><th>Detalle</th><th></th>
+    </tr></thead><tbody>
+    ${rows.map((r, n) => `<tr class="cursor-pointer" onclick="verAvtex(${n})">
+      <td class="text-xs whitespace-nowrap">${esc(r.fecha_hora)}</td>
+      <td class="text-xs">${esc(r.canal)}</td>
+      <td class="font-mono text-xs">${esc(r.order_id)}</td>
+      <td class="font-mono text-xs">${esc(r.nro_factura)}</td>
+      <td class="text-xs text-gray-600">${esc(r.estado_vtex)}</td>
+      <td class="text-xs">${estadoNotifBadge(r.estado)}</td>
+      <td class="text-xs">${esc(r.http)}</td>
+      <td class="text-xs text-gray-600 max-w-md truncate" title="${esc(r.detalle)}">${esc(r.detalle)}</td>
+      <td class="text-xs text-violet-700 underline whitespace-nowrap">ver</td>
+    </tr>`).join("") || '<tr><td colspan="9" class="text-gray-400 p-4">Sin envíos todavía</td></tr>'}
+    </tbody></table></div>`;
+}
+
+function verAvtex(n) {
+  const r = (window._AVLOG || [])[n];
+  if (!r) return;
+  showModal(`
+    <h3 class="font-bold text-lg mb-1">${esc(r.order_id)} → ${esc(r.nro_factura)}</h3>
+    <div class="text-xs text-gray-500 mb-3">${esc(r.fecha_hora)} · ${esc(r.canal)} ·
+      estado en VTEX <code>${esc(r.estado_vtex)}</code> · resultado ${esc(r.estado)}
+      ${r.http ? `· HTTP ${esc(r.http)}` : ""}</div>
+    <div class="text-xs text-gray-500 uppercase mb-1">Qué contestó VTEX</div>
+    <pre class="text-xs bg-gray-50 border rounded p-2 whitespace-pre-wrap break-all mb-3">${esc(r.detalle || "(vacío)")}</pre>
+    <div class="text-xs text-gray-500 uppercase mb-1">Qué se le mandó</div>
+    <pre class="text-xs bg-gray-50 border rounded p-2 whitespace-pre-wrap break-all max-h-64 overflow-y-auto">${esc(r.enviado || "(no se llegó a armar)")}</pre>
+    <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
+}
+
+async function correrAvtex() {
+  showModal(`<h3 class="font-bold text-lg mb-3">Informando al marketplace…</h3>${spinner()}`);
+  let r;
+  try { r = await api("vtexinv.run", { forzar: "1" }); }
+  catch (e) {
+    return showModal(`<h3 class="font-bold text-lg mb-3">Aviso al marketplace</h3>
+      <p class="text-red-600 text-sm">${esc(e.message)}</p>
+      <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
+  }
+  showModal(`
+    <h3 class="font-bold text-lg mb-3">Resultado</h3>
+    ${r.apagado ? `<div class="text-sm bg-amber-50 border border-amber-200 rounded p-3 mb-3">${esc(r.mensaje)}</div>` : ""}
+    <div class="text-sm space-y-1 mb-3">
+      <div>Facturas revisadas: <b>${r.revisadas || 0}</b></div>
+      <div class="text-green-700">Informadas ahora: <b>${r.notificadas || 0}</b></div>
+      ${r.ya_estaban ? `<div class="text-gray-600">El marketplace ya las tenía: <b>${r.ya_estaban}</b></div>` : ""}
+      ${r.pendientes ? `<div class="text-amber-700">Quedan pendientes (el pedido todavía no está
+        en un estado que acepte factura): <b>${r.pendientes}</b></div>` : ""}
+      ${r.saltadas ? `<div class="text-gray-500">Salteadas por canal: <b>${r.saltadas}</b></div>` : ""}
+      ${r.fallidas ? `<div class="text-red-700">Fallaron: <b>${r.fallidas}</b></div>` : ""}
+      ${r.truncado ? `<div class="text-amber-700">${esc(r.truncado)}</div>` : ""}
+    </div>
+    ${(r.errores || []).length ? `<div class="text-xs bg-red-50 border border-red-200 rounded p-2 mb-2 max-h-56 overflow-y-auto">
+      ${r.errores.map((x) => `<div class="mb-1">${esc(x)}</div>`).join("")}</div>` : ""}
+    ${(r.detalle || []).length ? `<div class="text-xs bg-amber-50 border border-amber-200 rounded p-2 max-h-40 overflow-y-auto">
+      ${r.detalle.map((x) => `<div class="mb-1">${esc(x)}</div>`).join("")}</div>` : ""}
+    <div class="mt-4 text-right"><button onclick="closeModal(); viewAvtex();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
+}
+
 /* ── Buscador de Facturas ─────────────────────────────────────────────── */
 
 /** De dónde sale el link que se le informa al marketplace. */
@@ -2275,6 +2443,15 @@ const CONFIG_CAMPOS = [
     ["pdf_publico", "Publicar los PDF como \"cualquiera con el link\"", "bool"],
     ["pdf_folder_nombre", "Nombre de la carpeta de Drive (solo si pdf_destino = drive)", "text"],
     ["pdf_folder_id", "ID de la carpeta (se completa solo)", "text"],
+  ]],
+  ["Aviso de factura al marketplace (VTEX)", [
+    ["vtex_invoice_enabled", "Informar automáticamente las facturas a Frávega y OnCity", "bool"],
+    ["vtex_invoice_dry_run", "Modo simulación (arma el envío pero NO lo manda)", "bool"],
+    ["vtex_invoice_al_vuelo", "Informar apenas llega el aviso de Tango", "bool"],
+    ["vtex_invoice_canales", "Canales a los que informar (fravega, oncity)", "text"],
+    ["vtex_invoice_valor", "Importe informado: orden · tango", "text"],
+    ["vtex_invoice_max", "Máximo de facturas por corrida", "text"],
+    ["vtex_invoice_pausa_ms", "Pausa entre llamadas a VTEX (ms)", "text"],
   ]],
   ["Facturas", [
     ["invoices_match_importe", "Usar también el importe para matchear facturas", "bool"],
