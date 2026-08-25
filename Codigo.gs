@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-25.22';
+var APP_VERSION = '2026-08-25.23';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -495,6 +495,7 @@ function doPost(e) {
       case 'pdfs.sync':           out = apiPdfsSync(user, p); break;
       case 'facturas.buscar':     out = apiFacturasBuscar(p); break;
       case 'pdfs.talonarios':     out = apiTalonariosSugeridos(p); break;
+      case 'facturas.reintentar': out = apiFacturasReintentar(user); break;
       case 'orders.autoRun':      out = apiOrdersAutoRun(user); break;
       case 'oncity.invoices':     out = apiOncityInvoices(user, p); break;
       case 'skus.list':          out = apiSkusList(p.q || ''); break;
@@ -2477,6 +2478,15 @@ function runOrdersImport(disparadaPor) {
          ' excluidas=' + res.excluidas.length + ' errores=' + res.errores.length,
          Date.now() - t0);
 
+    // Con lo que queda de tiempo, reintentamos los comprobantes que Tango
+    // todavía no había publicado cuando llegó el aviso de facturación.
+    if (Date.now() - t0 < 4 * 60 * 1000) {
+      try {
+        res.facturas = _reintentarFacturas(disparadaPor);
+        res.facturas.historial = _completarHistorial(disparadaPor);
+      } catch (e2) { res.errores.push('Reintento de facturas: ' + e2.message); }
+    }
+
     _avisarCorrida(cfg, res);
     return res;
 
@@ -2647,16 +2657,29 @@ function _procesarWebhook(req, e) {
       resultado = r.ok ? 'pdf guardado' : 'sin pdf';
       detalle = r.detalle;
     } else if (topic === 'OrderBilled') {
-      var nro = _buscarNroFactura(req);
-      if (nro) {
-        _registrarFactura({ nro_factura: nro, order_id: resource, url: '',
-                            archivo_id: '', origen: 'OrderBilled',
-                            detalle: 'Número de factura informado por Tango' });
-        detalle = 'orden ' + resource + ' → factura ' + nro;
+      // El aviso viene sin número de factura (Message llega vacío), así que no
+      // sirve de nada leer el payload: le preguntamos a /Invoices, que además
+      // nos da la URL del PDF. Si todavía no está publicado, queda anotado como
+      // pendiente y lo levanta el reintento.
+      var rb = _guardarPdfDeWebhook(req, resource, message);
+      if (rb.ok) {
+        resultado = 'ok';
+        detalle = 'orden ' + resource + ' → ' + rb.detalle;
       } else {
-        detalle = 'orden ' + resource + ' facturada, sin número reconocible en el aviso';
+        var nro = _buscarNroFactura(req);   // por si algún día viene en el aviso
+        if (nro) {
+          _registrarFactura({ nro_factura: nro, order_id: resource, url: '',
+                              archivo_id: '', origen: 'OrderBilled',
+                              detalle: 'Número de factura informado por Tango' });
+          resultado = 'ok';
+          detalle = 'orden ' + resource + ' → factura ' + nro + ' (sin PDF todavía)';
+        } else {
+          _anotarPendiente(resource);
+          resultado = 'sin pdf';
+          detalle = 'orden ' + resource + ' facturada, pero Tango todavía no publicó el ' +
+                    'comprobante. Queda pendiente y se reintenta solo. ' + rb.detalle;
+        }
       }
-      resultado = 'ok';
     } else if (topic.toLowerCase().indexOf('validation') !== -1) {
       resultado = 'ok';
       detalle = 'Tango validó la URL del webhook. La conexión funciona.';
@@ -2745,14 +2768,17 @@ function _bajarPdfDeUrl(url) {
  * Procesa un comprobante devuelto por /Invoices: baja el PDF, lo publica en
  * Drive y lo registra. Si ya lo teníamos guardado, no lo vuelve a bajar.
  */
-function _procesarComprobante(item, forzar) {
+function _procesarComprobante(item, forzar, esNuestra) {
   var nro = _normFactura(item.InvoiceNumber);
   var oid = String(item.OrderNumber || item.OrderId || '').trim();
   var url = String(item.InvoiceFileUrl || '').trim();
 
   // Solo nos interesan los talonarios con los que facturamos los marketplaces.
   // El resto de la facturación de la empresa pasa de largo y no ensucia la lista.
-  if (!forzar && !_talonarioNuestro(item)) {
+  // El filtro de talonarios es para la sincronización masiva. Si el comprobante
+  // llegó por un aviso de Tango o por una búsqueda puntual, ya sabemos que la
+  // orden es nuestra y no hay nada que filtrar.
+  if (!forzar && !esNuestra && !_talonarioNuestro(item)) {
     return { estado: 'otro_talonario', nro: nro, orden: oid };
   }
 
@@ -2760,8 +2786,12 @@ function _procesarComprobante(item, forzar) {
 
   if (!forzar) {
     var idx = _indicePdfs();
-    if ((nro && idx.porFactura[nro]) || (oid && idx.porOrden[oid])) {
-      return { estado: 'ya_estaba', nro: nro, orden: oid };
+    var yaTengo = (nro && idx.porFactura[nro]) || (oid && idx.porOrden[oid]);
+    if (yaTengo) {
+      // Aunque el PDF ya lo tuviéramos, la orden puede seguir figurando "sin
+      // facturar" en OrdenesEnviadas: aprovechamos para completarla.
+      _marcarFacturadaEnHistorial(oid, item.InvoiceNumber, _fechaComprobante(item));
+      return { estado: 'ya_estaba', nro: nro, orden: oid, url: yaTengo };
     }
   }
 
@@ -2778,6 +2808,7 @@ function _procesarComprobante(item, forzar) {
       origen: 'Tango', vence: vence,
       detalle: item.InvoiceType + ' ' + item.InvoiceNumber
     });
+    _marcarFacturadaEnHistorial(oid, item.InvoiceNumber, _fechaComprobante(item));
     return { estado: 'guardado', nro: nro, orden: oid, url: url, vence: vence };
   }
 
@@ -2791,6 +2822,7 @@ function _procesarComprobante(item, forzar) {
     detalle: item.InvoiceType + ' ' + item.InvoiceNumber +
              (vence ? ' · la URL de Tango vencía el ' + vence : '')
   });
+  _marcarFacturadaEnHistorial(oid, item.InvoiceNumber, _fechaComprobante(item));
   return { estado: 'guardado', nro: nro, orden: oid, url: g.url };
 }
 
@@ -2821,6 +2853,16 @@ function _talonarioNuestro(item) {
   return false;
 }
 
+/** La fecha del comprobante, venga con el nombre que venga, como dd/MM/yyyy. */
+function _fechaComprobante(item) {
+  var v = item.InvoiceDate || item.Date || item.EmissionDate || item.CreationDate || '';
+  var s = String(v).trim();
+  if (!s) return '';
+  var m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return m[3] + '/' + m[2] + '/' + m[1];
+  return s.slice(0, 10);
+}
+
 /** El aviso InvoiceFile nos dice para qué orden hay comprobante: lo buscamos. */
 function _guardarPdfDeWebhook(req, resource, message) {
   if (!resource) return { ok: false, detalle: 'El aviso no trae el identificador de la orden' };
@@ -2841,7 +2883,7 @@ function _guardarPdfDeWebhook(req, resource, message) {
 
   var hechos = [];
   items.forEach(function (it) {
-    var r = _procesarComprobante(it, false);
+    var r = _procesarComprobante(it, false, true);   // viene de un aviso: es nuestra
     hechos.push(r.nro + ': ' + r.estado);
   });
   var alguno = hechos.some(function (h) { return h.indexOf('guardado') !== -1 ||
@@ -2962,7 +3004,11 @@ function _registrarFactura(f) {
     for (var i = 0; i < datos.length; i++) {
       var mismaFactura = nro && _normFactura(datos[i][0]) === nro;
       var mismaOrden = !nro && oid && String(datos[i][1]).trim() === oid;
-      if (mismaFactura || mismaOrden) {
+      // Una fila "Pendiente" (misma orden, sin número y sin URL) se completa en
+      // vez de duplicarse: si no, la orden quedaría reintentándose para siempre.
+      var pendienteDeEsaOrden = oid && String(datos[i][1]).trim() === oid &&
+                                !_normFactura(datos[i][0]) && !String(datos[i][2]).trim();
+      if (mismaFactura || mismaOrden || pendienteDeEsaOrden) {
         // Completamos lo que falte sin pisar lo que ya está bien.
         var fila = datos[i];
         if (nro) fila[0] = nro;
@@ -3081,7 +3127,7 @@ function apiPdfBuscar(user, p) {
 
   var lineas = [], primera = '';
   items.forEach(function (it) {
-    var r = _procesarComprobante(it, true);
+    var r = _procesarComprobante(it, false, true);
     lineas.push(it.InvoiceType + ' ' + it.InvoiceNumber + ' → ' + r.estado +
                 (r.url ? ' · ' + r.url : ''));
     if (!primera && r.url) primera = r.url;
@@ -3190,6 +3236,197 @@ function apiTalonariosSugeridos(p) {
   };
 }
 
+/* ── Facturas pendientes de comprobante ────────────────────────────────── */
+
+/**
+ * Anota una orden que Tango dio por facturada pero de la que todavía no
+ * publicó el comprobante. La fila queda en FacturasPDF sin número ni URL, y
+ * `REINTENTAR_FACTURAS()` la vuelve a consultar más tarde.
+ */
+function _anotarPendiente(orderId) {
+  if (!orderId) return;
+  _registrarFactura({
+    nro_factura: '', order_id: orderId, url: '', archivo_id: '',
+    origen: 'Pendiente',
+    detalle: 'Facturada en Tango; esperando que se publique el comprobante'
+  });
+}
+
+/**
+ * Vuelve a preguntar por las facturas que quedaron sin PDF.
+ *
+ * Tango avisa OrderBilled apenas factura, pero el PDF del comprobante
+ * electrónico puede tardar (tiene que volver de AFIP). En vez de perder ese
+ * aviso, la orden queda pendiente y esta función la reintenta.
+ *
+ * Se llama sola después de cada corrida automática de órdenes, y también se
+ * puede ejecutar a mano desde el editor de Apps Script.
+ */
+function REINTENTAR_FACTURAS() {
+  return _reintentarFacturas('manual');
+}
+
+function _reintentarFacturas(quien) {
+  _sheetPdfs();
+  var filas = _readRows(SH.PDFS, 5000);
+  var pendientes = [];
+  filas.forEach(function (r) {
+    if (String(r.url || '').trim()) return;                  // ya tiene PDF
+    var oid = String(r.order_id || '').trim();
+    if (!oid) return;
+    if (pendientes.indexOf(oid) === -1) pendientes.push(oid);
+  });
+
+  var res = { pendientes: pendientes.length, resueltas: 0, siguen: 0, detalle: [] };
+  var t0 = Date.now();
+  for (var i = 0; i < pendientes.length; i++) {
+    if (Date.now() - t0 > 3 * 60 * 1000) {
+      res.truncado = true;
+      res.detalle.push('Se cortó por tiempo en ' + i + ' de ' + pendientes.length);
+      break;
+    }
+    var r2 = _guardarPdfDeWebhook({}, pendientes[i], '');
+    if (r2.ok) { res.resueltas++; res.detalle.push(pendientes[i] + ' → ' + r2.detalle); }
+    else res.siguen++;
+  }
+
+  if (res.pendientes) {
+    log_(quien, 'facturas', 'Reintento de comprobantes pendientes',
+         res.siguen ? 'warning' : 'ok',
+         'pendientes=' + res.pendientes + ' resueltas=' + res.resueltas +
+         ' siguen=' + res.siguen, Date.now() - t0);
+  }
+  return res;
+}
+
+/**
+ * Escribe el número y la fecha de la factura en OrdenesEnviadas.
+ *
+ * Antes esas columnas solo se llenaban al subir el reporte de facturación de
+ * Tango. Ahora que el webhook nos dice qué se facturó, la orden queda marcada
+ * sola y el Buscador la encuentra sin depender de que hayas subido nada.
+ * No pisa lo que ya estaba cargado.
+ */
+function _marcarFacturadaEnHistorial(orderId, nro, fecha) {
+  if (!orderId || !nro) return false;
+  var sheet = _sheet(SH.SENT);
+  var last = sheet.getLastRow();
+  if (last < 2) return false;
+
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+                  .map(function (h) { return String(h); });
+  var cOrden = headers.indexOf('order_id');
+  var cEstado = headers.indexOf('estado_facturacion');
+  var cNro = headers.indexOf('nro_factura');
+  var cFecha = headers.indexOf('fecha_factura');
+  var cEn = headers.indexOf('facturada_en');
+  if (cOrden === -1 || cNro === -1) return false;
+
+  var ids = sheet.getRange(2, cOrden + 1, last - 1, 1).getValues();
+  for (var i = ids.length - 1; i >= 0; i--) {      // de la más nueva a la más vieja
+    var id = String(ids[i][0]).trim();
+    if (id !== String(orderId).trim() &&
+        id !== _sinPrefijo(String(orderId), 'FVG-')) continue;
+
+    var fila = i + 2;
+    if (String(sheet.getRange(fila, cNro + 1).getValue()).trim()) return false;  // ya estaba
+    sheet.getRange(fila, cNro + 1).setValue(nro);
+    if (cEstado !== -1) sheet.getRange(fila, cEstado + 1).setValue('facturada');
+    if (cFecha !== -1 && fecha) sheet.getRange(fila, cFecha + 1).setValue(fecha);
+    if (cEn !== -1) sheet.getRange(fila, cEn + 1).setValue(_now());
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Completa en OrdenesEnviadas las facturas que ya tenemos registradas en
+ * FacturasPDF pero que quedaron figurando "sin facturar".
+ *
+ * Pasa cuando la factura entró por el webhook (o por la sincronización) y
+ * todavía no subiste el reporte de facturación de Tango. Es idempotente: no
+ * pisa nada que ya esté cargado, así que se puede correr las veces que quieras.
+ */
+/** Reintento + completado, desde el botón de la pantalla. */
+function apiFacturasReintentar(user) {
+  var r = _reintentarFacturas(user.email);
+  r.historial = _completarHistorial(user.email);
+  return r;
+}
+
+function COMPLETAR_FACTURAS_EN_HISTORIAL() {
+  return _completarHistorial('manual');
+}
+
+function _completarHistorial(quien) {
+  _sheetPdfs();
+  var sheet = _sheet(SH.SENT);
+  var last = sheet.getLastRow();
+  var res = { revisadas: 0, completadas: 0, sin_orden: 0 };
+  if (last < 2) return res;
+
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+                  .map(function (h) { return String(h); });
+  var cOrden = headers.indexOf('order_id');
+  var cEstado = headers.indexOf('estado_facturacion');
+  var cNro = headers.indexOf('nro_factura');
+  var cFecha = headers.indexOf('fecha_factura');
+  var cEn = headers.indexOf('facturada_en');
+  if (cOrden === -1 || cNro === -1) return res;
+
+  // Una sola lectura y una sola escritura: es mucho más rápido que fila por fila.
+  var ancho = sheet.getLastColumn();
+  var datos = sheet.getRange(2, 1, last - 1, ancho).getValues();
+  var porOrden = {};
+  datos.forEach(function (fila, i) {
+    var id = String(fila[cOrden]).trim();
+    if (id) porOrden[id] = i;
+  });
+
+  var ts = _now();
+  _readRows(SH.PDFS, 5000).forEach(function (r) {
+    var nro = String(r.nro_factura || '').trim();
+    var oid = String(r.order_id || '').trim();
+    if (!nro || !oid) return;
+    res.revisadas++;
+
+    var i = porOrden[oid];
+    if (i === undefined) i = porOrden[_sinPrefijo(oid, 'FVG-')];
+    if (i === undefined) { res.sin_orden++; return; }
+
+    if (String(datos[i][cNro]).trim()) return;       // ya estaba cargada
+    datos[i][cNro] = nro;
+    if (cEstado !== -1) datos[i][cEstado] = 'facturada';
+    if (cFecha !== -1 && !String(datos[i][cFecha]).trim()) {
+      datos[i][cFecha] = _soloFecha(r.fecha_hora);
+    }
+    if (cEn !== -1) datos[i][cEn] = ts;
+    res.completadas++;
+  });
+
+  if (res.completadas) {
+    sheet.getRange(2, 1, datos.length, ancho).setValues(datos);
+    log_(quien, 'facturas', 'Facturas completadas en OrdenesEnviadas', 'ok',
+         'completadas=' + res.completadas + ' revisadas=' + res.revisadas +
+         ' sin_orden=' + res.sin_orden);
+  }
+  return res;
+}
+
+/**
+ * El número de factura se guarda normalizado (B0000700002725) para poder
+ * compararlo, pero se muestra como lo ves en Tango: B 00007-00002725.
+ */
+function _lindaFactura(v) {
+  var s = String(v || '').trim();
+  if (!s) return '';
+  var m = s.match(/^([A-Z]?)(\d{12,14})$/);
+  if (!m) return s;                       // ya viene con guion o no lo entendemos
+  var d = m[2];
+  var num = d.slice(-8), pv = d.slice(0, d.length - 8);
+  return (m[1] ? m[1] + ' ' : '') + pv + '-' + num;
+}
+
 /* ── Buscador de Facturas ──────────────────────────────────────────────── */
 
 /** Saca acentos y símbolos para poder comparar sin que moleste la tilde. */
@@ -3247,6 +3484,13 @@ function apiFacturasBuscar(p) {
   // Las palabras del texto libre, cada una en plano.
   var partes = q ? q.split(/\s+/).map(_plano).filter(String) : [];
 
+  // Los comprobantes se escriben con distinta cantidad de ceros (7-2725,
+  // 00007-00002725, B000700002725...). Guardamos también la versión sin ceros
+  // a la izquierda, para que cualquiera de las dos encuentre lo mismo.
+  var sinCeros = function (v) {
+    return String(v || '').replace(/0+(\d)/g, '$1');
+  };
+
   _sheetPdfs();
   var idx = _indicePdfs();
   var pdfs = {};   // nro normalizado -> fila de FacturasPDF
@@ -3269,7 +3513,7 @@ function apiFacturasBuscar(p) {
     var url = (nro && idx.porFactura[nro]) || idx.porOrden[oid] || (pdf ? String(pdf.url || '') : '');
 
     if (canal && String(r.canal || '') !== canal) continue;
-    if (soloFacturadas && !nro) continue;
+    if (soloFacturadas && !nro && !(pdf && _normFactura(pdf.nro_factura))) continue;
     if (soloSinPdf && url) continue;
 
     var fCompra = _soloFecha(r.fecha_compra) || _soloFecha(r.fecha_hora);
@@ -3286,11 +3530,15 @@ function apiFacturasBuscar(p) {
     }
 
     if (partes.length) {
-      var heno = _plano([oid, r.suborder_id, r.nro_factura, r.documento, r.cuil,
-                         r.cliente, r.email, fCompra, fFactura].join(' '));
+      var crudo = [oid, r.suborder_id, r.nro_factura, r.documento, r.cuil,
+                   r.cliente, r.email, fCompra, fFactura,
+                   pdf ? pdf.nro_factura : '',
+                   pdf ? _lindaFactura(pdf.nro_factura) : ''].join(' ');
+      var heno = _plano(crudo) + ' ' + _plano(sinCeros(crudo));
       var todas = true;
       for (var k = 0; k < partes.length; k++) {
-        if (heno.indexOf(partes[k]) === -1) { todas = false; break; }
+        if (heno.indexOf(partes[k]) === -1 &&
+            heno.indexOf(_plano(sinCeros(partes[k]))) === -1) { todas = false; break; }
       }
       if (!todas) continue;
     }
@@ -3298,6 +3546,16 @@ function apiFacturasBuscar(p) {
     var clave = oid + '|' + nro;
     if (vistos[clave]) continue;
     vistos[clave] = true;
+
+    // El número de factura sale de OrdenesEnviadas, pero si ahí todavía no se
+    // cargó (porque no subiste el reporte) lo tomamos del comprobante que ya
+    // tenemos registrado, y lo marcamos como venido de Tango.
+    var nroMostrar = String(r.nro_factura || '').trim();
+    var deTango = false;
+    if (!nroMostrar && pdf && String(pdf.nro_factura || '').trim()) {
+      nroMostrar = String(pdf.nro_factura).trim();
+      deTango = true;
+    }
 
     out.push({
       order_id: oid,
@@ -3307,11 +3565,12 @@ function apiFacturasBuscar(p) {
       documento: String(r.documento || r.cuil || ''),
       total: r.total,
       fecha_compra: fCompra,
-      nro_factura: String(r.nro_factura || ''),
-      fecha_factura: fFactura,
+      nro_factura: _lindaFactura(nroMostrar),
+      factura_de_tango: deTango,
+      fecha_factura: fFactura || (pdf ? _soloFecha(pdf.fecha_hora) : ''),
       estado: String(r.estado_facturacion || ''),
       url: url,
-      vence: pdf ? String(pdf.vence || '') : '',
+      vence: pdf ? _soloFecha(pdf.vence) : '',
       origen_pdf: pdf ? String(pdf.origen || '') : ''
     });
     if (out.length >= 300) break;
@@ -3336,16 +3595,19 @@ function apiFacturasBuscar(p) {
       if (canal) return;   // FacturasPDF no guarda canal
 
       if (partes.length) {
-        var heno = _plano([nro, oid, r.detalle].join(' '));
+        var crudo2 = [nro, _lindaFactura(nro), oid, r.detalle].join(' ');
+        var heno2 = _plano(crudo2) + ' ' + _plano(sinCeros(crudo2));
         for (var k = 0; k < partes.length; k++) {
-          if (heno.indexOf(partes[k]) === -1) return;
+          if (heno2.indexOf(partes[k]) === -1 &&
+              heno2.indexOf(_plano(sinCeros(partes[k]))) === -1) return;
         }
       }
       out.push({
         order_id: oid, suborder_id: '', canal: '', cliente: '', documento: '',
-        total: '', fecha_compra: '', nro_factura: String(r.nro_factura || ''),
+        total: '', fecha_compra: '', nro_factura: _lindaFactura(r.nro_factura),
         fecha_factura: f, estado: 'solo_pdf', url: String(r.url || ''),
-        vence: String(r.vence || ''), origen_pdf: String(r.origen || '')
+        factura_de_tango: true,
+        vence: _soloFecha(r.vence), origen_pdf: String(r.origen || '')
       });
     });
   }

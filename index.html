@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-25.22";
+const APP_VERSION = "2026-08-25.23";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -1494,6 +1494,7 @@ async function viewPdfs() {
         <button onclick="viewPdfs()" class="border px-4 py-2 rounded-lg text-sm">Actualizar</button>
         <button onclick="sincronizarPdfs()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
           ⬇️ Traer comprobantes de los últimos 30 días</button>
+        <button onclick="reintentarFacturas()" class="border px-4 py-2 rounded-lg text-sm">🔄 Reintentar las que quedaron sin PDF</button>
         <button onclick="verTalonarios()" class="border px-4 py-2 rounded-lg text-sm">🎯 ¿Qué talonarios uso?</button>
         ${i.destino === "drive" ? `<button onclick="probarCarpeta()" class="border px-4 py-2 rounded-lg text-sm">🧪 Probar la carpeta de Drive</button>` : ""}
         ${i.destino === "drive" && i.carpeta ? `<a href="${esc(i.carpeta)}" target="_blank" class="text-violet-700 underline text-sm">Abrir la carpeta</a>` : ""}
@@ -1591,7 +1592,9 @@ async function buscarFacturas() {
       <td class="text-xs text-gray-500 whitespace-nowrap">${esc(f.fecha_factura || f.fecha_compra)}</td>
       <td class="text-xs text-right">${f.total === "" || f.total === null || f.total === undefined ? "" : esc(f.total)}</td>
       <td class="font-mono text-xs whitespace-nowrap">${f.nro_factura
-        ? esc(f.nro_factura)
+        ? `${esc(f.nro_factura)}${f.factura_de_tango
+            ? ` <span class="text-[10px] text-gray-400 font-sans" title="Número tomado del comprobante de Tango: todavía no subiste el reporte de facturación">de Tango</span>`
+            : ""}`
         : '<span class="text-gray-400">sin facturar</span>'}</td>
       <td>${f.url
         ? `<a href="${esc(f.url)}" target="_blank" class="text-violet-700 underline text-xs">abrir</a>`
@@ -1632,6 +1635,39 @@ async function traerPdfDe(n) {
       <pre class="text-xs bg-gray-50 border rounded p-2 whitespace-pre-wrap break-all">${esc(r.diagnostico || "")}</pre>
       <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
   }
+}
+
+/**
+ * Vuelve a preguntar por los comprobantes que Tango todavía no había publicado
+ * cuando llegó el aviso, y completa en el historial las órdenes que figuran
+ * sin facturar pero que ya tienen su factura registrada.
+ */
+async function reintentarFacturas() {
+  showModal(`<h3 class="font-bold text-lg mb-3">Reintentando…</h3>${spinner()}`);
+  let r;
+  try { r = await api("facturas.reintentar"); }
+  catch (e) {
+    return showModal(`<h3 class="font-bold text-lg mb-3">Reintento</h3>
+      <p class="text-red-600 text-sm">${esc(e.message)}</p>
+      <div class="mt-4 text-right"><button onclick="closeModal()" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
+  }
+  const h = r.historial || {};
+  showModal(`
+    <h3 class="font-bold text-lg mb-3">Reintento de comprobantes</h3>
+    <div class="text-sm space-y-1 mb-3">
+      <div>Órdenes que estaban esperando el PDF: <b>${r.pendientes}</b></div>
+      <div class="text-green-700">Resueltas ahora: <b>${r.resueltas}</b></div>
+      ${r.siguen ? `<div class="text-amber-700">Siguen sin comprobante: <b>${r.siguen}</b>
+        <div class="text-xs text-gray-600">Tango todavía no lo publicó. Si pasan varias horas,
+          revisá que el talonario tenga tildado "Publica comprobantes en Tango Tiendas".</div></div>` : ""}
+      ${h.completadas ? `<div class="text-green-700">Órdenes que pasaron de "sin facturar" a
+        facturadas en el historial: <b>${h.completadas}</b></div>` : ""}
+      ${h.sin_orden ? `<div class="text-gray-600">Comprobantes sin orden en el historial:
+        <b>${h.sin_orden}</b> (facturas de otros circuitos)</div>` : ""}
+      ${r.truncado ? `<div class="text-amber-700">Se cortó por tiempo: volvé a tocarlo para seguir.</div>` : ""}
+      ${!r.pendientes && !h.completadas ? `<div class="text-gray-600">No había nada pendiente.</div>` : ""}
+    </div>
+    <div class="mt-4 text-right"><button onclick="closeModal(); viewPdfs();" class="px-4 py-2 border rounded-lg">Cerrar</button></div>`);
 }
 
 /** Descubre con qué talonarios se facturaron nuestros pedidos. */
