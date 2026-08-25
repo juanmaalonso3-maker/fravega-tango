@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-24.11';
+var APP_VERSION = '2026-08-24.12';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -174,6 +174,7 @@ var DEFAULT_CONFIG = [
   ['fvtex_facturar_envio', '0', 'Sumar el costo de envío al total (0 con Frávega Envíos)'],
   ['fvtex_espera_min', '90', 'Minutos de antigüedad mínima del pedido (Envío Pack necesita 90)'],
   ['fvtex_id_field', 'auto', 'Nro de Orden: auto | orderId | marketplaceOrderId'],
+  ['fvtex_sale_condition', '', 'Condición de venta de Tango para Frávega (vacío = la general)'],
   ['fvtex_quitar_prefijo', 'FVG-', 'Prefijo a sacarle al orderId de VTEX para que coincida con el Nro de Orden del CSV'],
   // Pedidos que VTEX sigue mostrando en "handling" pero que NO hay que mandar a
   // Tango. Verificado contra el CSV del 24/08: cuatro figuran como Facturada y
@@ -3213,20 +3214,48 @@ function apiSettingsGet() {
   };
 }
 
+/**
+ * Guarda la configuración.
+ *
+ * Una clave que no está en DEFAULT_CONFIG se SALTEA y se informa, en vez de
+ * cortar el guardado. Antes tiraba error a mitad de camino: los campos ya
+ * procesados quedaban escritos, los siguientes no, y —lo peor— nunca se
+ * llegaba a recrear los triggers. Un formulario no debería poder dejar el
+ * sistema a medio configurar.
+ */
 function apiSettingsSet(user, valores) {
   var editables = {};
   DEFAULT_CONFIG.forEach(function (r) { editables[r[0]] = true; });
-  var cambios = [];
+  var cambios = [], ignoradas = [];
+
   Object.keys(valores || {}).forEach(function (k) {
-    if (!editables[k]) throw new Error('Clave no editable: ' + k);
+    if (!editables[k]) { ignoradas.push(k); return; }
     setConfig(k, valores[k]);
     cambios.push(k + '=' + valores[k]);
   });
-  var recrear = ['scheduler_hours', 'scheduler_enabled',
-                 'orders_auto_hours', 'orders_auto_enabled'];
-  if (recrear.some(function (k) { return k in (valores || {}); })) configurarTriggers();
-  log_(user.email, 'configuracion', 'Configuración actualizada', 'ok', cambios.join(', '));
-  return { ok: true, proxima_sincronizacion: _proximaSync() };
+
+  // Los triggers se recrean SIEMPRE: es barato y evita que queden
+  // desincronizados con lo que dice la hoja.
+  configurarTriggers();
+
+  var agendados = { ordenes: 0, stock: 0 };
+  try {
+    ScriptApp.getProjectTriggers().forEach(function (t) {
+      var f = t.getHandlerFunction();
+      if (f === 'ordenesProgramadas') agendados.ordenes++;
+      if (f === 'syncProgramada') agendados.stock++;
+    });
+  } catch (e) { /* si no se pueden leer, no rompemos el guardado */ }
+
+  log_(user.email, 'configuracion', 'Configuración actualizada',
+       ignoradas.length ? 'warning' : 'ok',
+       cambios.join(', ') + (ignoradas.length ? ' · ignoradas: ' + ignoradas.join(', ') : '') +
+       ' · triggers ordenes=' + agendados.ordenes + ' stock=' + agendados.stock);
+
+  return { ok: true, proxima_sincronizacion: _proximaSync(),
+           proxima_ordenes: getConfig('orders_auto_enabled') === '1'
+             ? _proximaCorrida(getConfig('orders_auto_hours')) : null,
+           agendados: agendados, ignoradas: ignoradas };
 }
 
 function apiDashboard() {
