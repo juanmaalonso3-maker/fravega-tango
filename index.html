@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-25.26";
+const APP_VERSION = "2026-08-25.27";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -1269,7 +1269,11 @@ async function generarFacturasOncity() {
           solo documento <b>${c.doc || 0}</b> ·
           nombre+importe <b>${c.nombre_importe || 0}</b> ·
           solo nombre <b>${c.nombre || 0}</b>
-          <div class="text-xs text-gray-500">Columnas usadas del reporte de Tango —
+          ${(r.reexportadas || []).length ? `<div class="text-xs bg-blue-50 border border-blue-200 text-blue-900 rounded p-2 my-2">
+          ℹ️ ${(r.reexportadas || []).length} orden(es) ya figuraban como exportadas, pero su
+          factura está en este reporte y Tango confirma que les corresponde, así que entraron
+          igual: ${esc((r.reexportadas || []).join(", "))}</div>` : ""}
+        <div class="text-xs text-gray-500">Columnas usadas del reporte de Tango —
             documento: ${esc(r.columna_documento)} · importe: ${esc(r.columna_importe)}</div>
           ${r.ya_tenian ? `<div class="text-xs text-gray-500">${r.ya_tenian} fila(s) ya traían número de factura y se dejaron como estaban.</div>` : ""}
         </div>
@@ -1332,7 +1336,11 @@ async function generarFacturasHistorial() {
           solo documento <b>${(r.conteo || {}).doc || 0}</b> ·
           nombre+importe <b>${(r.conteo || {}).nombre_importe || 0}</b> ·
           solo nombre <b>${(r.conteo || {}).nombre || 0}</b>
-          <div class="text-xs text-gray-500">Columnas usadas del reporte de Tango —
+          ${(r.reexportadas || []).length ? `<div class="text-xs bg-blue-50 border border-blue-200 text-blue-900 rounded p-2 my-2">
+          ℹ️ ${(r.reexportadas || []).length} orden(es) ya figuraban como exportadas, pero su
+          factura está en este reporte y Tango confirma que les corresponde, así que entraron
+          igual: ${esc((r.reexportadas || []).join(", "))}</div>` : ""}
+        <div class="text-xs text-gray-500">Columnas usadas del reporte de Tango —
             documento: ${esc(r.columna_documento)} · importe: ${esc(r.columna_importe)}</div>
         </div>
         <div class="text-sm mb-2 ${r.sin_url && r.sin_url.length ? "text-amber-800 bg-amber-50 border border-amber-200 rounded p-2" : "text-gray-600"}">

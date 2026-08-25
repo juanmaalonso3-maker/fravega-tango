@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-25.26';
+var APP_VERSION = '2026-08-25.27';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -4023,14 +4023,18 @@ function _matchearFacturas(facturasRows, canal) {
     return null;
   }
 
-  var asignaciones = {}, sinFactura = [];
+  var asignaciones = {}, sinFactura = [], reexportadas = [];
   var conteo = { tango: 0, doc_importe: 0, doc: 0, nombre_importe: 0, nombre: 0 };
   var ts = _now();
   var cambios = false;
 
   for (var r = 0; r < datos.length; r++) {
     var fila = datos[r];
-    if (String(fila[col.estado_facturacion] || '').toLowerCase() === 'facturada') continue;
+    // "facturada" quiere decir "ya salió en un archivo". NO cortamos acá: si la
+    // factura que estás subiendo es exactamente la de esta orden (según Tango),
+    // tiene que entrar igual. El estado solo frena las heurísticas, que son las
+    // que podrían asignarle una factura ajena.
+    var yaExportada = String(fila[col.estado_facturacion] || '').toLowerCase() === 'facturada';
 
     var ch = String(col.canal !== undefined ? (fila[col.canal] || 'fravega') : 'fravega').toLowerCase();
     if (canal && ch !== canal) continue;
@@ -4051,10 +4055,15 @@ function _matchearFacturas(facturasRows, canal) {
                       registro[orden] || registro[_sinPrefijo(orden, 'FVG-')] || '';
     if (nroConocido) {
       f = tomar(porNumero[_normFactura(nroConocido)], null);
-      if (f) via = 'tango';
+      if (f) { via = 'tango'; if (yaExportada) reexportadas.push(orden); }
     }
 
-    // 2) Si no, las heurísticas de siempre. Para eso sí hacen falta los datos
+    // 2) Si el cruce exacto no la reclamó y la orden ya se había exportado,
+    //    la dejamos afuera: no queremos que una heurística le asigne otra
+    //    factura a un pedido que ya se informó.
+    if (!f && yaExportada) continue;
+
+    // 3) Si no, las heurísticas de siempre. Para eso sí hacen falta los datos
     //    del cliente: una fila vieja sin nombre ni documento no se puede cruzar.
     if (!f && !cliente && !doc) continue;
     if (!f && doc && colImp && !isNaN(importe)) { f = tomar(porDoc[doc], importe); if (f) { via = 'doc_importe'; } }
@@ -4093,6 +4102,7 @@ function _matchearFacturas(facturasRows, canal) {
 
   return {
     asignaciones: asignaciones, sin_factura: sinFactura, sobrantes: sobrantes,
+    reexportadas: reexportadas,
     conteo: conteo,
     columna_documento: colDoc || '(el reporte no trae documento)',
     columna_importe: colImp || (usarImporte ? '(el reporte no trae importe)' : '(desactivado)')
@@ -4137,7 +4147,7 @@ function apiInvoicesFromHistory(user, facturasRows) {
 
   return { archivo: xls.archivo, cargadas: filas.length,
            sin_factura: m.sin_factura, sobrantes: m.sobrantes,
-           conteo: m.conteo, sin_url: sinUrl,
+           reexportadas: m.reexportadas, conteo: m.conteo, sin_url: sinUrl,
            con_url: filas.length - sinUrl.length,
            columna_documento: m.columna_documento, columna_importe: m.columna_importe,
            base64: xls.base64 };
@@ -4207,7 +4217,7 @@ function apiOncityInvoices(user, p) {
 
   return {
     archivo: nombre, filas: salida, completadas: completadas,
-    ya_tenian: yaTenian, sin_match: sinMatch,
+    ya_tenian: yaTenian, sin_match: sinMatch, reexportadas: m.reexportadas,
     sin_url: sinUrl, con_url: conUrl,
     sin_factura: m.sin_factura, sobrantes: m.sobrantes, conteo: m.conteo,
     columna_documento: m.columna_documento, columna_importe: m.columna_importe
