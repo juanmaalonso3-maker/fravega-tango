@@ -69,7 +69,7 @@ const API_URL = "https://script.google.com/macros/s/AKfycbyvlPC_Xtx-Z1bZNhnM0217
 // Versión de este HTML. Tiene que coincidir con APP_VERSION del Codigo.gs.
 // Si no coinciden, la app avisa arriba de todo en vez de fallar con errores
 // raros como "Acción desconocida".
-const APP_VERSION = "2026-08-26.16";
+const APP_VERSION = "2026-08-26.18";
 // Client ID de Google (el mismo de GarantApp)
 const GOOGLE_CLIENT_ID = "849214701404-ff11l3oo5k9hecabvf99cnbbgjlegeam.apps.googleusercontent.com";
 
@@ -494,7 +494,7 @@ let ORDENES_ROWS = null, ORDENES_ARCHIVO = "", ORDENES_ANALISIS = null, ORDENES_
 // El valor guardado puede venir de una versión anterior (antes la pestaña de
 // Frávega se llamaba "api"). Si no es uno de los actuales, lo descartamos: si
 // no, la vista rompe al buscar un canal que no existe.
-const MODOS_ORDENES = ["fravega", "oncity", "csv"];
+const MODOS_ORDENES = ["fravega", "oncity", "csv", "canceladas"];
 let ORDENES_MODO = localStorage.getItem("tf_ordenes_modo") || "fravega";
 if (MODOS_ORDENES.indexOf(ORDENES_MODO) === -1) {
   ORDENES_MODO = "fravega";
@@ -514,7 +514,9 @@ function viewOrdenes() {
     class="px-4 py-2 text-sm rounded-lg ${ORDENES_MODO === id
       ? "bg-violet-700 text-white font-medium" : "border bg-white text-gray-600"}">${txt}</button>`;
 
-  const bloque = ORDENES_MODO === "csv" ? bloqueOrdenesCsv() : bloqueOrdenesVtex(ORDENES_MODO);
+  const bloque = ORDENES_MODO === "csv" ? bloqueOrdenesCsv()
+    : ORDENES_MODO === "canceladas" ? bloqueCanceladas()
+    : bloqueOrdenesVtex(ORDENES_MODO);
 
   setMain(H("Ingreso de Órdenes") + `
     <div id="auto-panel" class="mb-4"></div>
@@ -522,12 +524,136 @@ function viewOrdenes() {
       ${tab("fravega", "🔵 Frávega (API)")}
       ${tab("oncity", "🏬 OnCity (API)")}
       ${tab("csv", "📄 Frávega por CSV")}
+      ${tab("canceladas", "🚫 Canceladas")}
     </div>
     ${bloque}
     ${card(`<div class="text-xs text-gray-500 uppercase mb-2">Historial de importaciones</div>
       <div id="ordenes-hist">${spinner("Cargando historial...")}</div>`)}`);
   cargarHistorialOrdenes();  // llena SOLO el div del historial, sin tocar la carga
   cargarPanelAuto();
+}
+
+/* ── Canceladas: avisarle a Tango que el marketplace dio de baja ─────── */
+
+let CANCEL_DATOS = null;
+
+function bloqueCanceladas() {
+  return card(`
+    <div class="text-sm text-gray-600 mb-3">
+      Cuando el marketplace cancela un pedido que ya mandamos a Tango, hay que avisarle a
+      Tango para que no quede un pedido vivo que nadie va a despachar. Se manda
+      <b>la misma orden</b> con la marca de cancelación.
+    </div>
+    <div class="text-xs bg-gray-50 border rounded-lg p-3 mb-3 text-gray-600">
+      Las canceladas se leen de <b>VTEX</b> para los dos canales. El CSV de Frávega no trae
+      ninguna columna de cancelación, así que no sirve para esto.
+      <div class="mt-1">Dos casos quedan siempre afuera, a propósito: los pedidos que
+        <b>nunca mandamos</b> a Tango (no hay nada que cancelar) y los que ya están
+        <b>facturados</b> — ahí corresponde una nota de crédito, que es una decisión
+        contable y no algo que deba hacer la app sola.</div>
+    </div>
+    <div class="flex gap-2 flex-wrap items-center mb-3">
+      <select id="can-canal" class="border rounded-lg px-3 py-2 text-sm bg-white">
+        <option value="fravega">Frávega</option>
+        <option value="oncity">OnCity</option>
+      </select>
+      <button onclick="buscarCanceladas()" class="bg-violet-700 text-white px-4 py-2 rounded-lg text-sm">
+        1️⃣ Buscar canceladas</button>
+    </div>
+    <div id="can-resultado"></div>`);
+}
+
+async function buscarCanceladas() {
+  const canal = ($("can-canal") || {}).value || "fravega";
+  const box = $("can-resultado");
+  box.innerHTML = spinner("Buscando pedidos cancelados en el marketplace...");
+  CANCEL_DATOS = null;
+
+  let r;
+  try { r = await api("cancel.preview", { canal }); }
+  catch (e) { box.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
+  CANCEL_DATOS = r;
+
+  const linea = (txt, n, clase) => `<span class="${clase || ""}">${txt}: <b>${n}</b></span>`;
+
+  box.innerHTML = `
+    <div class="border rounded-lg p-4">
+      <div class="text-sm mb-1">
+        <b>${r.listados}</b> pedido(s) cancelado(s) en ${esc(r.nombre)}
+        <span class="text-xs text-gray-500">(estados: ${esc((r.estados || []).join(", "))})</span>
+      </div>
+      <div class="flex gap-4 flex-wrap text-sm mb-3">
+        ${linea("Para avisarle a Tango", r.aCancelar.length, r.aCancelar.length ? "text-violet-700 font-medium" : "")}
+        ${linea("Ya avisadas", r.yaCanceladas.length, "text-gray-500")}
+        ${linea("Se cancelaron antes de llegar a Tango", r.noEnviadas.length, "text-gray-500")}
+        ${linea("Ya facturadas", r.facturadas.length, r.facturadas.length ? "text-amber-700" : "text-gray-500")}
+      </div>
+      ${r.truncada ? `<div class="text-xs text-amber-700 mb-2">Se cortó por tiempo:
+        volvé a buscar para seguir.</div>` : ""}
+
+      ${r.facturadas.length ? `<div class="text-sm bg-amber-50 border border-amber-200 rounded p-3 mb-3">
+        <div class="font-bold text-amber-900 mb-1">Canceladas que ya estaban facturadas</div>
+        <div class="text-xs text-gray-700 mb-2">Estas no se tocan. El marketplace las canceló
+          pero nosotros ya emitimos la factura: hay que resolverlo con una nota de crédito
+          en Tango, a mano.</div>
+        ${r.facturadas.map((f) => `<div class="text-xs font-mono">· ${esc(f.orden)} —
+          factura ${esc(f.factura)} — ${esc(f.cliente)}</div>`).join("")}</div>` : ""}
+
+      ${r.fallidas.length ? `<div class="text-sm bg-red-50 border border-red-200 rounded p-3 mb-3">
+        <div class="font-bold text-red-800 mb-1">No se pudieron preparar</div>
+        ${r.fallidas.map((f) => `<div class="text-xs">· ${esc(f.orden)}: ${esc(f.error)}</div>`).join("")}</div>` : ""}
+
+      ${r.aCancelar.length ? `
+        <div class="overflow-x-auto mb-3"><table class="data w-full"><thead><tr>
+          <th>Pedido</th><th>Cliente</th><th>Fecha de compra</th><th>Total</th>
+          <th>Cancelado el</th><th>Motivo</th>
+        </tr></thead><tbody>
+        ${r.aCancelar.map((x) => `<tr>
+          <td class="font-mono text-xs">${esc(x.orden)}</td>
+          <td class="text-xs">${esc(x.cliente)}</td>
+          <td class="text-xs text-gray-500">${esc(x.fecha_compra)}</td>
+          <td class="text-xs">$ ${Number(x.total || 0).toLocaleString("es-AR")}</td>
+          <td class="text-xs text-gray-500">${esc(String(x.fecha_cancelacion).replace("T", " "))}</td>
+          <td class="text-xs text-gray-600">${esc(x.motivo)}</td>
+        </tr>`).join("")}</tbody></table></div>
+        <button onclick="enviarCanceladas()"
+          class="bg-red-700 hover:bg-red-800 text-white px-5 py-2.5 rounded-lg font-medium">
+          2️⃣ Avisarle a Tango que se cancelaron ${r.aCancelar.length} pedido(s)</button>`
+        : `<div class="text-sm text-gray-500">No hay cancelaciones nuevas para avisar.</div>`}
+    </div>`;
+}
+
+function enviarCanceladas() {
+  if (!CANCEL_DATOS || !CANCEL_DATOS.orders.length) return;
+  const n = CANCEL_DATOS.orders.length;
+  confirmar(`Se le va a avisar a Tango que ${n} pedido(s) fueron cancelados en ` +
+            `${CANCEL_DATOS.nombre}. En Tango van a quedar como anulados. ¿Seguimos?`,
+    async () => {
+      const box = $("can-resultado");
+      box.innerHTML = spinner(`Avisando ${n} cancelación(es) a Tango...`);
+      let r;
+      try {
+        r = await api("cancel.send", {
+          canal: CANCEL_DATOS.canal,
+          orders: CANCEL_DATOS.orders,
+          registros: CANCEL_DATOS.registros,
+        });
+      } catch (e) { box.innerHTML = `<p class="text-red-600 text-sm">${esc(e.message)}</p>`; return; }
+
+      box.innerHTML = `
+        <div class="border rounded-lg p-4 ${r.rechazadas.length ? "bg-amber-50" : "bg-green-50"}">
+          <div class="font-bold mb-2">${r.rechazadas.length ? "⚠️ Con observaciones" : "✅ Listo"}</div>
+          <div class="text-sm space-y-1">
+            <div class="text-green-800">Tango aceptó la cancelación de: <b>${r.enviadas.length}</b></div>
+            ${r.rechazadas.length ? `<div class="text-red-700">Rechazadas: <b>${r.rechazadas.length}</b></div>` : ""}
+            <div class="text-gray-600">Quedaron marcadas en el historial: <b>${r.marcadas}</b></div>
+          </div>
+          ${r.rechazadas.length ? `<div class="text-xs bg-white border rounded p-2 mt-2 max-h-48 overflow-y-auto">
+            ${r.rechazadas.map((x) => `<div>· ${esc(x.orden)}: ${esc(x.error)}</div>`).join("")}</div>` : ""}
+        </div>`;
+      CANCEL_DATOS = null;
+      cargarHistorialOrdenes();
+    });
 }
 
 /* ── Automatización: estado y disparo manual ────────────────────────── */
@@ -739,6 +865,12 @@ function pintarOrdenesVtex() {
           <td>${money(o.total)}${o.aviso ? `<div class="text-xs text-amber-700" title="${esc(o.aviso)}">⚠ revisar total</div>` : ""}</td>
           <td class="text-xs text-gray-500">${esc(o.transportadora || "—")}</td>
         </tr>`).join("")}</tbody></table></div>` : ""}
+
+      ${(a.canceladas_en_el_medio || []).length ? `<div class="text-sm bg-gray-50 border rounded p-3 mb-3 text-gray-700">
+        🚫 <b>${a.canceladas_en_el_medio.length}</b> pedido(s) se cancelaron en el marketplace
+        mientras los leíamos, así que <b>no se mandan a Tango</b>:
+        ${a.canceladas_en_el_medio.map((x) => `<div class="text-xs font-mono">· ${esc(x.orden)} (${esc(x.estado)})</div>`).join("")}
+      </div>` : ""}
 
       ${a.excluidas.length ? `<div class="text-sm text-red-700 bg-red-50 border border-red-200 rounded p-3 mb-3">
         Estos pedidos NO se envían porque tienen SKUs sin relación (ya quedaron en
@@ -2520,6 +2652,12 @@ const CONFIG_CAMPOS = [
     ["orders_auto_max", "Tope: si una corrida encuentra más pedidos que esto, NO envía y avisa", "text"],
     ["orders_auto_email", "Email para los avisos (vacío = sin aviso)", "text"],
     ["orders_auto_email_siempre", "Avisar siempre (si no, solo cuando hay algo para revisar)", "bool"],
+  ]],
+  ["Cancelaciones", [
+    ["cancel_auto_enabled", "Avisarle a Tango cuando el marketplace cancela un pedido", "bool"],
+    ["cancel_auto_max", "Tope: si una corrida encuentra más cancelaciones que esto, NO envía", "text"],
+    ["fvtex_estados_cancelados", "Frávega: estados de VTEX que cuentan como cancelado", "text"],
+    ["oncity_estados_cancelados", "OnCity: estados de VTEX que cuentan como cancelado", "text"],
   ]],
   ["Órdenes", [
     ["orders_counterfoil", "Talonario de pedido", "text"],

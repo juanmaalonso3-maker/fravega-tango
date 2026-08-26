@@ -78,7 +78,7 @@ function _canal(nombre) {
  * cuando GitHub Pages todavía sirve el HTML anterior desde la caché.
  * SUBIR ESTE NÚMERO cada vez que cambien las acciones del doPost.
  */
-var APP_VERSION = '2026-08-26.16';
+var APP_VERSION = '2026-08-26.18';
 
 var ALLOWED_DOMAINS = ['bitek.com.ar'];
 var ALLOWED_EMAILS = ['juanma.alonso3@gmail.com', 'bitekmeli@gmail.com'];
@@ -122,7 +122,7 @@ var COLS_PDFS = ['nro_factura', 'order_id', 'url', 'archivo_id',
 var COLS_SENT = ['order_id', 'suborder_id', 'fecha_hora', 'fecha_compra',
                  'cliente', 'documento', 'cuil', 'email', 'total', 'items',
                  'origen', 'estado_facturacion', 'nro_factura', 'fecha_factura',
-                 'facturada_en', 'canal', 'vtex_notificada'];
+                 'facturada_en', 'canal', 'vtex_notificada', 'cancelada_en'];
 
 var DEFAULT_CONFIG = [
   ['stock_warehouse_code', '04', 'Depósito de Tango para el stock'],
@@ -232,6 +232,11 @@ var DEFAULT_CONFIG = [
   ['fvg_invoice_horas_alerta', '6', 'Horas a esperar la confirmación de Frávega antes de avisar'],
   ['invoice_reenvio_minutos', '60', 'Minutos dentro de los cuales avisar antes de reenviar la misma factura'],
   ['orders_alerta_minimo', '5', 'Pedidos nuevos mínimos para que salte la alerta de duplicados'],
+  // ── Cancelaciones ───────────────────────────────────────────────────────
+  ['cancel_auto_enabled', '0', 'Avisarle a Tango automáticamente cuando el marketplace cancela un pedido'],
+  ['cancel_auto_max', '30', 'Si una corrida encuentra más cancelaciones que esto, NO envía y avisa'],
+  ['fvtex_estados_cancelados', 'canceled', 'Estados de VTEX que cuentan como cancelado (Frávega)'],
+  ['oncity_estados_cancelados', 'canceled', 'Estados de VTEX que cuentan como cancelado (OnCity)'],
   ['invoices_match_importe', '1', 'Usar también el importe para matchear facturas'],
   ['invoices_tolerancia_importe', '1', 'Diferencia máxima de importe aceptada (en pesos)'],
   ['invoices_origen', 'historial', 'De dónde salen las órdenes a facturar: historial | csv'],
@@ -510,6 +515,8 @@ function doPost(e) {
       case 'vtex.orders.send':    out = apiVtexOrdersSend(user, p); break;
       case 'vtex.test':           out = apiVtexTest(p.canal); break;
       case 'vtex.orders.ignore':  out = apiVtexIgnorar(user, p); break;
+      case 'cancel.preview':      out = apiVtexCanceladasPreview(user, p); break;
+      case 'cancel.send':         out = apiVtexCanceladasSend(user, p); break;
       case 'orders.autoStatus':   out = apiOrdersAutoStatus(); break;
       case 'pdfs.info':           out = apiWebhookInfo(); break;
       case 'pdfs.buscar':         out = apiPdfBuscar(user, p); break;
@@ -2146,7 +2153,7 @@ function apiVtexOrdersPreview(user, p) {
   var sent = _sentIds();
 
   var orders = [], registros = {}, nuevas = [],
-      saltadas = [], excluidas = [], fallidas = [];
+      saltadas = [], excluidas = [], fallidas = [], canceladasEnElMedio = [];
   var detalles = 0, truncada = false, totalListados = 0, campoId = '';
   var porEstado = {};   // cuántos pedidos vinieron de cada estado
   var ignorados = [];
@@ -2182,6 +2189,17 @@ function apiVtexOrdersPreview(user, p) {
         catch (err) { fallidas.push({ orden: idOrden, error: err.message }); continue; }
         if (c.pausa) Utilities.sleep(c.pausa);
 
+        // El estado del listado ya puede estar viejo: entre que VTEX armó la
+        // página y que pedimos el detalle pasan minutos, y después todavía
+        // falta que se confirme el envío. Si en el medio el pedido se canceló,
+        // el detalle lo dice y lo sacamos ACÁ. Sin esto, un pedido cancelado
+        // se daría de alta en Tango y habría que cancelarlo después.
+        var estadoAhora = String(d.status || '');
+        if (_estadoCancelado(estadoAhora)) {
+          canceladasEnElMedio.push({ orden: idOrden, estado: estadoAhora });
+          continue;
+        }
+
         var res = _buildOrderFromVtex(d, idOrden, idx, rels, c);
         if (res[1].length) {
           res[1].forEach(function (sku) {
@@ -2213,6 +2231,7 @@ function apiVtexOrdersPreview(user, p) {
        'estados=' + c.estados.join('+') + ' listados=' + totalListados +
        ' nuevas=' + nuevas.length + ' saltadas=' + saltadas.length +
        ' excluidas=' + excluidas.length + ' fallidas=' + fallidas.length +
+       ' canceladas_en_el_medio=' + canceladasEnElMedio.length +
        ' campo_id=' + campoId, Date.now() - t0);
 
   // Red de seguridad contra duplicados: si el historial tiene pedidos de este
@@ -2250,6 +2269,7 @@ function apiVtexOrdersPreview(user, p) {
     orders: orders, registros: registros,
     nuevas: nuevas, saltadas: saltadas, ignorados: ignorados,
     excluidas: excluidas, fallidas: fallidas,
+    canceladas_en_el_medio: canceladasEnElMedio,
     truncada: truncada,
     condicion_venta: c.orders_sale_condition,
     talonario: c.orders_counterfoil,
@@ -2537,6 +2557,15 @@ function runOrdersImport(disparadaPor) {
           res.errores = res.errores.concat(res.fvg_verificadas.perdidas);
         }
       } catch (e3) { res.errores.push('Informar facturas al marketplace: ' + e3.message); }
+
+      // Y las cancelaciones del marketplace, para que Tango no quede con
+      // pedidos vivos que nadie va a despachar.
+      try {
+        res.canceladas = correrCanceladas(disparadaPor, { deadline: t0 + 5.7 * 60 * 1000 });
+        if (res.canceladas.errores.length) {
+          res.errores = res.errores.concat(res.canceladas.errores);
+        }
+      } catch (e4) { res.errores.push('Cancelaciones: ' + e4.message); }
     }
 
     _avisarCorrida(cfg, res);
@@ -4293,6 +4322,298 @@ function apiOncityInvoices(user, p) {
     sin_factura: m.sin_factura, sobrantes: m.sobrantes, conteo: m.conteo,
     columna_documento: m.columna_documento, columna_importe: m.columna_importe
   };
+}
+
+/* ═══════════════ CANCELACIONES ═══════════════
+ *
+ * Cuando el marketplace cancela un pedido que ya mandamos a Tango, hay que
+ * avisarle a Tango para que no quede un pedido vivo que nadie va a despachar.
+ *
+ * La API de Tango lo resuelve con el mismo /order/batch de siempre: se manda
+ * la MISMA orden y se le agregan tres campos —CancelOrder, CancelDate y
+ * CancelReason—. Por eso reusamos el mismo armador que el alta: lo único que
+ * cambia es lo que se le suma al final.
+ *
+ * De dónde salen las canceladas: de VTEX, para los dos canales. El CSV de
+ * Frávega no trae ninguna columna de cancelación —lo verificamos— y su API de
+ * Seller Center nos rechaza la lectura de pedidos. VTEX sí las expone con
+ * f_status=canceled, y es de donde ya leemos todo lo demás.
+ */
+
+/**
+ * ¿Este estado de VTEX quiere decir que el pedido está muerto?
+ * Se usa en dos lugares: para no dar de alta en Tango algo que se canceló
+ * mientras lo leíamos, y para detectar las que hay que cancelar.
+ */
+function _estadoCancelado(estado) {
+  var e = String(estado || '').toLowerCase();
+  return e === 'canceled' || e === 'cancelled' ||
+         e === 'cancel' || e.indexOf('cancellation') === 0;
+}
+
+/** Fecha de cancelación en el formato de Tango, nunca anterior a la del pedido. */
+function _fechaCancelacion(d, fechaOrden) {
+  var ms = _fechaMs(d.lastChange) || _fechaMs(d.cancellationData && d.cancellationData.requestedByUser)
+           || Date.now();
+  var msOrden = _fechaMs(d.creationDate) || 0;
+  // Tango rechaza una cancelación anterior a la orden. Si VTEX nos da algo
+  // raro, usamos la fecha del pedido más un minuto.
+  if (msOrden && ms < msOrden) ms = msOrden + 60000;
+  if (ms > Date.now()) ms = Date.now();
+  return Utilities.formatDate(new Date(ms), TZ_AR, "yyyy-MM-dd'T'HH:mm:ss");
+}
+
+/** El motivo que informa VTEX, recortado a lo que acepta Tango. */
+function _motivoCancelacion(d) {
+  var cd = d.cancellationData || {};
+  var m = cd.reason || d.cancelReason || '';
+  if (!m && cd.cancelledByOwner) m = 'Cancelada por el vendedor';
+  if (!m && cd.requestedByUser) m = 'Cancelada por el comprador';
+  if (!m) m = 'Cancelada en el marketplace';
+  return String(m).slice(0, 200);
+}
+
+/**
+ * Busca en VTEX los pedidos cancelados y arma la lista de los que hay que
+ * avisarle a Tango. No manda nada: es la vista previa.
+ *
+ * Solo entran los que efectivamente mandamos a Tango. Si un pedido se canceló
+ * antes de que lo enviáramos, en Tango no existe y no hay nada que cancelar.
+ */
+function apiVtexCanceladasPreview(user, p) {
+  p = p || {};
+  var canal = String(p.canal || 'fravega').toLowerCase();
+  var cfg = _configMap();
+  var c = _cfgCanal(cfg, canal);
+  var t0 = Date.now();
+
+  var estados = String(_cfgCanalVal(cfg, canal, 'estados_cancelados', 'canceled'))
+    .split(',').map(function (s) { return s.trim(); }).filter(String);
+
+  var rels = _skuRelations();
+  var idx = _indiceSkuCanal(canal, rels);
+  var yaEnviadas = _indiceEnviadas();
+
+  var res = {
+    canal: canal, nombre: c.nombre, estados: estados, listados: 0,
+    orders: [], registros: {},
+    aCancelar: [], yaCanceladas: [], noEnviadas: [], facturadas: [], fallidas: []
+  };
+
+  var limite = p.deadline || (t0 + 4 * 60 * 1000);
+
+  for (var e = 0; e < estados.length; e++) {
+    var pagina = 1, paginas = 1;
+    while (pagina <= paginas) {
+      if (Date.now() > limite) { res.truncada = true; break; }
+      var body = vtexOrdersPage(canal, estados[e], pagina, c);
+      paginas = Number((body.paging || {}).pages || 1);
+      var lista = body.list || [];
+      res.listados += lista.length;
+      if (!lista.length) break;
+
+      for (var i = 0; i < lista.length; i++) {
+        if (Date.now() > limite) { res.truncada = true; break; }
+        var it = lista[i];
+        var idOrden = c.id_field === 'marketplaceOrderId'
+          ? String(it.marketplaceOrderId || '')
+          : _sinPrefijo(String(it.orderId || ''), c.quitar_prefijo);
+        if (!idOrden) continue;
+
+        var fila = yaEnviadas[idOrden];
+        if (!fila) { res.noEnviadas.push(idOrden); continue; }
+        if (fila.cancelada) { res.yaCanceladas.push(idOrden); continue; }
+
+        // Una orden ya facturada no se cancela: correspondería una nota de
+        // crédito, que es una decisión contable y no algo que deba hacer la app.
+        if (fila.nro_factura) {
+          res.facturadas.push({ orden: idOrden, factura: fila.nro_factura,
+                                cliente: fila.cliente });
+          continue;
+        }
+
+        var d;
+        try { d = vtexOrderDetail(canal, it.orderId); }
+        catch (err) { res.fallidas.push({ orden: idOrden, error: err.message }); continue; }
+
+        var arm = _buildOrderFromVtex(d, idOrden, idx, rels, c);
+        if (!arm[0]) {
+          // Sin relación de SKU igual se puede cancelar: los ítems no importan
+          // para dar de baja. Armamos una versión mínima.
+          res.fallidas.push({ orden: idOrden,
+                              error: 'No se pudo rearmar el pedido: ' + arm[1].join(', ') });
+          continue;
+        }
+
+        var orden = arm[0];
+        orden.CancelOrder = true;
+        orden.CancelDate = _fechaCancelacion(d, orden.Date);
+        orden.CancelReason = _motivoCancelacion(d);
+
+        res.orders.push(orden);
+        res.registros[idOrden] = arm[2];
+        res.aCancelar.push({
+          orden: idOrden,
+          cliente: arm[2].cliente,
+          documento: arm[2].documento,
+          fecha_compra: arm[2].fecha_compra,
+          total: arm[2].total,
+          motivo: orden.CancelReason,
+          fecha_cancelacion: orden.CancelDate
+        });
+
+        if (c.pausa > 0) Utilities.sleep(c.pausa);
+      }
+      pagina++;
+    }
+  }
+
+  log_(user.email, 'ordenes', 'Canceladas leídas de ' + c.nombre, 'info',
+       'estados=' + estados.join('+') + ' listados=' + res.listados +
+       ' a_cancelar=' + res.aCancelar.length + ' ya_canceladas=' + res.yaCanceladas.length +
+       ' no_enviadas=' + res.noEnviadas.length + ' facturadas=' + res.facturadas.length,
+       Date.now() - t0);
+  return res;
+}
+
+/** order_id → { cancelada, nro_factura, cliente } para saber qué hacer con cada una. */
+function _indiceEnviadas() {
+  var out = {};
+  var sheet = _sheetAuto(SH.SENT, COLS_SENT);
+  var last = sheet.getLastRow();
+  if (last < 2) return out;
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+                  .map(function (h) { return String(h).trim(); });
+  var col = {}; headers.forEach(function (h, i) { col[h] = i; });
+  sheet.getRange(2, 1, last - 1, headers.length).getValues().forEach(function (f) {
+    var id = String(f[col.order_id] || '').trim();
+    if (!id) return;
+    out[id] = {
+      cancelada: col.cancelada_en !== undefined &&
+                 !!String(f[col.cancelada_en] || '').trim(),
+      nro_factura: String(f[col.nro_factura] || '').trim(),
+      cliente: String(f[col.cliente] || ''),
+      canal: String(f[col.canal] || '')
+    };
+  });
+  return out;
+}
+
+/**
+ * Manda a Tango las cancelaciones tildadas.
+ * Reusa el mismo envío por lotes que el alta de pedidos: para Tango es la
+ * misma operación, con los campos de cancelación agregados.
+ */
+function apiVtexCanceladasSend(user, p) {
+  p = p || {};
+  var canal = String(p.canal || 'fravega').toLowerCase();
+  var orders = p.orders || [];
+  var registros = p.registros || {};
+  if (!orders.length) throw new Error('No hay cancelaciones para enviar');
+
+  orders.forEach(function (o) {
+    if (o.CancelOrder !== true) {
+      throw new Error('Se intentó mandar como cancelación una orden sin CancelOrder. ' +
+                      'Frená: esto daría de alta el pedido de nuevo.');
+    }
+  });
+
+  var env = _sendOrders(orders, user, 'Cancelaciones · ' + _canal(canal).nombre,
+                        null, registros);
+  var marcadas = _marcarCanceladas(env.enviadas || []);
+
+  log_(user.email, 'ordenes', 'Cancelaciones enviadas a Tango',
+       (env.rechazadas || []).length ? 'warning' : 'ok',
+       'canal=' + canal + ' enviadas=' + (env.enviadas || []).length +
+       ' rechazadas=' + (env.rechazadas || []).length + ' marcadas=' + marcadas);
+
+  return { enviadas: env.enviadas || [], rechazadas: env.rechazadas || [],
+           marcadas: marcadas };
+}
+
+/** Deja constancia de la cancelación para no volver a mandarla. */
+function _marcarCanceladas(ids) {
+  if (!ids.length) return 0;
+  var sheet = _sheetAuto(SH.SENT, COLS_SENT);
+  var last = sheet.getLastRow();
+  if (last < 2) return 0;
+  var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]
+                  .map(function (h) { return String(h).trim(); });
+  var cOrden = headers.indexOf('order_id');
+  var cCanc = headers.indexOf('cancelada_en');
+  var cEstado = headers.indexOf('estado_facturacion');
+  if (cOrden === -1 || cCanc === -1) return 0;
+
+  var quiero = {};
+  ids.forEach(function (x) { quiero[String(x).trim()] = true; });
+
+  var ancho = sheet.getLastColumn();
+  var datos = sheet.getRange(2, 1, last - 1, ancho).getValues();
+  var n = 0, ts = _now();
+  datos.forEach(function (f) {
+    if (!quiero[String(f[cOrden]).trim()]) return;
+    if (String(f[cCanc] || '').trim()) return;
+    f[cCanc] = ts;
+    if (cEstado !== -1) f[cEstado] = 'cancelada';
+    n++;
+  });
+  if (n) sheet.getRange(2, 1, datos.length, ancho).setValues(datos);
+  return n;
+}
+
+/** La corrida automática: busca canceladas y las manda, sin intervención. */
+function correrCanceladas(quien, opciones) {
+  opciones = opciones || {};
+  var cfg = _configMap();
+  var res = { por_canal: {}, enviadas: 0, rechazadas: 0, facturadas: [], errores: [] };
+
+  if (String(_cfgVal(cfg, 'cancel_auto_enabled')) !== '1' && !opciones.forzar) {
+    res.apagado = true;
+    return res;
+  }
+
+  var canales = String(_cfgVal(cfg, 'orders_auto_canales') || 'fravega,oncity')
+    .split(',').map(function (x) { return x.trim().toLowerCase(); }).filter(String);
+
+  for (var i = 0; i < canales.length; i++) {
+    var canal = canales[i];
+    try {
+      var prev = apiVtexCanceladasPreview({ email: quien }, {
+        canal: canal, deadline: opciones.deadline
+      });
+      var det = { leidos: prev.listados, a_cancelar: prev.aCancelar.length,
+                  ya_canceladas: prev.yaCanceladas.length,
+                  facturadas: prev.facturadas.length, enviadas: 0, rechazadas: 0 };
+
+      prev.facturadas.forEach(function (f) {
+        res.facturadas.push(_canal(canal).nombre + ' · ' + f.orden +
+                            ' (factura ' + f.factura + ')');
+      });
+
+      if (prev.orders.length) {
+        var tope = parseInt(_cfgVal(cfg, 'cancel_auto_max'), 10) || 30;
+        if (prev.orders.length > tope) {
+          res.errores.push(_canal(canal).nombre + ': aparecieron ' + prev.orders.length +
+            ' cancelaciones, más que el tope de ' + tope + '. No se mandó nada: revisalo a mano.');
+        } else {
+          var env = apiVtexCanceladasSend({ email: quien }, {
+            canal: canal, orders: prev.orders, registros: prev.registros
+          });
+          det.enviadas = env.enviadas.length;
+          det.rechazadas = env.rechazadas.length;
+          res.enviadas += det.enviadas;
+          res.rechazadas += det.rechazadas;
+          env.rechazadas.forEach(function (r) {
+            res.errores.push(_canal(canal).nombre + ' · ' + r.orden + ': ' + r.error);
+          });
+        }
+      }
+      res.por_canal[canal] = det;
+    } catch (e) {
+      res.errores.push(_canal(canal).nombre + ' (cancelaciones): ' + e.message);
+    }
+  }
+  return res;
 }
 
 /* ═══════════════ NOTIFICACIÓN DE FACTURAS A VTEX ═══════════════
@@ -6636,7 +6957,7 @@ function _filaSent(id, reg, ts) {
           reg.cliente || '', reg.documento || '', reg.cuil || '', reg.email || '',
           (reg.total === undefined || reg.total === null) ? '' : reg.total,
           reg.items || '', reg.origen || 'csv', 'pendiente', '', '', '',
-          reg.canal || 'fravega', ''];
+          reg.canal || 'fravega', '', ''];
 }
 
 /**
